@@ -1,0 +1,24 @@
+# Dependencies / build
+node_modules/
+dist/
+
+# Secrets — never commit
+.env
+.env.local
+.tekion-token.json
+
+# Saved browser session & captured traffic (auth tokens + customer PII)
+auth.json
+tekion-auth.json
+captured/
+*.har
+
+# Generated documents (not part of the codebase)
+*.docx
+*.zip
+
+# Error screenshots from Playwright runs
+error-*.png
+
+# OS / editor
+.DS_Store
