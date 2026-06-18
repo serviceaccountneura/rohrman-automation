@@ -1,6 +1,6 @@
 # rohrman-automation
 
-Automation for entering data into Tekion (Schaumburg Honda). The project works
+Automation for entering data into Tekion. The project works
 in two complementary ways:
 
 - **APC API** — talks directly to Tekion's Automotive Partner Cloud REST API for
