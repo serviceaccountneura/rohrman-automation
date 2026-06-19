@@ -17,7 +17,11 @@
     "customer:update": "tsx cli/updateCustomer.ts",
     "vehicles:list": "tsx cli/listVehicles.ts",
     "deal:accessory": "tsx cli/getDealAccessory.ts",
-    "lead:update": "tsx cli/updateLead.ts"
+    "lead:update": "tsx cli/updateLead.ts",
+    "pw:login": "tsx src/playwright/login.ts",
+    "pw:capture": "tsx src/playwright/capture.ts",
+    "pw:analyze": "tsx src/playwright/analyze.ts",
+    "pw:codegen": "playwright codegen --load-storage=tekion-auth.json https://app.tekioncloud.com/parts/purchase-order/list"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
