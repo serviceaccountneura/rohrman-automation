@@ -39,6 +39,27 @@ export function currentTotp(): string {
   return authenticator.generate(secret);
 }
 
+/** Seconds remaining in the current 30s TOTP window. */
+function totpSecondsLeft(): number {
+  try { return authenticator.timeRemaining(); } catch { return 30; }
+}
+
+/**
+ * Return a TOTP code guaranteed to differ from `previous`. If the current code
+ * is still the same one (window hasn't rolled over yet), wait for the next
+ * window so Tekion never sees a reused code.
+ */
+async function freshTotp(page: Page, previous: string): Promise<string> {
+  let code = currentTotp();
+  if (code && code === previous) {
+    const waitMs = (totpSecondsLeft() + 1) * 1000;
+    console.log(`   ⏳ waiting ${Math.ceil(waitMs / 1000)}s for a new code…`);
+    await page.waitForTimeout(waitMs);
+    code = currentTotp();
+  }
+  return code;
+}
+
 function waitForEnter(msg: string): Promise<void> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   return new Promise((res) => rl.question(msg, () => { rl.close(); res(); }));
@@ -87,19 +108,40 @@ export async function openLoggedIn(headless = false): Promise<LoginResult> {
   await page.fill(SEL.password, pass);
   await page.click(SEL.loginSubmit);
 
-  // Verification code screen.
+  // Verification-code screen — try up to 3 times, each with a fresh TOTP code.
   const otp = page.locator(SEL.otpInput).first();
   await otp.waitFor({ state: 'visible', timeout: 30_000 });
-  const code = currentTotp();
-  console.log(`🔐 Verification code: ${code}  (auto-filling; type it manually if needed)`);
-  await otp.fill(code);
-  await page.click(SEL.otpSubmit);
 
-  // Wait for the dashboard. If MFA needs a fresh code, fall back to manual.
-  try {
-    await page.waitForURL('**/home**', { timeout: 30_000 });
-  } catch {
-    console.log('⏳ Not on dashboard yet. Finish any remaining step in the browser…');
+  const MAX_TRIES = 3;
+  let lastCode = '';
+  let loggedIn = false;
+  for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
+    const code = await freshTotp(page, lastCode);
+    lastCode = code;
+    console.log(`🔐 Attempt ${attempt}/${MAX_TRIES}: entering code ${code}`);
+
+    const field = page.locator(SEL.otpInput).first();
+    await field.click({ clickCount: 3 }).catch(() => {}); // select any existing text
+    await field.fill('');
+    await field.fill(code);
+    await page.click(SEL.otpSubmit);
+
+    // Success = we leave the login screen for the dashboard.
+    try {
+      await page.waitForURL('**/home**', { timeout: 12_000 });
+      loggedIn = true;
+      break;
+    } catch {
+      // Or we left /login some other way (still counts as success).
+      if (!/\/login/.test(page.url())) { loggedIn = true; break; }
+      console.log(`   ⚠️ attempt ${attempt} did not pass — retrying with a fresh code.`);
+      // Make sure the OTP field is back/visible before the next try.
+      await page.locator(SEL.otpInput).first().waitFor({ state: 'visible', timeout: 10_000 }).catch(() => {});
+    }
+  }
+
+  if (!loggedIn) {
+    console.log(`⏳ Auto-login did not pass after ${MAX_TRIES} tries. Finish in the browser…`);
     await waitForEnter('   Press ENTER once you are on the Tekion home page… ');
   }
 
