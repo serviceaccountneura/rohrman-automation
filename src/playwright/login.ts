@@ -192,31 +192,19 @@ export async function openLoggedIn(headless = false): Promise<LoginResult> {
     }
 
     // ── Username screen ──
-    // The field has no name/autocomplete (just type=text), and the *disabled*
-    // username field on the password screen matches the same selector — so we
-    // require an ENABLED input to avoid grabbing the wrong one mid-transition.
     const userField = await firstVisible(page, [
-      'input[name="username"]:not([disabled])', 'input[autocomplete="username"]:not([disabled])',
-      'input[type="email"]:not([disabled])', 'input[type="text"]:not([disabled])',
+      'input[name="username"]', 'input[autocomplete="username"]', 'input[type="email"]',
+      'input[placeholder*="user" i]', 'input[placeholder*="email" i]', 'input[type="text"]',
     ], 6000);
     if (userField) {
       console.log('   • entering username');
       await userField.fill('');
       await userField.fill(user);
-      // Confirm the value committed before submitting — some React forms keep
-      // "Next" inert until the controlled value updates.
-      if ((await userField.inputValue().catch(() => '')) !== user) {
-        await userField.pressSequentially(user, { delay: 30 }).catch(() => {});
-      }
       await page.locator(
         hasNext ? 'button:has-text("Next")' : 'button[type="submit"], button:has-text("Sign In"), button:has-text("Login")',
       ).first().click().catch(() => {});
       userDone = true;
-      // Confirm we advanced to the password screen; if not, the click may not
-      // have registered — press Enter as a fallback before the loop re-tries.
-      const advanced = await page.locator('input[type="password"]').first()
-        .waitFor({ state: 'visible', timeout: 6000 }).then(() => true).catch(() => false);
-      if (!advanced) await userField.press('Enter').catch(() => {});
+      await page.waitForTimeout(1500);
       continue;
     }
 
