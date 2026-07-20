@@ -1,0 +1,5 @@
+google-genai>=2.8.0
+pymupdf>=1.27
+pillow>=10
+pydantic>=2.5
+flask>=3.0

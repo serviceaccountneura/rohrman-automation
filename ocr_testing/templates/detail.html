@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% set page_title = "Document Intake" %}
+
+{# ---- generic renderer for the dynamic, model-decided JSON structure ---- #}
+{% macro render_table(rows) %}
+  {% set ns = namespace(cols=[]) %}
+  {% for r in rows %}{% if r is mapping %}{% for k in r.keys() %}{% if k not in ns.cols %}{% set ns.cols = ns.cols + [k] %}{% endif %}{% endfor %}{% endif %}{% endfor %}
+  <table class="mini-table">
+    <thead><tr>{% for c in ns.cols %}<th>{{ c|replace('_',' ')|title }}</th>{% endfor %}</tr></thead>
+    <tbody>
+      {% for r in rows %}
+        <tr>{% for c in ns.cols %}<td>{{ r.get(c) if (r is mapping and r.get(c) is not none) else '' }}</td>{% endfor %}</tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endmacro %}
+
+{% macro render_obj(prefix, data) %}
+  {% for key, val in data.items() %}
+    {% if not key.startswith('_') %}
+      {% set path = (prefix ~ '.' ~ key) if prefix else key %}
+      {% if val is mapping %}
+        <div class="form-section">{{ key|replace('_',' ')|title }}</div>
+        <div class="subsection">{{ render_obj(path, val) }}</div>
+      {% elif val is iterable and val is not string and val|length and val[0] is mapping %}
+        <div class="form-section">{{ key|replace('_',' ')|title }}</div>
+        {{ render_table(val) }}
+      {% elif val is iterable and val is not string and val|length %}
+        <div class="form-field"><label>{{ key|replace('_',' ')|title }}</label>
+          <input name="{{ path }}" value="{{ val|join(', ') }}"></div>
+      {% else %}
+        <div class="form-field">
+          <label>{{ key|replace('_',' ')|title }}</label>
+          <input name="{{ path }}" value="{{ val if val is not none else '' }}">
+        </div>
+      {% endif %}
+    {% endif %}
+  {% endfor %}
+{% endmacro %}
+
+{% block content %}
+
+<div class="detail-head">
+  <a class="back" href="{{ url_for('intake') }}">← Document Intake</a>
+  <div class="detail-badges">
+    <span class="chip doc">{{ (clean.document_type or 'Document')|replace('_',' ')|title }}</span>
+    {% if validation.needs_review %}
+      <span class="chip red">● Needs review</span>
+    {% else %}
+      <span class="chip green">● Looks good</span>
+    {% endif %}
+    {% for name, ok in (validation.checks or {}).items() %}
+      <span class="chip {{ 'green' if ok else 'red' }}">{{ name|replace('_',' ') }} {{ '✓' if ok else '✗' }}</span>
+    {% endfor %}
+  </div>
+</div>
+
+<div class="detail-grid">
+  <!-- PDF / image -->
+  <div class="panel">
+    <div class="panel-head">
+      PDF
+      <div class="zoom">
+        <button type="button" onclick="zoom(0.2)">＋</button>
+        <button type="button" onclick="zoom(-0.2)">－</button>
+        <button type="button" onclick="zoomReset()">⤢</button>
+        <span id="zoomPct">100%</span>
+        <a class="link" href="{{ url_for('raw_file', rec_id=rec.id) }}" target="_blank">open</a>
+      </div>
+    </div>
+    <div class="viewer" id="viewer">
+      {% for p in range(page_count) %}
+        <img class="page" src="{{ url_for('preview', rec_id=rec.id, page=p) }}" alt="page {{ p+1 }}">
+      {% endfor %}
+    </div>
+  </div>
+
+  <!-- Form (rendered from whatever structure the model produced) -->
+  <div class="panel">
+    <div class="panel-head">Form</div>
+    <form method="post" action="{{ url_for('document', rec_id=rec.id) }}" class="form-body">
+      {{ render_obj('', clean) }}
+      <div class="form-actions">
+        <button class="btn-primary sm" type="submit">Save</button>
+        <a class="btn-ghost" href="{{ url_for('download_json', rec_id=rec.id) }}">Download JSON</a>
+        <a class="btn-ghost" href="{{ url_for('download_text', rec_id=rec.id) }}">Download text</a>
+      </div>
+    </form>
+
+    {% if raw_text %}
+    <details class="raw">
+      <summary>Raw OCR text</summary>
+      <pre>{{ raw_text }}</pre>
+    </details>
+    {% endif %}
+  </div>
+</div>
+
+{% endblock %}
+{% block scripts %}
+<script>
+  let scale = 1;
+  function apply() {
+    document.querySelectorAll('.page').forEach(p => p.style.width = (scale * 100) + '%');
+    document.getElementById('zoomPct').textContent = Math.round(scale * 100) + '%';
+  }
+  function zoom(d) { scale = Math.min(3, Math.max(0.4, scale + d)); apply(); }
+  function zoomReset() { scale = 1; apply(); }
+</script>
+{% endblock %}

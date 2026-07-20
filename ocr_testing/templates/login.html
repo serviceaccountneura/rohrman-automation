@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Log In · AP Automate</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+</head>
+<body class="auth-body">
+  <div class="auth-card">
+    <div class="auth-hero">
+      <div class="hero-brand"><span class="brand-mark">R</span> ROHRMAN</div>
+      <div class="hero-bottom">
+        <h2>AP Automate</h2>
+        <p>Streamline invoice processing, purchase orders, and accounts
+           payable workflows across your dealerships.</p>
+      </div>
+    </div>
+    <div class="auth-form">
+      <h1>Welcome Back</h1>
+      <p class="sub">Sign in to continue</p>
+
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% for cat, msg in messages %}<div class="flash {{ cat }}">{{ msg }}</div>{% endfor %}
+      {% endwith %}
+
+      <form method="post">
+        <label>Email</label>
+        <input type="email" name="email" placeholder="Enter your email" required>
+        <label>Password</label>
+        <input type="password" name="password" placeholder="Enter your password" required>
+        <div class="form-row-end"><a href="#" class="link">Forgot Password?</a></div>
+        <button class="btn-primary" type="submit">Sign In</button>
+      </form>
+      <p class="switch">Don't have an account? <a class="link" href="{{ url_for('signup') }}">Sign Up</a></p>
+    </div>
+  </div>
+</body>
+</html>

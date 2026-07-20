@@ -1,0 +1,39 @@
+# Data
+data/
+results/
+static/uploads/
+
+# Virtual environments / envs
+venvs/
+env/
+envs/
+.venv/
+venv/
+.env
+*.env
+
+# Third-party repo clone
+hw-ocr-iam/
+
+# Credentials / secrets
+neura_vertex_ai.json
+*.json.key
+*credentials*.json
+
+# README files
+README*.md
+README*
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# OS / editor
+.DS_Store
+
+# Generated docs / scratch / test assets
+*.docx
+test.JPG
+nemotron_run.py
+vertex_batch.py

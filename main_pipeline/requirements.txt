@@ -1,0 +1,4 @@
+google-genai>=2.8.0
+pymupdf>=1.27
+pillow>=10
+python-dotenv>=1.0
