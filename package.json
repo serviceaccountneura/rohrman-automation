@@ -22,14 +22,21 @@
     "pw:login": "tsx src/playwright/login.ts",
     "pw:capture": "tsx src/playwright/capture.ts",
     "pw:analyze": "tsx src/playwright/analyze.ts",
-    "pw:codegen": "playwright codegen --load-storage=tekion-auth.json https://app.tekioncloud.com/parts/purchase-order/list"
+    "pw:codegen": "playwright codegen --load-storage=tekion-auth.json https://app.tekioncloud.com/parts/purchase-order/list",
+    "server": "tsx src/apcServer.ts",
+    "dev": "tsx watch src/apcServer.ts",
+    "apc-server": "tsx src/apcServer.ts"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
+    "express": "^4.22.2",
+    "multer": "^1.4.5-lts.1",
     "otplib": "^12.0.1",
     "playwright": "^1.48.0"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/multer": "^1.4.13",
     "@types/node": "^22.7.0",
     "tsx": "^4.19.1",
     "typescript": "^5.6.2"

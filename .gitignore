@@ -19,6 +19,30 @@ captured/
 
 # Error screenshots from Playwright runs
 error-*.png
+misc-filled-*.png
+misc-submitted-*.png
+misc-vendor-fail-*.png
+dealer-menu-debug-*.png
+
+# Credentials / service account keys
+neura_vertex_ai.json
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE / agent config
+.agents/
+.claude/
+
+# Uploads, sample files, OCR results (data, not code)
+uploads/
+main_pipeline/Sample files/
+main_pipeline/results/
+
+# Internal notes
+notes.md
+architecture_decision.txt
 
 # OS / editor
 .DS_Store
