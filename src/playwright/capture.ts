@@ -51,7 +51,6 @@ async function main() {
   const browser = await chromium.launch({ headless: false, proxy: proxyFromEnv() });
   const context = await browser.newContext({
     storageState: SESSION_FILE,
-    viewport: { width: 1680, height: 1050 },
     recordHar: { path: harPath, content: 'embed' },
   });
   await context.tracing.start({ screenshots: true, snapshots: true, sources: true });

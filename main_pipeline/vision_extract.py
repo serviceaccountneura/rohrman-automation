@@ -381,7 +381,8 @@ def main() -> None:
             continue
         display(path, doc)
         if out_dir:
-            dest = out_dir / (path.stem + ".json")
+            parent = path.parent.name
+            dest = out_dir / (f"{parent} - {path.stem}.json")
             dest.write_text(json.dumps(doc, indent=2, default=str))
             print(f"  → wrote {dest}", file=sys.stderr)
         summary.append((path.name, "review" if doc.get("_needs_review") else "ok"))
