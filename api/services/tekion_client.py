@@ -17,6 +17,7 @@ Env: TEKION_USERNAME, TEKION_PASSWORD, TEKION_TOTP_SECRET
 """
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from datetime import datetime, timezone
@@ -24,13 +25,16 @@ from typing import Any
 
 import pyotp
 import requests
+from sqlmodel import Session
+
+from api.models.db import TekionSession
 
 BASE = "https://app.tekioncloud.com"
 TENANT = "rohrmanautomotivegroup"
 
 
 class TekionApiClient:
-    def __init__(self) -> None:
+    def __init__(self, db_session: Session | None = None) -> None:
         self.session = requests.Session()
         self.cookies: str = ""
         self.api_token: str = ""
@@ -38,6 +42,8 @@ class TekionApiClient:
         self.dealer_id: str = ""
         self.site_id: str = ""
         self.dealers: list[dict[str, str]] = []
+        self._db: Session | None = db_session
+        self._logged_in = False
 
     @property
     def current_dealer_id(self) -> str:
@@ -105,9 +111,17 @@ class TekionApiClient:
         method: str = "GET",
         body: Any = None,
         extra_headers: dict[str, str] | None = None,
+        _relogin: bool = True,
     ) -> Any:
         resp = self._req(path, method=method, body=body, extra_headers=extra_headers)
         if not resp.ok:
+            # 401/403 → session expired. Re-login once and retry.
+            if resp.status_code in (401, 403) and _relogin and not path.startswith("/api/loginservice"):
+                print(f"[API] Got {resp.status_code} on {method} {path} — re-logging in…")
+                self.login()
+                return self._req_json(
+                    path, method=method, body=body, extra_headers=extra_headers, _relogin=False
+                )
             raise Exception(f"{method} {path} -> {resp.status_code}: {resp.text[:300]}")
         return resp.json()
 
@@ -121,12 +135,19 @@ class TekionApiClient:
         if not email or not password or not totp_secret:
             raise Exception("TEKION_USERNAME, TEKION_PASSWORD, TEKION_TOTP_SECRET required in .env")
 
+        # Reset session state for a clean login.
+        self.cookies = ""
+        self.api_token = ""
+        self.user_id = ""
+        self.session = requests.Session()
+
         # Step 1: identity-provider
         print("[API] Login: identity-provider...")
         self._req_json(
             "/api/loginservice/p/identity-provider",
             method="POST",
             body={"email": email},
+            _relogin=False,
         )
 
         # Step 2: password
@@ -135,6 +156,7 @@ class TekionApiClient:
             "/api/loginservice/p/authenticate/password",
             method="POST",
             body={"email": email, "password": password},
+            _relogin=False,
         )
         pw_data = pw_res.get("data") or {}
         mfa_response = pw_data.get("mfaResponse") or pw_data
@@ -159,6 +181,7 @@ class TekionApiClient:
                 "authenticatorType": "GOOGLE_AUTHENTICATOR",
                 "otp": otp,
             },
+            _relogin=False,
         )
 
         login_data = (
@@ -180,11 +203,73 @@ class TekionApiClient:
             for d in login_data.get("dealer", [])
         ]
         self.site_id = f"-1_{self.dealer_id}"
+        self._logged_in = True
 
         print(f"[API] Logged in as {login_data.get('displayName')}, default dealer: {self.dealer_id}")
         print(f"[API] Available dealers: {len(self.dealers)}")
 
+        # Persist the session so we don't re-login next time.
+        self._save_session()
+
         return self.dealers
+
+    # ── Session persistence ────────────────────────────────────────────────────
+
+    def _save_session(self) -> None:
+        """Upsert the current session into the DB."""
+        if not self._db:
+            return
+        existing = self._db.get(TekionSession, 1)
+        now = datetime.now(timezone.utc)
+        if existing:
+            existing.cookies = self.cookies
+            existing.api_token = self.api_token
+            existing.user_id = self.user_id
+            existing.dealer_id = self.dealer_id
+            existing.site_id = self.site_id
+            existing.dealers_json = json.dumps(self.dealers)
+            existing.last_used_at = now
+            self._db.add(existing)
+        else:
+            row = TekionSession(
+                id=1,
+                cookies=self.cookies,
+                api_token=self.api_token,
+                user_id=self.user_id,
+                dealer_id=self.dealer_id,
+                site_id=self.site_id,
+                dealers_json=json.dumps(self.dealers),
+                created_at=now,
+                last_used_at=now,
+            )
+            self._db.add(row)
+        self._db.commit()
+        print(f"[API] Session saved to DB (dealer={self.dealer_id})")
+
+    def load_session(self) -> bool:
+        """Hydrate from the DB session. Returns True if a session was found."""
+        if not self._db:
+            return False
+        row = self._db.get(TekionSession, 1)
+        if not row or not row.api_token:
+            return False
+        self.cookies = row.cookies
+        self.api_token = row.api_token
+        self.user_id = row.user_id
+        self.dealer_id = row.dealer_id
+        self.site_id = row.site_id
+        try:
+            self.dealers = json.loads(row.dealers_json) if row.dealers_json else []
+        except (json.JSONDecodeError, TypeError):
+            self.dealers = []
+        self._logged_in = True
+        # Update last_used_at
+        row.last_used_at = datetime.now(timezone.utc)
+        self._db.add(row)
+        self._db.commit()
+        print(f"[API] Session loaded from DB (dealer={self.dealer_id}, "
+              f"saved {row.created_at.isoformat() if row.created_at else 'unknown'})")
+        return True
 
     def switch_dealer(self, dealer_id: str) -> None:
         self.dealer_id = dealer_id
@@ -299,6 +384,146 @@ class TekionApiClient:
                     "email": contact.get("email") or "",
                 }
         return None
+
+    def get_dealer_address(self) -> dict[str, Any]:
+        """Fetch the current dealer's default address from the bootstrap endpoint."""
+        res = self._req_json("/api/api-platform/u/bootstrap")
+        dm = (res.get("data") or {}).get("dealerMaster") or {}
+        addresses = dm.get("dealerAddress") or []
+        if not addresses:
+            raise Exception(f"No dealer address found for dealer {self.dealer_id}")
+        return addresses[0]
+
+    def create_stock_order(
+        self,
+        vendor_id: int,
+        vendor_name: str,
+        vendor_display_id: str,
+        vendor_site_id: str,
+        vendor_phone: str,
+        vendor_email: str,
+        parts: list[dict[str, Any]],
+        dealer_address: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Create + submit a vendor stock order (NON_OEM_STOCK_ORDER).
+
+        No pre-invoice — the order is submitted and ready for receiving on the
+        Tekion UI.
+        """
+        # Build the shipping/billing address from the dealer's default address.
+        addr = {
+            "complexListId": dealer_address.get("complexListId", "Default"),
+            "dealerAddressID": dealer_address.get("dealerAddressID", "1"),
+            "addressType": dealer_address.get("addressType", 0),
+            "addressTypeDisplayName": dealer_address.get("addressTypeDisplayName", "DEFAULT"),
+            "streetAddress1": dealer_address.get("streetAddress1", ""),
+            "streetAddress2": dealer_address.get("streetAddress2", ""),
+            "streetAddress3": dealer_address.get("streetAddress3"),
+            "streetAddress4": dealer_address.get("streetAddress4"),
+            "city": dealer_address.get("city", ""),
+            "state": dealer_address.get("state", ""),
+            "zipCode": dealer_address.get("zipCode", ""),
+            "country": dealer_address.get("country", "US"),
+            "county": dealer_address.get("county", ""),
+            "isdCode": dealer_address.get("isdCode", ""),
+            "locationUrl": dealer_address.get("locationUrl"),
+            "epa": dealer_address.get("epa"),
+            "bar": dealer_address.get("bar"),
+            "website": dealer_address.get("website"),
+            "phoneNumber": dealer_address.get("phoneNumber"),
+            "phoneNumberUnformatted": dealer_address.get("phoneNumberUnformatted"),
+            "email": dealer_address.get("email"),
+            "departmentId": dealer_address.get("departmentId"),
+            "departmentName": dealer_address.get("departmentName"),
+            "makeId": dealer_address.get("makeId"),
+            "makeName": dealer_address.get("makeName"),
+            "fromEmail": dealer_address.get("fromEmail"),
+            "fromName": dealer_address.get("fromName"),
+            "geoLocation": dealer_address.get("geoLocation"),
+            "addressOverride": dealer_address.get("addressOverride"),
+            "isActive": dealer_address.get("isActive", True),
+            "line1": dealer_address.get("streetAddress1", ""),
+            "line2": dealer_address.get("streetAddress2", ""),
+            "pincode": dealer_address.get("zipCode", ""),
+        }
+
+        # Build parts list — parts come in with alias keys (partNumber, unitPrice, etc.)
+        parts_payload = []
+        for p in parts:
+            part_number = p.get("partNumber") or p.get("part_number", "")
+            part_name = p.get("partName") or p.get("part_name", "")
+            unit_price = p.get("unitPrice") or p.get("unit_price", 0)
+            brand_code = p.get("brandCode") or p.get("brand_code", "")
+            qty = p.get("qty", 1)
+            part_id = f"M_{brand_code}_{part_number}".replace(" ", "_")
+            parts_payload.append({
+                "partId": part_id,
+                "qty": qty,
+                "unit": "ea",
+                "price": unit_price,
+                "charges": [],
+                "partNumber": part_number,
+                "partName": part_name,
+                "dmsPartNumber": part_number.replace(" ", ""),
+                "brandCode": brand_code,
+                "groupIds": [],
+                "extra": {
+                    "originalCostPrice": unit_price,
+                    "partCostOverriddenByVendorPricing": False,
+                },
+            })
+
+        body = {
+            "vendorSiteId": vendor_site_id,
+            "vendorId": vendor_id,
+            "vendorPhone": vendor_phone,
+            "vendorEmail": vendor_email,
+            "vendorName": vendor_name,
+            "vendorDisplayId": vendor_display_id,
+            "vendorAddress": {},
+            "temporaryVendor": False,
+            "estimateDeliveryTime": None,
+            "shippingAddress": addr,
+            "billingAddress": addr,
+            "poAssetType": "parts",
+            "companyId": 1,
+            "parts": parts_payload,
+            "items": False,
+            "poChargeToAdd": [],
+            "poChargeToUpdate": [],
+            "poChargeToDelete": [],
+            "status": "READY_TO_SUBMIT",
+            "controlNumber": None,
+            "orderType": "NON_OEM_STOCK_ORDER",
+            "purchaseType": "REGULAR",
+            "additional": {},
+            "newTaxCodeEnabled": False,
+            "poTaxConfiguration": {
+                "taxCodeGrid": [],
+                "taxDetails": [],
+                "flatTaxDetails": [],
+            },
+            "printConfigDto": {
+                "copyTypes": ["VENDOR", "DEALER"],
+                "sortDetails": None,
+                "copyTypeVsLocale": None,
+            },
+        }
+
+        res = self._req_json(
+            "/api/partTrade/u/nonOem/order",
+            method="POST",
+            body=body,
+        )
+        data = res.get("data") or {}
+        return {
+            "orderId": data.get("id"),
+            "orderNumber": data.get("orderNumber"),
+            "status": data.get("status"),
+            "universalId": data.get("universalId"),
+            "totalAmount": data.get("totalAmount"),
+            "vendorName": (data.get("vendorDetails") or {}).get("vendorName"),
+        }
 
     def search_ro(self, ro_number: str) -> list[dict[str, str]]:
         res = self._req_json(

@@ -1,6 +1,6 @@
 """Tekion routes — unified PO creation + vendor mapping management.
 
-POST /api/tekion/po        — create sublet or misc PO (discriminated by po_type)
+POST /api/tekion/po        — create sublet, misc, or stock PO (discriminated by po_type)
 GET  /api/tekion/vendors/{dealer_id}  — list vendor mappings for a dealer
 POST /api/tekion/vendors   — add/update a vendor mapping (after human review)
 """
@@ -18,6 +18,7 @@ from api.models.schemas import (
     CreateMiscPoRequest,
     CreatePoRequest,
     CreatePoResponse,
+    CreateStockPoRequest,
     CreateSubletPoRequest,
     VendorCandidate,
 )
@@ -26,17 +27,22 @@ from api.services.vendor_service import _normalize, resolve_vendor
 
 router = APIRouter(prefix="/api/tekion", tags=["tekion"])
 
-# Shared client — login once, reuse across requests.
+# Shared client — hydrated from DB session, re-logs in lazily on 401.
 _client: TekionApiClient | None = None
 _client_lock = threading.Lock()
 
 
-def get_client() -> TekionApiClient:
+def get_client(db_session: Session) -> TekionApiClient:
     global _client
     with _client_lock:
         if _client is None:
-            _client = TekionApiClient()
-            _client.login()
+            _client = TekionApiClient(db_session=db_session)
+            # Try to restore the saved session before logging in.
+            if not _client.load_session():
+                _client.login()
+        else:
+            # Keep the DB session reference current (each request has its own).
+            _client._db = db_session
         return _client
 
 
@@ -104,6 +110,8 @@ def create_po(
 ) -> CreatePoResponse:
     if isinstance(req, CreateSubletPoRequest):
         return _create_sublet_po(req, session)
+    if isinstance(req, CreateStockPoRequest):
+        return _create_stock_po(req, session)
     return _create_misc_po(req, session)
 
 
@@ -112,7 +120,7 @@ def _create_sublet_po(
     session: Session,
 ) -> CreatePoResponse:
     try:
-        client = get_client()
+        client = get_client(session)
         dealer_id = _resolve_dealer(client, req.dealership_name)
         vendor = _resolve_vendor(client, dealer_id, req.vendor_name, session)
 
@@ -218,7 +226,7 @@ def _create_misc_po(
     session: Session,
 ) -> CreatePoResponse:
     try:
-        client = get_client()
+        client = get_client(session)
         dealer_id = _resolve_dealer(client, req.dealership_name)
         vendor = _resolve_vendor(client, dealer_id, req.vendor_name, session)
 
@@ -284,7 +292,48 @@ def _create_misc_po(
         return CreatePoResponse(success=False, error=str(e))
 
 
-# ── Vendor mapping management ─────────────────────────────────────────────────
+def _create_stock_po(
+    req: CreateStockPoRequest,
+    session: Session,
+) -> CreatePoResponse:
+    try:
+        client = get_client(session)
+        dealer_id = _resolve_dealer(client, req.dealership_name)
+        vendor = _resolve_vendor(client, dealer_id, req.vendor_name, session)
+
+        if not req.parts:
+            raise HTTPException(
+                status_code=422,
+                detail="Stock PO requires at least one part",
+            )
+
+        # Fetch dealer address for shipping/billing
+        dealer_address = client.get_dealer_address()
+
+        order = client.create_stock_order(
+            vendor_id=int(vendor["id"]),
+            vendor_name=vendor["name"],
+            vendor_display_id=vendor["displayId"],
+            vendor_site_id=vendor["siteId"],
+            vendor_phone=vendor["phone"],
+            vendor_email=vendor["email"],
+            parts=[p.model_dump(by_alias=True) for p in req.parts],
+            dealer_address=dealer_address,
+        )
+
+        return CreatePoResponse(
+            success=True,
+            po_number=str(order.get("orderNumber") or ""),
+            po_id=order.get("orderId"),
+            po_status=order.get("status"),
+            vendor_name=order.get("vendorName") or vendor["name"],
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        reset_client()
+        return CreatePoResponse(success=False, error=str(e))
 
 
 @router.get("/vendors/{dealer_id}")

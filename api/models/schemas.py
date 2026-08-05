@@ -37,9 +37,20 @@ class OcrJobResult(BaseModel):
 class PoType(str, Enum):
     SUBLET = "SUBLET"
     MISCELLANEOUS = "MISCELLANEOUS"
+    STOCK = "STOCK"
 
 
 # ── Line items (per PO type) ──────────────────────────────────────────────────
+
+
+class StockPartInput(BaseModel):
+    part_number: str = Field(alias="partNumber")
+    part_name: str = Field(alias="partName")
+    qty: float = 1.0
+    unit_price: float = Field(alias="unitPrice")
+    brand_code: str = Field(alias="brandCode")
+
+    model_config = {"populate_by_name": True}
 
 
 class MiscLineItem(BaseModel):
@@ -86,9 +97,15 @@ class CreateMiscPoRequest(_CreatePoBase):
     line_items: list[MiscLineItem] = Field(default_factory=list, alias="lineItems")
 
 
+class CreateStockPoRequest(_CreatePoBase):
+    """Vendor stock order — create + submit only, no pre-invoice."""
+    po_type: Literal["STOCK"] = "STOCK"
+    parts: list[StockPartInput] = Field(default_factory=list, alias="parts")
+
+
 # FastAPI / Pydantic dispatches to the correct schema based on po_type.
 CreatePoRequest = Annotated[
-    Union[CreateSubletPoRequest, CreateMiscPoRequest],
+    Union[CreateSubletPoRequest, CreateMiscPoRequest, CreateStockPoRequest],
     Field(discriminator="po_type"),
 ]
 

@@ -2,6 +2,10 @@
 """
 from __future__ import annotations
 
+from dotenv import load_dotenv
+
+load_dotenv()  # Load TEKION_* and other env vars before anything imports them.
+
 from fastapi import Depends, FastAPI
 
 from api.deps import get_current_user

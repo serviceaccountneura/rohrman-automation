@@ -1,4 +1,4 @@
-"""SQLModel table definitions — auth + vendor mappings."""
+"""SQLModel table definitions — auth + vendor mappings + Tekion sessions."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -59,3 +59,24 @@ class VendorMapping(SQLModel, table=True):
     __table_args__ = (
         UniqueConstraint("dealer_id", "vendor_name", name="uq_vendor_mapping_dealer_vendor"),
     )
+
+
+class TekionSession(SQLModel, table=True):
+    """Persisted Tekion API session — avoids re-logging in on every request.
+
+    The client tries the saved session first; if Tekion returns 401/403,
+    it re-logs in and updates this row.
+    """
+
+    __tablename__ = "tekion_sessions"
+
+    # Singleton row — always id=1.
+    id: int = Field(default=1, primary_key=True)
+    cookies: str = Field(default="", max_length=10000)
+    api_token: str = Field(default="", max_length=1000)
+    user_id: str = Field(default="", max_length=100)
+    dealer_id: str = Field(default="", max_length=20)
+    site_id: str = Field(default="", max_length=30)
+    dealers_json: str = Field(default="[]", max_length=10000)
+    created_at: datetime = Field(default_factory=_utcnow)
+    last_used_at: datetime = Field(default_factory=_utcnow)
