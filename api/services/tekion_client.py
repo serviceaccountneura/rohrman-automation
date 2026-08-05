@@ -252,6 +252,54 @@ class TekionApiClient:
             )
         return vendors
 
+    def get_vendor_by_display_id(self, vendor_display_id: str) -> dict[str, str] | None:
+        """Fetch a single vendor by its Tekion vendorDisplayId (e.g. '1707_160').
+
+        Returns the same shape as search_vendor() entries, or None if not found.
+        """
+        res = self._req_json(
+            "/api/lookup/search",
+            method="POST",
+            body={
+                "VENDOR": {
+                    "filters": [
+                        {
+                            "field": "vendorStatus",
+                            "operator": "NIN",
+                            "values": ["DRAFT", "INACTIVE", "ON_HOLD"],
+                            "key": "vendorStatus",
+                        },
+                        {
+                            "field": "vendorDisplayId",
+                            "operator": "IN",
+                            "values": [vendor_display_id],
+                            "key": "vendorDisplayId",
+                        },
+                    ],
+                    "searchText": "",
+                    "pageInfo": {"start": 0, "rows": 5},
+                    "sort": [],
+                }
+            },
+        )
+
+        results = self._extract_lookup_results(res, "VENDOR")
+        for v in results:
+            if str(v.get("vendorDisplayId", "")) == vendor_display_id:
+                sites = v.get("sites") or []
+                site = sites[0] if sites else {}
+                contacts = site.get("pointOfContacts") or []
+                contact = contacts[0] if contacts else {}
+                return {
+                    "id": str(v.get("id", "")),
+                    "name": v.get("vendorName", ""),
+                    "displayId": v.get("vendorDisplayId", ""),
+                    "siteId": str(site.get("id", "")),
+                    "phone": contact.get("phone") or contact.get("mobile") or "",
+                    "email": contact.get("email") or "",
+                }
+        return None
+
     def search_ro(self, ro_number: str) -> list[dict[str, str]]:
         res = self._req_json(
             "/api/lookup/search",

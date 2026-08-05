@@ -1,9 +1,10 @@
-"""SQLModel table definitions for auth (users + refresh tokens)."""
+"""SQLModel table definitions — auth + vendor mappings."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
+from sqlalchemy import UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 
@@ -36,3 +37,25 @@ class RefreshToken(SQLModel, table=True):
     expires_at: datetime
     revoked: bool = Field(default=False)
     created_at: datetime = Field(default_factory=_utcnow)
+
+
+class VendorMapping(SQLModel, table=True):
+    """Maps (dealer_id, vendor_name) → Tekion vendorDisplayId.
+
+    Seeded per-dealership so PO creation resolves the exact vendor
+    instead of fuzzy-searching Tekion and taking the first hit.
+    """
+
+    __tablename__ = "vendor_mappings"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    dealer_id: str = Field(index=True, max_length=20)
+    # Normalized vendor name — uppercase, stripped. Used for lookups.
+    vendor_name: str = Field(index=True, max_length=255)
+    # Tekion vendorDisplayId, e.g. "1707_160"
+    vendor_display_id: str = Field(max_length=100)
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("dealer_id", "vendor_name", name="uq_vendor_mapping_dealer_vendor"),
+    )

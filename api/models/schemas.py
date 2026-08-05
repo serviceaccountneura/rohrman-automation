@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Annotated, Any, Literal, Union
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -39,47 +39,67 @@ class PoType(str, Enum):
     MISCELLANEOUS = "MISCELLANEOUS"
 
 
-class LineItemInput(BaseModel):
-    description: str
+# ── Line items (per PO type) ──────────────────────────────────────────────────
+
+
+class MiscLineItem(BaseModel):
+    part_name: str = Field(alias="partName")
     qty: float = 1.0
-    unit_price: float = Field(default=0.0, alias="unitPrice")
-    total_price: float = Field(default=0.0, alias="totalPrice")
+    unit_price: float = Field(alias="unitPrice")
+    gl_account: str = Field(alias="glAccount")
 
     model_config = {"populate_by_name": True}
 
 
-class SubletItemInput(BaseModel):
+class SubletLineItem(BaseModel):
+    ro_number: str = Field(alias="roNo")
+    job_number: str = Field(alias="jobNo")
     description: str
+    opcode: str = "SUBLET"
     labor_amount: float = Field(default=0.0, alias="laborAmount")
     parts_amount: float = Field(default=0.0, alias="partsAmount")
 
     model_config = {"populate_by_name": True}
 
 
-class CreateSubletPoRequest(BaseModel):
+# ── Discriminated union: po_type selects the schema ───────────────────────────
+
+
+class _CreatePoBase(BaseModel):
     dealership_name: str = Field(alias="dealershipName")
     vendor_name: str = Field(alias="vendorName")
-    control_number: str = Field(alias="controlNumber")
     invoice_number: str = Field(alias="invoiceNumber")
     invoice_amount: float = Field(alias="invoiceAmount")
     sales_tax: float = Field(default=0.0, alias="salesTax")
-    gl_account: str = Field(default="2460", alias="glAccount")
-    job_type: str | None = Field(default=None, alias="jobType")
-    opcode: str = "SUBLET"
-    category: str = "MISCELLANEOUS"
-    line_items: list[SubletItemInput] = Field(default_factory=list, alias="lineItems")
 
     model_config = {"populate_by_name": True}
 
 
-class CreateMiscPoRequest(BaseModel):
-    dealership_name: str = Field(alias="dealershipName")
-    vendor_name: str = Field(alias="vendorName")
-    invoice_number: str = Field(alias="invoiceNumber")
-    invoice_amount: float = Field(alias="invoiceAmount")
-    sales_tax: float = Field(default=0.0, alias="salesTax")
-    gl_account: str = Field(default="0021", alias="glAccount")
-    line_items: list[LineItemInput] = Field(default_factory=list, alias="lineItems")
+class CreateSubletPoRequest(_CreatePoBase):
+    # po_type is the discriminator — no alias so it matches the JSON key directly.
+    po_type: Literal["SUBLET"] = "SUBLET"
+    line_items: list[SubletLineItem] = Field(default_factory=list, alias="lineItems")
+
+
+class CreateMiscPoRequest(_CreatePoBase):
+    po_type: Literal["MISCELLANEOUS"] = "MISCELLANEOUS"
+    line_items: list[MiscLineItem] = Field(default_factory=list, alias="lineItems")
+
+
+# FastAPI / Pydantic dispatches to the correct schema based on po_type.
+CreatePoRequest = Annotated[
+    Union[CreateSubletPoRequest, CreateMiscPoRequest],
+    Field(discriminator="po_type"),
+]
+
+
+class VendorCandidate(BaseModel):
+    id: str
+    name: str
+    display_id: str = Field(alias="displayId")
+    site_id: str = Field(default="", alias="siteId")
+    phone: str = ""
+    email: str = ""
 
     model_config = {"populate_by_name": True}
 
@@ -92,6 +112,10 @@ class CreatePoResponse(BaseModel):
     invoice_id: str | None = None
     vendor_name: str | None = None
     error: str | None = None
+    # When vendor could not be resolved from the mapping, these are set:
+    needs_review: bool = False
+    review_reason: str | None = None
+    vendor_candidates: list[VendorCandidate] = Field(default_factory=list)
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
