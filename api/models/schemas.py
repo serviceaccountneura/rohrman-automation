@@ -171,3 +171,33 @@ class RefreshRequest(BaseModel):
 
 class MessageResponse(BaseModel):
     message: str
+
+
+# ── Dashboard ─────────────────────────────────────────────────────────────────
+
+
+class DashboardSummary(BaseModel):
+    total: int
+    processed: int
+    exceptions: int
+    auto_resolved: int
+
+
+class DocumentsByType(BaseModel):
+    SUBLET: int = 0
+    MISCELLANEOUS: int = 0
+    STOCK: int = 0
+
+
+class ExceptionItem(BaseModel):
+    id: UUID
+    vendor: str
+    invoice_number: str
+    po_number: str
+    exception_type: str
+
+
+class DashboardResponse(BaseModel):
+    summary: DashboardSummary
+    by_type: DocumentsByType
+    recent_exceptions: list[ExceptionItem]

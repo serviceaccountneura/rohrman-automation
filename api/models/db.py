@@ -1,4 +1,4 @@
-"""SQLModel table definitions — auth + vendor mappings + Tekion sessions."""
+"""SQLModel table definitions — auth + vendor mappings + Tekion sessions + documents."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -80,3 +80,26 @@ class TekionSession(SQLModel, table=True):
     dealers_json: str = Field(default="[]", max_length=10000)
     created_at: datetime = Field(default_factory=_utcnow)
     last_used_at: datetime = Field(default_factory=_utcnow)
+
+
+class Document(SQLModel, table=True):
+    """Tracks each document (invoice/PO/parts ticket) through the automation pipeline.
+
+    Powers the dashboard stats and exception queue.
+    """
+
+    __tablename__ = "documents"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    file_name: str = Field(default="", max_length=500)
+    dealership_name: str = Field(default="", max_length=255, index=True)
+    vendor_name: str = Field(default="", max_length=255, index=True)
+    invoice_number: str = Field(default="", max_length=100)
+    po_number: str = Field(default="", max_length=100)
+    po_type: str = Field(default="", max_length=20, index=True)  # SUBLET, MISCELLANEOUS, STOCK
+    # PENDING, PROCESSED, EXCEPTION, AUTO_RESOLVED
+    status: str = Field(default="PENDING", max_length=20, index=True)
+    # VENDOR_NOT_FOUND, PO_MISMATCH, AMOUNT_MISMATCH, LOW_OCR_CONFIDENCE, etc.
+    exception_type: str | None = Field(default=None, max_length=100)
+    created_at: datetime = Field(default_factory=_utcnow, index=True)
+    processed_at: datetime | None = Field(default=None)
