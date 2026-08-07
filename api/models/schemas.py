@@ -57,7 +57,8 @@ class MiscLineItem(BaseModel):
     part_name: str = Field(alias="partName")
     qty: float = 1.0
     unit_price: float = Field(alias="unitPrice")
-    gl_account: str = Field(alias="glAccount")
+    # Optional — auto-resolved from vendor table + department fallback if omitted.
+    gl_account: str | None = Field(default=None, alias="glAccount")
 
     model_config = {"populate_by_name": True}
 
@@ -171,6 +172,24 @@ class RefreshRequest(BaseModel):
 
 class MessageResponse(BaseModel):
     message: str
+
+
+# ── Invoice upload ────────────────────────────────────────────────────────────
+
+
+class UploadUrlRequest(BaseModel):
+    file_name: str = Field(alias="fileName")
+    dealership_name: str | None = Field(default=None, alias="dealershipName")
+
+    model_config = {"populate_by_name": True}
+
+
+class UploadUrlResponse(BaseModel):
+    upload_url: str = Field(alias="uploadUrl")
+    s3_key: str = Field(alias="s3Key")
+    file_name: str = Field(alias="fileName")
+
+    model_config = {"populate_by_name": True}
 
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────

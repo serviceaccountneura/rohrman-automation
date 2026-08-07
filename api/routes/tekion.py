@@ -24,6 +24,7 @@ from api.models.schemas import (
 )
 from api.services.tekion_client import TekionApiClient
 from api.services.vendor_service import _normalize, resolve_vendor
+from api.services.gl_service import resolve_gl
 
 router = APIRouter(prefix="/api/tekion", tags=["tekion"])
 
@@ -253,8 +254,15 @@ def _create_misc_po(
             items=items,
         )
 
-        # Pre-invoice — use the first line item's GL, or default 0021.
-        gl_account = req.line_items[0].gl_account if req.line_items else "0021"
+        # Pre-invoice — resolve GL account from vendor table + department fallback.
+        descriptions = [li.part_name for li in req.line_items] or ["Misc purchase"]
+        gl_account = resolve_gl(
+            po_type="MISCELLANEOUS",
+            dealership_name=req.dealership_name,
+            vendor_name=req.vendor_name,
+            line_descriptions=descriptions,
+            session=session,
+        )
         gl_account_id = f"{dealer_id}_{gl_account}"
         ap_gl_account_id = f"{dealer_id}_3002"
 

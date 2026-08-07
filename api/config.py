@@ -24,6 +24,13 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 15
     refresh_token_expire_days: int = 7
 
+    # ── AWS S3 ────────────────────────────────────────────────────────────────
+    aws_access_key_id: str = ""
+    aws_secret_access_key: str = ""
+    aws_region: str = "us-east-2"
+    s3_bucket: str = "rohrman-invoices"
+    s3_presign_expiry: int = 300  # seconds (5 min)
+
 
 @lru_cache
 def get_settings() -> Settings:

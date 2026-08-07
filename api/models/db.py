@@ -1,4 +1,4 @@
-"""SQLModel table definitions — auth + vendor mappings + Tekion sessions + documents."""
+"""SQLModel table definitions — auth + vendor mappings + Tekion sessions + documents + GL mappings."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -103,3 +103,20 @@ class Document(SQLModel, table=True):
     exception_type: str | None = Field(default=None, max_length=100)
     created_at: datetime = Field(default_factory=_utcnow, index=True)
     processed_at: datetime | None = Field(default=None)
+
+
+class GlVendorMapping(SQLModel, table=True):
+    """Master Miscellaneous Vendor-to-GL lookup table.
+
+    Applies across all dealerships when generating a Miscellaneous PO.
+    If a vendor is not in this table, the department fallback is used.
+    """
+
+    __tablename__ = "gl_vendor_mappings"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    # Normalized vendor name (uppercase, stripped) for lookups.
+    vendor_name: str = Field(index=True, unique=True, max_length=255)
+    gl_account: str = Field(max_length=10)
+    description: str = Field(default="", max_length=255)
+    created_at: datetime = Field(default_factory=_utcnow)
