@@ -154,9 +154,27 @@ class UserRead(BaseModel):
     id: UUID
     email: str
     full_name: str | None = None
+    role: str
     is_active: bool
     is_superuser: bool
     created_at: datetime
+
+
+class UserListItem(BaseModel):
+    id: UUID
+    full_name: str | None
+    email: str
+    role: str
+    status: str  # ACTIVE / INACTIVE
+
+
+class UserListResponse(BaseModel):
+    items: list[UserListItem]
+    total: int
+
+
+class UpdateUserStatusRequest(BaseModel):
+    is_active: bool
 
 
 class Token(BaseModel):
@@ -220,3 +238,82 @@ class DashboardResponse(BaseModel):
     summary: DashboardSummary
     by_type: DocumentsByType
     recent_exceptions: list[ExceptionItem]
+
+
+class DocumentItem(BaseModel):
+    id: UUID
+    file_name: str
+    dealership_name: str
+    vendor_name: str
+    invoice_number: str
+    ro_number: str
+    po_number: str
+    po_type: str
+    status: str
+    exception_type: str | None
+    created_at: datetime
+    processed_at: datetime | None
+
+
+class DocumentListResponse(BaseModel):
+    items: list[DocumentItem]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
+class ExceptionListItem(BaseModel):
+    id: UUID
+    vendor_name: str
+    invoice_number: str
+    vin: str
+    po_number: str
+    ro_number: str
+    exception_type: str | None
+    severity: str | None
+    detected_on: datetime
+    document_type: str
+    status: str
+
+
+class ExceptionListResponse(BaseModel):
+    items: list[ExceptionListItem]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
+class ExceptionTypeCount(BaseModel):
+    exception_type: str
+    count: int
+
+
+class ExceptionAnalyticsResponse(BaseModel):
+    total_exceptions: int
+    critical: int
+    medium: int
+    low: int
+    auto_resolved: int
+    by_exception_type: list[ExceptionTypeCount]
+
+
+class NotificationItem(BaseModel):
+    id: UUID
+    title: str
+    message: str
+    category: str
+    severity: str
+    is_read: bool
+    document_id: UUID | None = None
+    created_at: datetime
+
+
+class NotificationListResponse(BaseModel):
+    items: list[NotificationItem]
+    total: int
+    unread_count: int
+    page: int
+    page_size: int
+    total_pages: int

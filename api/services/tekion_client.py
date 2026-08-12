@@ -66,6 +66,18 @@ class TekionApiClient:
             "Accept": "application/json, text/plain, */*",
             "Origin": BASE,
             "Referer": f"{BASE}/",
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/138.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+            "sec-ch-ua": '"Chromium";v="138", "Google Chrome";v="138"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"macOS"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
         }
         if self.cookies:
             headers["Cookie"] = self.cookies
@@ -393,6 +405,52 @@ class TekionApiClient:
         if not addresses:
             raise Exception(f"No dealer address found for dealer {self.dealer_id}")
         return addresses[0]
+
+    def fetch_gl_accounts(self) -> list[dict[str, Any]]:
+        """Fetch all GL accounts for the current dealership from Tekion.
+
+        Uses POST /api/lookup/search with GL_ACCOUNT_ASSET, paginated.
+        Returns a list of dicts with: account_id, account_number, account_name,
+        account_type, department_type, active.
+        """
+        accounts: list[dict[str, Any]] = []
+        start = 0
+        rows = 100
+
+        while True:
+            res = self._req_json(
+                "/api/lookup/search",
+                method="POST",
+                body={
+                    "GL_ACCOUNT_ASSET": {
+                        "filters": [],
+                        "searchText": "",
+                        "pageInfo": {"start": start, "rows": rows},
+                        "sort": [],
+                    }
+                },
+            )
+            data = (res.get("data") or {}).get("GL_ACCOUNT_ASSET") or {}
+            entities = data.get("entities") or []
+            count = data.get("count", 0)
+
+            for e in entities:
+                d = e.get("data") or {}
+                accounts.append({
+                    "account_id": d.get("id", ""),
+                    "account_number": d.get("accountNumber", ""),
+                    "account_name": d.get("accountName", ""),
+                    "account_type": d.get("accountTypeId", ""),
+                    "department_type": d.get("departmentType", ""),
+                    "active": d.get("active", True),
+                })
+
+            start += rows
+            if start >= count or len(entities) == 0:
+                break
+
+        print(f"[API] Fetched {len(accounts)} GL accounts for dealer {self.dealer_id}")
+        return accounts
 
     def create_stock_order(
         self,

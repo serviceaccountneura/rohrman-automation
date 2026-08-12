@@ -25,6 +25,7 @@ from api.models.schemas import (
 from api.services.tekion_client import TekionApiClient
 from api.services.vendor_service import _normalize, resolve_vendor
 from api.services.gl_service import resolve_gl
+from api.services.gl_service_misc import resolve_misc_gl, refresh_gl_accounts as refresh_gl_cache
 
 router = APIRouter(prefix="/api/tekion", tags=["tekion"])
 
@@ -254,16 +255,15 @@ def _create_misc_po(
             items=items,
         )
 
-        # Pre-invoice — resolve GL account from vendor table + department fallback.
+        # Pre-invoice — resolve GL account via Tekion GL accounts + LLM.
         descriptions = [li.part_name for li in req.line_items] or ["Misc purchase"]
-        gl_account = resolve_gl(
-            po_type="MISCELLANEOUS",
+        gl_account_id = resolve_misc_gl(
             dealership_name=req.dealership_name,
-            vendor_name=req.vendor_name,
+            dealer_id=dealer_id,
             line_descriptions=descriptions,
+            client=client,
             session=session,
         )
-        gl_account_id = f"{dealer_id}_{gl_account}"
         ap_gl_account_id = f"{dealer_id}_3002"
 
         result = client.pre_invoice(
@@ -388,3 +388,22 @@ def add_vendor_mapping(
         )
     session.commit()
     return {"message": "Vendor mapping saved"}
+
+
+@router.post("/gl-accounts/{dealer_id}/refresh")
+def refresh_gl_accounts(
+    dealer_id: str,
+    session: Annotated[Session, Depends(get_session)],
+) -> dict:
+    """Force-refresh cached GL accounts for a dealership from Tekion."""
+    try:
+        client = get_client(session)
+        accounts = refresh_gl_cache(dealer_id, client, session)
+        return {
+            "message": "GL accounts refreshed",
+            "dealer_id": dealer_id,
+            "count": len(accounts),
+        }
+    except Exception as e:
+        reset_client()
+        raise HTTPException(status_code=500, detail=str(e))

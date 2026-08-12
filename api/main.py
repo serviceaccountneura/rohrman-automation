@@ -9,7 +9,7 @@ load_dotenv()  # Load TEKION_* and other env vars before anything imports them.
 from fastapi import Depends, FastAPI
 
 from api.deps import get_current_user
-from api.routes import auth, dashboard, invoices, ocr, tekion
+from api.routes import auth, dashboard, invoices, notifications, ocr, tekion, users
 
 app = FastAPI(
     title="Rohrman Automation API",
@@ -25,6 +25,8 @@ app.include_router(ocr.router, dependencies=[Depends(get_current_user)])
 app.include_router(tekion.router, dependencies=[Depends(get_current_user)])
 app.include_router(dashboard.router, dependencies=[Depends(get_current_user)])
 app.include_router(invoices.router, dependencies=[Depends(get_current_user)])
+app.include_router(users.router, dependencies=[Depends(get_current_user)])
+app.include_router(notifications.router, dependencies=[Depends(get_current_user)])
 
 
 @app.get("/health")

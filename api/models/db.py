@@ -19,6 +19,7 @@ class User(SQLModel, table=True):
     email: str = Field(index=True, unique=True, max_length=255)
     full_name: str | None = Field(default=None, max_length=255)
     hashed_password: str
+    role: str = Field(default="AP_CLERK", max_length=50, index=True)
     is_active: bool = Field(default=True)
     is_superuser: bool = Field(default=False)
     created_at: datetime = Field(default_factory=_utcnow)
@@ -95,12 +96,18 @@ class Document(SQLModel, table=True):
     dealership_name: str = Field(default="", max_length=255, index=True)
     vendor_name: str = Field(default="", max_length=255, index=True)
     invoice_number: str = Field(default="", max_length=100)
+    vin: str = Field(default="", max_length=20)
+    ro_number: str = Field(default="", max_length=100)
     po_number: str = Field(default="", max_length=100)
     po_type: str = Field(default="", max_length=20, index=True)  # SUBLET, MISCELLANEOUS, STOCK
+    # AP_INVOICE, PO, PARTS_TICKET, JOURNAL, GL_REPORT, STATEMENT, REPAIR_ORDER, MANUFACTURER_INVOICE
+    document_type: str = Field(default="", max_length=30, index=True)
     # PENDING, PROCESSED, EXCEPTION, AUTO_RESOLVED
     status: str = Field(default="PENDING", max_length=20, index=True)
     # VENDOR_NOT_FOUND, PO_MISMATCH, AMOUNT_MISMATCH, LOW_OCR_CONFIDENCE, etc.
     exception_type: str | None = Field(default=None, max_length=100)
+    # HIGH, MEDIUM, LOW
+    severity: str | None = Field(default=None, max_length=10, index=True)
     created_at: datetime = Field(default_factory=_utcnow, index=True)
     processed_at: datetime | None = Field(default=None)
 
@@ -120,3 +127,51 @@ class GlVendorMapping(SQLModel, table=True):
     gl_account: str = Field(max_length=10)
     description: str = Field(default="", max_length=255)
     created_at: datetime = Field(default_factory=_utcnow)
+
+
+class TekionGlAccount(SQLModel, table=True):
+    """Cached GL accounts per dealership, fetched from Tekion.
+
+    Used by the misc PO GL resolver to give the LLM real account names
+    to match against line item descriptions.
+    """
+
+    __tablename__ = "tekion_gl_accounts"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    dealer_id: str = Field(index=True, max_length=20)
+    # Full Tekion GL account ID, e.g. "1708_7473"
+    account_id: str = Field(max_length=50)
+    # Account number only, e.g. "7473"
+    account_number: str = Field(max_length=20)
+    # Human-readable name, e.g. "OFF SUPPLY & EXP - SRV"
+    account_name: str = Field(max_length=255)
+    # e.g. "OPERATING_EXPENSE", "ASSET", "LIABILITY"
+    account_type: str = Field(default="", max_length=50)
+    # e.g. "SERVICE", "PARTS", "VEHICLE_SALES"
+    department_type: str = Field(default="", max_length=50)
+    active: bool = Field(default=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("dealer_id", "account_id", name="uq_tekion_gl_dealer_account"),
+    )
+
+
+class Notification(SQLModel, table=True):
+    """User notifications — exceptions, processing events, system alerts."""
+
+    __tablename__ = "notifications"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    user_id: UUID = Field(foreign_key="users.id", index=True)
+    title: str = Field(max_length=255)
+    message: str = Field(default="", max_length=1000)
+    # EXCEPTION, PO_CREATED, PROCESSED, SYSTEM, etc.
+    category: str = Field(default="SYSTEM", max_length=50, index=True)
+    # INFO, WARNING, ERROR
+    severity: str = Field(default="INFO", max_length=10)
+    is_read: bool = Field(default=False, index=True)
+    # Optional link to a document
+    document_id: UUID | None = Field(default=None, foreign_key="documents.id")
+    created_at: datetime = Field(default_factory=_utcnow, index=True)
