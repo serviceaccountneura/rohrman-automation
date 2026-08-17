@@ -12,6 +12,12 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _utcnow_plus_hours(hours: int) -> datetime:
+    from datetime import timedelta
+
+    return datetime.now(timezone.utc) + timedelta(hours=hours)
+
+
 class User(SQLModel, table=True):
     __tablename__ = "users"
 
@@ -175,3 +181,26 @@ class Notification(SQLModel, table=True):
     # Optional link to a document
     document_id: UUID | None = Field(default=None, foreign_key="documents.id")
     created_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
+class InviteCode(SQLModel, table=True):
+    """Single-use invite codes for user registration.
+
+    Created by an admin, expires in 24 hours, consumed on signup.
+    """
+
+    __tablename__ = "invite_codes"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    code: str = Field(index=True, unique=True, max_length=32)
+    # Role to assign when the invite is used
+    role: str = Field(default="AP_CLERK", max_length=50)
+    # Pre-filled name (optional — user can override on signup)
+    full_name: str | None = Field(default=None, max_length=255)
+    # Who created the invite
+    created_by: UUID = Field(foreign_key="users.id")
+    used: bool = Field(default=False, index=True)
+    used_by: UUID | None = Field(default=None, foreign_key="users.id")
+    used_at: datetime | None = Field(default=None)
+    expires_at: datetime = Field(default_factory=lambda: _utcnow_plus_hours(24), index=True)
+    created_at: datetime = Field(default_factory=_utcnow)

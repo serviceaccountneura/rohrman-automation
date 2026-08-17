@@ -189,6 +189,12 @@ def _create_sublet_po(
         ap_gl_account_id = f"{dealer_id}_3002"
         ref_text = req.line_items[0].ro_number
 
+        # Upload invoice document if provided.
+        attachment_media_ids: list[str] = []
+        if req.invoice_file_path:
+            media_id = client.upload_document(req.invoice_file_path)
+            attachment_media_ids.append(media_id)
+
         result = client.pre_invoice(
             vendor_id=vendor["id"],
             vendor_site_id=vendor["siteId"],
@@ -205,6 +211,7 @@ def _create_sublet_po(
             ref_text=ref_text,
             po_type="SUBLET",
             sales_tax=req.sales_tax,
+            attachment_media_ids=attachment_media_ids or None,
         )
 
         return CreatePoResponse(
@@ -266,6 +273,12 @@ def _create_misc_po(
         )
         ap_gl_account_id = f"{dealer_id}_3002"
 
+        # Upload invoice document if provided.
+        attachment_media_ids: list[str] = []
+        if req.invoice_file_path:
+            media_id = client.upload_document(req.invoice_file_path)
+            attachment_media_ids.append(media_id)
+
         result = client.pre_invoice(
             vendor_id=vendor["id"],
             vendor_site_id=vendor["siteId"],
@@ -282,6 +295,7 @@ def _create_misc_po(
             ref_text="",
             po_type="MISCELLANEOUS",
             sales_tax=req.sales_tax,
+            attachment_media_ids=attachment_media_ids or None,
         )
 
         return CreatePoResponse(

@@ -8,7 +8,7 @@ GET    /api/auth/me       — return the current authenticated user
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Annotated
 
 import jwt
@@ -18,8 +18,9 @@ from sqlmodel import Session, select
 from api.config import settings
 from api.db import get_session
 from api.deps import CurrentUserDep
-from api.models.db import RefreshToken, User
+from api.models.db import InviteCode, RefreshToken, User
 from api.models.schemas import (
+    InviteValidateResponse,
     MessageResponse,
     RefreshRequest,
     Token,
@@ -69,15 +70,76 @@ def signup(req: UserCreate, session: Annotated[Session, Depends(get_session)]) -
             detail="A user with that email already exists",
         )
 
+    # Validate invite code if provided
+    invite = None
+    if req.invite_code:
+        invite = session.exec(
+            select(InviteCode).where(InviteCode.code == req.invite_code)
+        ).first()
+        if not invite:
+            raise HTTPException(status_code=400, detail="Invalid invite code")
+        if invite.used:
+            raise HTTPException(status_code=400, detail="Invite code already used")
+        now = datetime.now(timezone.utc)
+        exp = invite.expires_at
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        if exp < now:
+            raise HTTPException(status_code=400, detail="Invite code has expired")
+
+    role = invite.role if invite else "AP_CLERK"
+    full_name = req.full_name or (invite.full_name if invite else None)
+
     user = User(
         email=req.email,
-        full_name=req.full_name,
+        full_name=full_name,
         hashed_password=hash_password(req.password),
+        role=role,
     )
     session.add(user)
     session.commit()
     session.refresh(user)
+
+    # Mark invite as used
+    if invite:
+        invite.used = True
+        invite.used_by = user.id
+        invite.used_at = datetime.now(timezone.utc)
+        session.add(invite)
+        session.commit()
+
     return user
+
+
+@router.get("/invite/{code}", response_model=InviteValidateResponse)
+def validate_invite(
+    code: str,
+    session: Annotated[Session, Depends(get_session)],
+) -> InviteValidateResponse:
+    """Validate an invite code. Public — called by the frontend invite page.
+
+    Returns whether the code is valid, and pre-fills role + name if available.
+    """
+    invite = session.exec(select(InviteCode).where(InviteCode.code == code)).first()
+    if not invite:
+        return InviteValidateResponse(valid=False, reason="Invalid invite code")
+
+    if invite.used:
+        return InviteValidateResponse(valid=False, reason="Invite code already used")
+
+    now = datetime.now(timezone.utc)
+    exp = invite.expires_at
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    if exp < now:
+        return InviteValidateResponse(valid=False, reason="Invite code has expired")
+
+    return InviteValidateResponse(
+        valid=True,
+        role=invite.role,
+        full_name=invite.full_name,
+        expires_at=invite.expires_at,
+    )
 
 
 @router.post("/login", response_model=Token)

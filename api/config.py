@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     s3_bucket: str = "rohrman-invoices"
     s3_presign_expiry: int = 300  # seconds (5 min)
 
+    # ── Frontend ──────────────────────────────────────────────────────────────
+    frontend_url: str = "http://localhost:3000"
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -83,6 +83,8 @@ class _CreatePoBase(BaseModel):
     invoice_number: str = Field(alias="invoiceNumber")
     invoice_amount: float = Field(alias="invoiceAmount")
     sales_tax: float = Field(default=0.0, alias="salesTax")
+    # Optional: local file path or S3 key of the invoice PDF to attach to the pre-invoice.
+    invoice_file_path: str | None = Field(default=None, alias="invoiceFilePath")
 
     model_config = {"populate_by_name": True}
 
@@ -143,6 +145,28 @@ class UserCreate(BaseModel):
     email: str = Field(min_length=3, max_length=255)
     password: str = Field(min_length=8, max_length=128)
     full_name: str | None = Field(default=None, max_length=255)
+    invite_code: str | None = Field(default=None, max_length=32)
+
+
+class CreateInviteRequest(BaseModel):
+    role: str = Field(default="AP_CLERK", max_length=50)
+    full_name: str | None = Field(default=None, max_length=255)
+
+
+class InviteResponse(BaseModel):
+    invite_code: str
+    invite_url: str
+    role: str
+    full_name: str | None
+    expires_at: datetime
+
+
+class InviteValidateResponse(BaseModel):
+    valid: bool
+    role: str | None = None
+    full_name: str | None = None
+    expires_at: datetime | None = None
+    reason: str | None = None
 
 
 class UserLogin(BaseModel):
