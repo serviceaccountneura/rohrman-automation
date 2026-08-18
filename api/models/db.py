@@ -99,23 +99,54 @@ class Document(SQLModel, table=True):
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     file_name: str = Field(default="", max_length=500)
+    # Where the uploaded file landed in S3, so the row points at the source doc.
+    s3_key: str = Field(default="", max_length=1000)
     dealership_name: str = Field(default="", max_length=255, index=True)
     vendor_name: str = Field(default="", max_length=255, index=True)
     invoice_number: str = Field(default="", max_length=100)
     vin: str = Field(default="", max_length=20)
     ro_number: str = Field(default="", max_length=100)
     po_number: str = Field(default="", max_length=100)
-    po_type: str = Field(default="", max_length=20, index=True)  # SUBLET, MISCELLANEOUS, STOCK
+    # SUBLET, MISCELLANEOUS, STOCK, OEM. Set from the upload folder, which is
+    # authoritative: it selects the pipeline even when OCR disagrees.
+    po_type: str = Field(default="", max_length=20, index=True)
     # AP_INVOICE, PO, PARTS_TICKET, JOURNAL, GL_REPORT, STATEMENT, REPAIR_ORDER, MANUFACTURER_INVOICE
     document_type: str = Field(default="", max_length=30, index=True)
-    # PENDING, PROCESSED, EXCEPTION, AUTO_RESOLVED
-    status: str = Field(default="PENDING", max_length=20, index=True)
+    # What OCR actually detected. Kept alongside po_type so a folder/OCR
+    # mismatch stays visible without blocking the run.
+    ocr_document_type: str = Field(default="", max_length=100)
+    # ── Journal entry results (OEM folder) ────────────────────────────────────
+    # Tekion's transaction id / human-facing number / "{dealerId}_{journal}".
+    transaction_id: str = Field(default="", max_length=50)
+    transaction_number: str = Field(default="", max_length=50)
+    journal_id: str = Field(default="", max_length=50)
+    # QUEUED, PROCESSING, PROCESSED, EXCEPTION, AUTO_RESOLVED
+    # (PENDING is retained for rows created before the queue existed.)
+    status: str = Field(default="QUEUED", max_length=20, index=True)
     # VENDOR_NOT_FOUND, PO_MISMATCH, AMOUNT_MISMATCH, LOW_OCR_CONFIDENCE, etc.
     exception_type: str | None = Field(default=None, max_length=100)
     # HIGH, MEDIUM, LOW
     severity: str | None = Field(default=None, max_length=10, index=True)
     created_at: datetime = Field(default_factory=_utcnow, index=True)
     processed_at: datetime | None = Field(default=None)
+
+    # ── Queue bookkeeping ─────────────────────────────────────────────────────
+    # This table doubles as the job queue: workers claim rows with
+    # SELECT ... FOR UPDATE SKIP LOCKED, so status lives in one place and the
+    # dashboard sees queue state for free.
+    #
+    # Where the uploaded file is on disk for the worker to read. Falls back to
+    # downloading s3_key when the temp file is gone (e.g. after a restart).
+    source_path: str = Field(default="", max_length=1000)
+    # SHA-256 of the uploaded bytes — used to spot a re-upload of the same file.
+    file_hash: str = Field(default="", max_length=64, index=True)
+    attempts: int = Field(default=0)
+    # Set while a worker holds the row; cleared when it finishes.
+    locked_at: datetime | None = Field(default=None)
+    locked_by: str = Field(default="", max_length=100)
+    # Retry backoff — the row is invisible to claims until this passes.
+    next_attempt_at: datetime | None = Field(default=None, index=True)
+    last_error: str = Field(default="", max_length=1000)
 
 
 class GlVendorMapping(SQLModel, table=True):

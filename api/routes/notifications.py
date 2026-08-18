@@ -23,7 +23,7 @@ router = APIRouter(prefix="/api/notifications", tags=["notifications"])
 
 @router.get("", response_model=NotificationListResponse)
 def list_notifications(
-    current_user: Annotated[User, Depends(CurrentUserDep)],
+    current_user: CurrentUserDep,
     session: Annotated[Session, Depends(get_session)],
     is_read: bool | None = Query(default=None, description="Filter by read status"),
     category: str | None = Query(default=None, description="Filter by category"),
@@ -91,7 +91,7 @@ def list_notifications(
 @router.post("/{notification_id}/read")
 def mark_as_read(
     notification_id: str,
-    current_user: Annotated[User, Depends(CurrentUserDep)],
+    current_user: CurrentUserDep,
     session: Annotated[Session, Depends(get_session)],
 ) -> dict:
     """Mark a single notification as read."""
@@ -108,7 +108,7 @@ def mark_as_read(
 
 @router.post("/read-all")
 def mark_all_as_read(
-    current_user: Annotated[User, Depends(CurrentUserDep)],
+    current_user: CurrentUserDep,
     session: Annotated[Session, Depends(get_session)],
 ) -> dict:
     """Mark all unread notifications as read for the current user."""
@@ -130,7 +130,7 @@ def mark_all_as_read(
 @router.delete("/{notification_id}")
 def delete_notification(
     notification_id: str,
-    current_user: Annotated[User, Depends(CurrentUserDep)],
+    current_user: CurrentUserDep,
     session: Annotated[Session, Depends(get_session)],
 ) -> dict:
     """Delete a notification."""
