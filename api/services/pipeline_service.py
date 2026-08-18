@@ -84,6 +84,9 @@ EX_DUPLICATE = "DUPLICATE_DOCUMENT"
 EX_VENDOR_NOT_FOUND = "VENDOR_NOT_FOUND"
 EX_UNBALANCED = "UNBALANCED_ENTRY"
 EX_TEKION_ERROR = "TEKION_ERROR"
+# Tekion answered, and the answer was no. Distinct from TEKION_ERROR because a
+# rejection is final — retrying re-runs OCR and asks the same question again.
+EX_TEKION_REJECTED = "TEKION_REJECTED"
 
 _SEVERITY = {
     EX_OCR_FAILED: "HIGH",
@@ -93,11 +96,19 @@ _SEVERITY = {
     EX_VENDOR_NOT_FOUND: "HIGH",
     EX_UNBALANCED: "HIGH",
     EX_TEKION_ERROR: "HIGH",
+    EX_TEKION_REJECTED: "HIGH",
 }
 
-# Only transient problems are worth retrying. A missing invoice number will not
-# fix itself, so retrying it just burns attempts and delays the human seeing it.
-_RETRYABLE = {EX_OCR_FAILED, EX_TEKION_ERROR}
+# Only OCR is retried, and only because it is free of side effects: reading a
+# document twice costs a Gemini call and changes nothing.
+#
+# Tekion failures are deliberately NOT retried. A run can fail *after* Tekion
+# has already created a purchase order — that is exactly what happened when a
+# log line raised mid-flow — and re-running the job creates a second PO in the
+# customer's books. There is no way from here to tell how far a failed attempt
+# got, so the safe assumption is that it may have written something. A human
+# retries once they have checked Tekion.
+_RETRYABLE = {EX_OCR_FAILED}
 
 
 def _fail(session: Session, doc: Document, exception_type: str, error: str = "") -> None:
@@ -309,6 +320,28 @@ def _run_purchase_order(
         _fail(session, doc, EX_MISSING_FIELD, error="missing vendor name or total amount")
         return
 
+    # The purchase order must be worth exactly what the pre-invoice posts
+    # against it. The PO is built from OCR's line items while the pre-invoice
+    # uses the grand total less tax, and Tekion rejects the invoice outright
+    # ("unable to update PO") when the two disagree — after the PO has already
+    # been created, leaving an orphan.
+    #
+    # OCR line items are the unreliable half: a missed row or an unreadable
+    # unit price silently shrinks the PO. When they do not reconcile, fall back
+    # to a single line for the correct amount — less itemised, but truthful
+    # about what is owed, and it matches what the existing flow already does
+    # when OCR finds no line items at all.
+    expected_po_total = round(total - sales_tax, 2)
+    line_total = round(sum(i["qty"] * i["unitPrice"] for i in line_items), 2)
+    if line_items and abs(line_total - expected_po_total) > 0.01:
+        print(
+            f"[PIPE] {doc.id} line items total {line_total} but invoice is "
+            f"{expected_po_total} (net of {sales_tax} tax) — using a single line"
+        )
+        line_items = []
+    elif line_items:
+        print(f"[PIPE] {doc.id} line items reconcile to {line_total}")
+
     common = {
         "dealership_name": doc.dealership_name,
         "vendor_name": doc.vendor_name,
@@ -341,7 +374,7 @@ def _run_purchase_order(
                     job_number="",
                     description="Sublet repair",
                     labor_amount=0.0,
-                    parts_amount=total,
+                    parts_amount=expected_po_total,
                 )
             ]
             req = CreateSubletPoRequest(**common, line_items=items)
@@ -366,29 +399,36 @@ def _run_purchase_order(
                 response = _create_stock_po(req, session)
 
         else:  # MISCELLANEOUS
-            req = CreateMiscPoRequest(
-                **common,
-                line_items=[
-                    MiscLineItem(
-                        part_name=item["description"] or "Misc purchase",
-                        qty=item["qty"],
-                        unit_price=item["unitPrice"],
-                    )
-                    for item in line_items
-                ],
-            )
+            misc_items = [
+                MiscLineItem(
+                    part_name=item["description"] or "Misc purchase",
+                    qty=item["qty"],
+                    unit_price=item["unitPrice"],
+                )
+                for item in line_items
+            ] or [
+                MiscLineItem(
+                    part_name=f"Invoice {doc.invoice_number}" if doc.invoice_number else "Misc purchase",
+                    qty=1.0,
+                    unit_price=expected_po_total,
+                )
+            ]
+            req = CreateMiscPoRequest(**common, line_items=misc_items)
             with tekion_scope():
                 response = _create_misc_po(req, session)
 
     except HTTPException as e:
-        # The PO flow raises 422 with candidates when a vendor is not mapped.
+        # An HTTPException here is Tekion (or our own validation) saying no:
+        # a 422 for an unmapped vendor, a 404 for a missing RO. None of that
+        # becomes true on a retry, so these are terminal — retrying would only
+        # re-run OCR and get the same answer three times.
         detail = e.detail if isinstance(e.detail, dict) else {}
         reason = str(detail.get("reason", "") or e.detail)
         print(f"[PIPE] {doc.id} PO rejected: {reason}")
         _fail(
             session,
             doc,
-            EX_VENDOR_NOT_FOUND if "mapping" in reason else EX_TEKION_ERROR,
+            EX_VENDOR_NOT_FOUND if "mapping" in reason else EX_TEKION_REJECTED,
             error=reason,
         )
         return

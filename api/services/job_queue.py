@@ -216,7 +216,7 @@ def confirm_duplicate(session: Session, doc: Document) -> Document:
     session.delete(doc)
     session.commit()
     session.refresh(original)
-    print(f"[QUEUE] duplicate confirmed — re-running {original.id}")
+    print(f"[QUEUE] duplicate confirmed -- re-running {original.id}")
     return original
 
 

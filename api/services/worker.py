@@ -90,7 +90,7 @@ def start() -> None:
     if _threads:
         return
     if WORKER_COUNT <= 0:
-        print("[WORKER] PIPELINE_WORKERS=0 — in-process workers disabled")
+        print("[WORKER] PIPELINE_WORKERS=0 -- in-process workers disabled")
         return
 
     _stop.clear()
