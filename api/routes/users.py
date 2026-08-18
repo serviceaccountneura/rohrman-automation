@@ -34,7 +34,7 @@ router = APIRouter(prefix="/api/users", tags=["users"])
 @router.get("", response_model=UserListResponse)
 def list_users(
     session: Annotated[Session, Depends(get_session)],
-    _current_user: Annotated[User, Depends(CurrentUserDep)],
+    _current_user: CurrentUserDep,
 ) -> UserListResponse:
     """List all users with name, email, role, and status."""
     users = session.exec(select(User).order_by(User.created_at.desc())).all()
@@ -55,7 +55,7 @@ def list_users(
 def delete_user(
     user_id: str,
     session: Annotated[Session, Depends(get_session)],
-    current_user: Annotated[User, Depends(CurrentUserDep)],
+    current_user: CurrentUserDep,
 ) -> dict:
     """Delete a user by ID. Cannot delete yourself."""
     if str(current_user.id) == user_id:
@@ -75,7 +75,7 @@ def update_user_status(
     user_id: str,
     req: UpdateUserStatusRequest,
     session: Annotated[Session, Depends(get_session)],
-    _current_user: Annotated[User, Depends(CurrentUserDep)],
+    _current_user: CurrentUserDep,
 ) -> dict:
     """Activate or deactivate a user."""
     user = session.get(User, user_id)
@@ -95,7 +95,7 @@ def update_user_status(
 @router.post("/invite", response_model=InviteResponse)
 def create_invite(
     req: CreateInviteRequest,
-    current_user: Annotated[User, Depends(CurrentUserDep)],
+    current_user: CurrentUserDep,
     session: Annotated[Session, Depends(get_session)],
 ) -> InviteResponse:
     """Create a single-use invite link valid for 24 hours."""

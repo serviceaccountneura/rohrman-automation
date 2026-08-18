@@ -126,6 +126,7 @@ def list_documents(
             dealership_name=doc.dealership_name,
             vendor_name=doc.vendor_name,
             invoice_number=doc.invoice_number,
+            vin=doc.vin,
             ro_number=doc.ro_number,
             po_number=doc.po_number,
             po_type=doc.po_type,

@@ -359,6 +359,7 @@ class DocumentItem(BaseModel):
     dealership_name: str
     vendor_name: str
     invoice_number: str
+    vin: str
     ro_number: str
     po_number: str
     po_type: str
