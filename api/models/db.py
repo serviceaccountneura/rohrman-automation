@@ -120,8 +120,12 @@ class Document(SQLModel, table=True):
     transaction_id: str = Field(default="", max_length=50)
     transaction_number: str = Field(default="", max_length=50)
     journal_id: str = Field(default="", max_length=50)
-    # QUEUED, PROCESSING, PROCESSED, EXCEPTION, AUTO_RESOLVED
+    # QUEUED, PROCESSING, PROCESSED, EXCEPTION, DUPLICATE, AUTO_RESOLVED
     # (PENDING is retained for rows created before the queue existed.)
+    #
+    # DUPLICATE is a decision point, not a failure: OCR matched an invoice that
+    # was already processed, so the run is held until someone confirms or
+    # discards it. Nothing was sent to Tekion.
     status: str = Field(default="QUEUED", max_length=20, index=True)
     # VENDOR_NOT_FOUND, PO_MISMATCH, AMOUNT_MISMATCH, LOW_OCR_CONFIDENCE, etc.
     exception_type: str | None = Field(default=None, max_length=100)
@@ -147,6 +151,15 @@ class Document(SQLModel, table=True):
     # Retry backoff — the row is invisible to claims until this passes.
     next_attempt_at: datetime | None = Field(default=None, index=True)
     last_error: str = Field(default="", max_length=1000)
+
+    # ── Duplicate handling ────────────────────────────────────────────────────
+    # The already-processed document this one repeats. Set alongside the
+    # DUPLICATE status so the UI can show what it collides with.
+    duplicate_of: UUID | None = Field(default=None, foreign_key="documents.id")
+    # Skip the duplicate check for exactly one run. Set when a user confirms a
+    # duplicate should be reprocessed anyway; cleared as soon as it is honoured,
+    # so a later upload is still checked normally.
+    duplicate_override: bool = Field(default=False)
 
 
 class GlVendorMapping(SQLModel, table=True):

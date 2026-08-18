@@ -309,6 +309,8 @@ class PipelineStatusResponse(BaseModel):
     journal_id: str = Field(default="", alias="journalId")
     # What OCR thought the document was — for review when it disagrees.
     ocr_document_type: str = Field(default="", alias="ocrDocumentType")
+    # Set when status is DUPLICATE: the already-processed document this repeats.
+    duplicate_of: UUID | None = Field(default=None, alias="duplicateOf")
     exception_type: str | None = Field(default=None, alias="exceptionType")
     severity: str | None = None
     # Queue bookkeeping — how many times it has been tried and why it last failed.

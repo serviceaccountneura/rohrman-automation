@@ -193,17 +193,19 @@ def _run(doc: Document, session: Session) -> None:
 
     # ── 4. Idempotency ───────────────────────────────────────────────────────
     # Checked after OCR because the invoice number is only known now. A repeat
-    # upload is parked rather than posted twice to Tekion.
-    duplicate = job_queue.find_duplicate(session, doc)
-    if duplicate is not None:
-        _fail(
-            session,
-            doc,
-            EX_DUPLICATE,
-            error=f"already processed as document {duplicate.id} "
-                  f"(invoice {duplicate.invoice_number!r})",
-        )
-        return
+    # upload is held for a decision rather than posted twice to Tekion — see
+    # job_queue.hold_as_duplicate. A user who confirms gets `duplicate_override`
+    # set for exactly this run.
+    if doc.duplicate_override:
+        doc.duplicate_override = False
+        session.add(doc)
+        session.commit()
+        print(f"[PIPE] {doc.id} duplicate check waived by confirmation")
+    else:
+        duplicate = job_queue.find_duplicate(session, doc)
+        if duplicate is not None:
+            job_queue.hold_as_duplicate(session, doc, duplicate)
+            return
 
     # ── 5. Dispatch on the folder ────────────────────────────────────────────
     if doc.po_type == FOLDER_OEM:
