@@ -7,8 +7,8 @@ POST /api/tekion/vendors   — add/update a vendor mapping (after human review)
 from __future__ import annotations
 
 import threading
-from datetime import datetime, timezone
-from typing import Annotated
+from datetime import datetime, timedelta, timezone
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -56,6 +56,15 @@ def reset_client() -> None:
     global _client
     with _client_lock:
         _client = None
+
+
+# ── Dealer list cache ─────────────────────────────────────────────────────────
+# The roster changes rarely and answering from a cold client costs a Tekion
+# login, so hold it for a day. GET /api/tekion/dealers?refresh=true busts it.
+_dealers_cache: list[dict[str, str]] | None = None
+_dealers_cached_at: datetime | None = None
+_dealers_lock = threading.Lock()
+_DEALERS_TTL = timedelta(hours=24)
 
 
 def _resolve_dealer(client: TekionApiClient, dealership_name: str) -> str:
@@ -412,6 +421,71 @@ def _create_stock_po(
     except Exception as e:
         reset_client()
         return CreatePoResponse(success=False, error=str(e))
+
+
+@router.get("/dealers")
+def list_dealers(
+    session: Annotated[Session, Depends(get_session)],
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """Every dealership this Tekion login can reach.
+
+    The login response carries the full dealer list, but nothing exposed it —
+    so callers were left guessing at dealership names. `name` is Tekion's own
+    display name and is exactly what `dealership_name` expects elsewhere in this
+    API; sending anything else risks a fuzzy match onto the wrong store.
+
+    Cached for a day: the roster changes rarely, and a cold client would
+    otherwise re-login to Tekion just to answer this. Pass `?refresh=true` to
+    force a re-fetch after a dealership is added or renamed.
+    """
+    global _dealers_cache, _dealers_cached_at
+
+    now = datetime.now(timezone.utc)
+    with _dealers_lock:
+        fresh_enough = (
+            _dealers_cache is not None
+            and _dealers_cached_at is not None
+            and now - _dealers_cached_at < _DEALERS_TTL
+        )
+        if fresh_enough and not refresh:
+            return {
+                "dealers": _dealers_cache,
+                "cached": True,
+                "fetchedAt": _dealers_cached_at.isoformat(),
+            }
+
+    try:
+        client = get_client(session)
+        if not client.dealers:
+            # A restored session carries the list; a cold one has to log in.
+            client.login()
+        dealers = [
+            {"dealerId": d["dealerId"], "name": d["dealerDisplayName"]}
+            for d in sorted(client.dealers, key=lambda d: d["dealerDisplayName"])
+        ]
+    except Exception as e:
+        reset_client()
+        with _dealers_lock:
+            # Serve a stale list rather than breaking the picker outright.
+            if _dealers_cache:
+                print(f"[TEKION] dealer refresh failed ({e}); serving cached list")
+                return {
+                    "dealers": _dealers_cache,
+                    "cached": True,
+                    "stale": True,
+                    "fetchedAt": (
+                        _dealers_cached_at.isoformat() if _dealers_cached_at else None
+                    ),
+                }
+        raise HTTPException(status_code=502, detail=f"Could not load dealers: {e}")
+
+    with _dealers_lock:
+        _dealers_cache = dealers
+        _dealers_cached_at = now
+
+    print(f"[TEKION] dealer list refreshed ({len(dealers)} dealerships)")
+    return {"dealers": dealers, "cached": False, "fetchedAt": now.isoformat()}
 
 
 @router.get("/vendors/{dealer_id}")
