@@ -7,13 +7,16 @@ POST /api/tekion/vendors   — add/update a vendor mapping (after human review)
 from __future__ import annotations
 
 import threading
+from datetime import datetime, timezone
 from typing import Annotated
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 
 from api.db import get_session
-from api.models.db import VendorMapping
+from api.models.db import Document, VendorMapping
+from api.services import file_source
 from api.models.schemas import (
     CreateMiscPoRequest,
     CreatePoRequest,
@@ -106,20 +109,68 @@ def _resolve_vendor(
 # ── Unified PO creation ───────────────────────────────────────────────────────
 
 
+def _record_po_result(
+    document_id: UUID,
+    req: CreatePoRequest,
+    response: CreatePoResponse,
+    session: Session,
+) -> None:
+    """Write the PO outcome onto the documents row from POST /api/ocr/extract.
+
+    Lets the presigned-upload flow land in the same table the pipeline uses, so
+    the dashboard and exception queue cover both paths.
+    """
+    doc = session.get(Document, document_id)
+    if doc is None:
+        print(f"[PO] document {document_id} not found; result not recorded")
+        return
+
+    doc.po_type = doc.po_type or req.po_type
+    doc.dealership_name = doc.dealership_name or req.dealership_name
+    doc.invoice_number = doc.invoice_number or req.invoice_number
+    if response.success:
+        doc.po_number = response.po_number or ""
+        doc.vendor_name = response.vendor_name or doc.vendor_name
+        doc.status = "PROCESSED"
+        doc.exception_type = None
+        doc.severity = None
+    else:
+        doc.status = "EXCEPTION"
+        doc.exception_type = "TEKION_ERROR"
+        doc.severity = "HIGH"
+        doc.last_error = (response.error or "")[:1000]
+    doc.processed_at = datetime.now(timezone.utc)
+    session.add(doc)
+    session.commit()
+
+
 @router.post("/po", response_model=CreatePoResponse)
 def create_po(
     req: CreatePoRequest,
     session: Annotated[Session, Depends(get_session)],
 ) -> CreatePoResponse:
-    # Serialized: the flows below switch dealership on a shared client, so two
-    # concurrent requests for different dealerships would otherwise interleave
-    # and post to the wrong one. The flow logic itself is unchanged.
-    with tekion_scope():
-        if isinstance(req, CreateSubletPoRequest):
-            return _create_sublet_po(req, session)
-        if isinstance(req, CreateStockPoRequest):
-            return _create_stock_po(req, session)
-        return _create_misc_po(req, session)
+    # invoice_file_path may be an S3 key (the frontend uploads there directly and
+    # never has a local path). Resolve it to a real file for the duration of the
+    # call; anything downloaded is cleaned up on the way out.
+    with file_source.resolve(req.invoice_file_path) as local_path:
+        if local_path != req.invoice_file_path:
+            req = req.model_copy(update={"invoice_file_path": local_path})
+
+        # Serialized: the flows below switch dealership on a shared client, so two
+        # concurrent requests for different dealerships would otherwise interleave
+        # and post to the wrong one. The flow logic itself is unchanged.
+        with tekion_scope():
+            if isinstance(req, CreateSubletPoRequest):
+                response = _create_sublet_po(req, session)
+            elif isinstance(req, CreateStockPoRequest):
+                response = _create_stock_po(req, session)
+            else:
+                response = _create_misc_po(req, session)
+
+    if req.document_id is not None:
+        _record_po_result(req.document_id, req, response, session)
+
+    return response
 
 
 def _create_sublet_po(

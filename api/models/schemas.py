@@ -22,12 +22,37 @@ class OcrJobStatus(str, Enum):
 class OcrJobResponse(BaseModel):
     job_id: str
     status: OcrJobStatus
+    # The documents row tracking this extraction. Pass it to POST /api/tekion/po
+    # so the PO result is recorded against the same row.
+    document_id: UUID | None = None
+
+
+class OcrFields(BaseModel):
+    """Flat, predictable field names extracted from the raw OCR output.
+
+    The raw `result` is nested and label-driven (vendor:{name},
+    identifiers:[{label,value}], totals:[{label,value}]) because the model
+    chooses its own field names. Use this instead of digging through it.
+    """
+
+    document_type: str = ""
+    dealership_name: str = ""
+    vendor_name: str = ""
+    invoice_number: str = ""
+    invoice_date: str = ""  # MM/DD/YYYY
+    invoice_amount: float = 0.0
+    sales_tax: float = 0.0
+    ro_number: str = ""
+    line_items: list[dict[str, Any]] = Field(default_factory=list)
+    needs_review: bool = False
 
 
 class OcrJobResult(BaseModel):
     job_id: str
     status: OcrJobStatus
     result: dict[str, Any] | None = None
+    # Same values as `result`, flattened. Prefer this in clients.
+    fields: OcrFields | None = None
     error: str | None = None
 
 
@@ -83,8 +108,13 @@ class _CreatePoBase(BaseModel):
     invoice_number: str = Field(alias="invoiceNumber")
     invoice_amount: float = Field(alias="invoiceAmount")
     sales_tax: float = Field(default=0.0, alias="salesTax")
-    # Optional: local file path or S3 key of the invoice PDF to attach to the pre-invoice.
+    # Optional: local file path or S3 key of the invoice PDF to attach to the
+    # pre-invoice. An S3 key (as returned by /api/invoices/upload-url) is
+    # downloaded server-side before being uploaded to Tekion.
     invoice_file_path: str | None = Field(default=None, alias="invoiceFilePath")
+    # Optional: the documents row from POST /api/ocr/extract. When given, the PO
+    # result is recorded against it so this flow is tracked like the pipeline's.
+    document_id: UUID | None = Field(default=None, alias="documentId")
 
     model_config = {"populate_by_name": True}
 

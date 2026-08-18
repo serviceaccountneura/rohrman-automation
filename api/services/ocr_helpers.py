@@ -173,6 +173,31 @@ def get_total_amount(ocr: dict[str, Any]) -> float:
     return abs(float(fallback))
 
 
+def to_flat_fields(ocr: dict[str, Any]) -> dict[str, Any]:
+    """Flatten the OCR output into the shape the API documents and returns.
+
+    The model picks its own field names, so the raw extraction is nested and
+    label-driven: `vendor: {name}`, `identifiers: [{label, value}]`,
+    `totals: [{label, value}]`. Every consumer would otherwise have to redo this
+    digging — including the frontend, in JavaScript.
+
+    This is the single flattening, used by both the pipeline and the OCR job
+    endpoint, so both report identical values.
+    """
+    return {
+        "document_type": get_document_type(ocr),
+        "dealership_name": get_dealership_name(ocr),
+        "vendor_name": get_vendor_name(ocr),
+        "invoice_number": get_invoice_number(ocr),
+        "invoice_date": get_invoice_date(ocr),
+        "invoice_amount": get_total_amount(ocr),
+        "sales_tax": get_sales_tax(ocr),
+        "ro_number": get_control_number(ocr),
+        "line_items": get_raw_line_items(ocr),
+        "needs_review": bool((ocr.get("_validation") or {}).get("needs_review", False)),
+    }
+
+
 def get_raw_line_items(ocr: dict[str, Any]) -> list[dict[str, Any]]:
     items = ocr.get("line_items") or []
     result = []

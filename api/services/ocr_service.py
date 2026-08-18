@@ -23,6 +23,8 @@ if not os.environ.get("VERTEX_CREDENTIALS"):
         os.environ["VERTEX_CREDENTIALS"] = str(creds)
 
 from google.genai import types  # noqa: E402
+
+from api.services.ocr_helpers import to_flat_fields  # noqa: E402
 from normalize import to_po_contract  # noqa: E402
 from pipeline import get_client, load_pages, pil_to_part  # noqa: E402
 from vision_extract import VISION_PROMPT, build_response_schema, validate  # noqa: E402
@@ -67,4 +69,7 @@ def extract_document(file_path: str | Path) -> dict[str, Any]:
     doc["_po_contract"] = to_po_contract(doc)
     doc["_validation"] = validate(doc)
     doc["_needs_review"] = doc["_validation"]["needs_review"]
+    # Flat, predictable field names for callers that should not have to dig
+    # through identifiers[]/totals[] themselves — notably the frontend.
+    doc["_fields"] = to_flat_fields(doc)
     return doc
