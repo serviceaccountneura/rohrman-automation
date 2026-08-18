@@ -130,7 +130,19 @@ class TekionApiClient:
             # 401/403 → session expired. Re-login once and retry.
             if resp.status_code in (401, 403) and _relogin and not path.startswith("/api/loginservice"):
                 print(f"[API] Got {resp.status_code} on {method} {path} — re-logging in…")
+                # login() resets dealer_id to the account default (the dealer on
+                # loginData). Since _req() rebuilds the dealerid/roleid/tek-siteid
+                # headers from that field on every call, letting it stand would
+                # silently retarget this retry — and everything after it — at the
+                # wrong dealership. Worse, a path with the dealer in the URL
+                # (e.g. .../transaction/dealer/1711/draft) would then carry 1711
+                # in the URL and 1707 in the headers.
+                previous_dealer = self.dealer_id
                 self.login()
+                if previous_dealer and previous_dealer != self.dealer_id:
+                    print(f"[API] Restoring dealer {previous_dealer} after re-login "
+                          f"(login defaulted to {self.dealer_id})")
+                    self.switch_dealer(previous_dealer)
                 return self._req_json(
                     path, method=method, body=body, extra_headers=extra_headers, _relogin=False
                 )

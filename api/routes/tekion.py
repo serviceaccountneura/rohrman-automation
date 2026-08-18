@@ -23,6 +23,7 @@ from api.models.schemas import (
     VendorCandidate,
 )
 from api.services.tekion_client import TekionApiClient
+from api.services.tekion_lock import tekion_scope
 from api.services.vendor_service import _normalize, resolve_vendor
 from api.services.gl_service import resolve_gl
 from api.services.gl_service_misc import resolve_misc_gl, refresh_gl_accounts as refresh_gl_cache
@@ -110,11 +111,15 @@ def create_po(
     req: CreatePoRequest,
     session: Annotated[Session, Depends(get_session)],
 ) -> CreatePoResponse:
-    if isinstance(req, CreateSubletPoRequest):
-        return _create_sublet_po(req, session)
-    if isinstance(req, CreateStockPoRequest):
-        return _create_stock_po(req, session)
-    return _create_misc_po(req, session)
+    # Serialized: the flows below switch dealership on a shared client, so two
+    # concurrent requests for different dealerships would otherwise interleave
+    # and post to the wrong one. The flow logic itself is unchanged.
+    with tekion_scope():
+        if isinstance(req, CreateSubletPoRequest):
+            return _create_sublet_po(req, session)
+        if isinstance(req, CreateStockPoRequest):
+            return _create_stock_po(req, session)
+        return _create_misc_po(req, session)
 
 
 def _create_sublet_po(

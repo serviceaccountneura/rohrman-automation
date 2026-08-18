@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime
 from typing import Any
 
 
@@ -71,6 +72,75 @@ def get_invoice_number(ocr: dict[str, Any]) -> str:
         or ""
     )
     return _clean_invoice_number(str(fallback)) if fallback else ""
+
+
+def get_document_type(ocr: dict[str, Any]) -> str:
+    """Whatever OCR decided the document is.
+
+    Recorded next to the upload folder so a mismatch stays visible. The folder
+    is authoritative for pipeline selection — this is only for review.
+    """
+    po_contract = ocr.get("_po_contract") or {}
+    return str(ocr.get("document_type") or po_contract.get("document_type") or "").strip()
+
+
+# Date formats seen on vendor invoices and parts tickets, in priority order.
+_DATE_FORMATS = ("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%m-%d-%Y", "%d-%b-%Y", "%b %d, %Y")
+
+
+def _normalize_date(raw: Any) -> str:
+    """Normalize a date string to MM/DD/YYYY. Returns '' when unparseable."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.strptime(text, fmt).strftime("%m/%d/%Y")
+        except ValueError:
+            continue
+    # Last resort: pull an M/D/Y out of a longer string ("Invoice Date 05/12/2026").
+    m = re.search(r"(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})", text)
+    if m:
+        month, day, year = m.groups()
+        if len(year) == 2:
+            year = f"20{year}"
+        try:
+            return datetime(int(year), int(month), int(day)).strftime("%m/%d/%Y")
+        except ValueError:
+            return ""
+    return ""
+
+
+def get_invoice_date(ocr: dict[str, Any]) -> str:
+    """The invoice date as MM/DD/YYYY — the JE flow's Accounting Date.
+
+    Looks for an explicit invoice-date identifier first, then any date label
+    that is not a due/payment date, since posting to the due date would put the
+    entry in the wrong period.
+    """
+    identifiers = ocr.get("identifiers") or []
+
+    for entry in identifiers:
+        label = (entry.get("label") or "").lower()
+        if "invoice date" in label or label in ("date", "inv date"):
+            normalized = _normalize_date(entry.get("value"))
+            if normalized:
+                return normalized
+
+    for entry in identifiers:
+        label = (entry.get("label") or "").lower()
+        if "date" not in label:
+            continue
+        if any(skip in label for skip in ("due", "payment", "ship", "order", "delivery")):
+            continue
+        normalized = _normalize_date(entry.get("value"))
+        if normalized:
+            return normalized
+
+    po_contract = ocr.get("_po_contract") or {}
+    return _normalize_date(
+        ocr.get("invoice_date") or ocr.get("invoiceDate") or po_contract.get("invoice_date")
+    )
 
 
 def _parse_amount(value: Any) -> float:

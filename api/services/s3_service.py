@@ -68,6 +68,42 @@ def generate_upload_url(
     }
 
 
+def build_s3_key(file_name: str, dealership_name: str | None = None) -> str:
+    """The canonical key for an invoice file: invoices/{dealership}/{date}/{uuid}.{ext}."""
+    ext = Path(file_name).suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise ValueError(
+            f"Unsupported file type: {ext}. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+        )
+    date_str = datetime.now(timezone.utc).strftime("%Y/%m/%d")
+    folder = dealership_name.lower().replace(" ", "-") if dealership_name else "unsorted"
+    return f"invoices/{folder}/{date_str}/{uuid.uuid4().hex[:12]}{ext}"
+
+
+def is_configured() -> bool:
+    """Whether S3 credentials are present.
+
+    The pipeline treats archiving as best-effort so local runs work without AWS
+    configured — processing must not fail just because the file could not be
+    stored.
+    """
+    return bool(settings.aws_access_key_id and settings.aws_secret_access_key)
+
+
+def upload_file(local_path: str | Path, s3_key: str) -> None:
+    """Upload a local file to S3 under `s3_key`."""
+    _get_s3_client().upload_file(str(local_path), settings.s3_bucket, s3_key)
+
+
+def download_file(s3_key: str, local_path: str | Path) -> None:
+    """Fetch an archived file back to disk.
+
+    Used by the queue workers when the temp file is gone (a restart between
+    upload and processing) but the row is still waiting.
+    """
+    _get_s3_client().download_file(settings.s3_bucket, s3_key, str(local_path))
+
+
 def generate_download_url(s3_key: str) -> str:
     """Generate a temporary GET URL for downloading a file from S3."""
     client = _get_s3_client()

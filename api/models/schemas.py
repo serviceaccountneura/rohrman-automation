@@ -210,6 +210,62 @@ class UploadUrlResponse(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+# ── Upload pipeline ───────────────────────────────────────────────────────────
+
+
+class PipelineFolder(str, Enum):
+    """The frontend folder the invoice was uploaded into.
+
+    This selects the Tekion flow and is authoritative — OCR's own document_type
+    is recorded for review but never changes the routing.
+    """
+
+    SUBLET = "SUBLET"
+    MISCELLANEOUS = "MISCELLANEOUS"
+    STOCK = "STOCK"
+    OEM = "OEM"
+
+
+class PipelineAcceptedResponse(BaseModel):
+    """Returned immediately on upload, before OCR runs."""
+
+    document_id: UUID = Field(alias="documentId")
+    status: str
+    folder: str
+    file_name: str = Field(alias="fileName")
+
+    model_config = {"populate_by_name": True}
+
+
+class PipelineStatusResponse(BaseModel):
+    document_id: UUID = Field(alias="documentId")
+    status: str
+    folder: str = ""
+    file_name: str = Field(default="", alias="fileName")
+    s3_key: str = Field(default="", alias="s3Key")
+    dealership_name: str = Field(default="", alias="dealershipName")
+    vendor_name: str = Field(default="", alias="vendorName")
+    invoice_number: str = Field(default="", alias="invoiceNumber")
+    ro_number: str = Field(default="", alias="roNumber")
+    # Set when the folder was SUBLET / MISCELLANEOUS / STOCK.
+    po_number: str = Field(default="", alias="poNumber")
+    # Set when the folder was OEM (journal entry).
+    transaction_id: str = Field(default="", alias="transactionId")
+    transaction_number: str = Field(default="", alias="transactionNumber")
+    journal_id: str = Field(default="", alias="journalId")
+    # What OCR thought the document was — for review when it disagrees.
+    ocr_document_type: str = Field(default="", alias="ocrDocumentType")
+    exception_type: str | None = Field(default=None, alias="exceptionType")
+    severity: str | None = None
+    # Queue bookkeeping — how many times it has been tried and why it last failed.
+    attempts: int = 0
+    last_error: str = Field(default="", alias="lastError")
+    created_at: datetime = Field(alias="createdAt")
+    processed_at: datetime | None = Field(default=None, alias="processedAt")
+
+    model_config = {"populate_by_name": True}
+
+
 # ── Dashboard ─────────────────────────────────────────────────────────────────
 
 
@@ -224,6 +280,9 @@ class DocumentsByType(BaseModel):
     SUBLET: int = 0
     MISCELLANEOUS: int = 0
     STOCK: int = 0
+    # OEM documents become journal entries rather than POs, but they are counted
+    # here too so the dashboard shows every folder.
+    OEM: int = 0
 
 
 class ExceptionItem(BaseModel):
