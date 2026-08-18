@@ -1,20 +1,32 @@
-"""User management routes — list, delete, activate/deactivate.
+"""User management routes — list, delete, activate/deactivate, invite.
 
-GET    /api/users           — list all users (name, email, role, status)
-DELETE /api/users/{user_id} — delete a user
-PATCH  /api/users/{user_id} — activate or deactivate a user
+GET    /api/users              — list all users (name, email, role, status)
+DELETE /api/users/{user_id}    — delete a user
+PATCH  /api/users/{user_id}    — activate or deactivate a user
+POST   /api/users/invite       — create an invite link (24h, single-use)
+GET    /api/users/invite/{code} — validate an invite code + pre-fill fields
 """
 from __future__ import annotations
 
+import secrets
+from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 
+from api.config import settings
 from api.db import get_session
 from api.deps import CurrentUserDep
-from api.models.db import User
-from api.models.schemas import UpdateUserStatusRequest, UserListItem, UserListResponse
+from api.models.db import InviteCode, User
+from api.models.schemas import (
+    CreateInviteRequest,
+    InviteResponse,
+    InviteValidateResponse,
+    UpdateUserStatusRequest,
+    UserListItem,
+    UserListResponse,
+)
 
 router = APIRouter(prefix="/api/users", tags=["users"])
 
@@ -78,3 +90,32 @@ def update_user_status(
         "user_id": user_id,
         "is_active": req.is_active,
     }
+
+
+@router.post("/invite", response_model=InviteResponse)
+def create_invite(
+    req: CreateInviteRequest,
+    current_user: Annotated[User, Depends(CurrentUserDep)],
+    session: Annotated[Session, Depends(get_session)],
+) -> InviteResponse:
+    """Create a single-use invite link valid for 24 hours."""
+    code = secrets.token_urlsafe(16)[:24]
+    invite = InviteCode(
+        code=code,
+        role=req.role,
+        full_name=req.full_name,
+        created_by=current_user.id,
+    )
+    session.add(invite)
+    session.commit()
+    session.refresh(invite)
+
+    invite_url = f"{settings.frontend_url}/invite?code={code}"
+
+    return InviteResponse(
+        invite_code=code,
+        invite_url=invite_url,
+        role=req.role,
+        full_name=req.full_name,
+        expires_at=invite.expires_at,
+    )

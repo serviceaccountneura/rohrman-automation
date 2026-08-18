@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -419,15 +420,19 @@ class TekionApiClient:
         return addresses[0]
 
     def fetch_gl_accounts(self) -> list[dict[str, Any]]:
-        """Fetch all GL accounts for the current dealership from Tekion.
+        """Fetch GL accounts for the current dealership from Tekion.
 
         Uses POST /api/lookup/search with GL_ACCOUNT_ASSET, paginated.
+        Server-side filter: active=True only (NIN filters are flaky from API client).
+        Client-side filter: exclude MEMO type and AP account ({dealer}_3002).
+        This matches the Tekion pre-invoice UI flow the Rohrman team uses.
         Returns a list of dicts with: account_id, account_number, account_name,
         account_type, department_type, active.
         """
         accounts: list[dict[str, Any]] = []
         start = 0
         rows = 100
+        ap_account_id = f"{self.dealer_id}_3002"
 
         while True:
             res = self._req_json(
@@ -435,7 +440,9 @@ class TekionApiClient:
                 method="POST",
                 body={
                     "GL_ACCOUNT_ASSET": {
-                        "filters": [],
+                        "filters": [
+                            {"field": "active", "operator": "IN", "values": [True], "key": "active"},
+                        ],
                         "searchText": "",
                         "pageInfo": {"start": start, "rows": rows},
                         "sort": [],
@@ -448,11 +455,16 @@ class TekionApiClient:
 
             for e in entities:
                 d = e.get("data") or {}
+                acct_type = d.get("accountTypeId", "")
+                acct_id = d.get("id", "")
+                # Client-side filter: skip MEMO + AP account
+                if acct_type == "MEMO" or acct_id == ap_account_id:
+                    continue
                 accounts.append({
-                    "account_id": d.get("id", ""),
+                    "account_id": acct_id,
                     "account_number": d.get("accountNumber", ""),
                     "account_name": d.get("accountName", ""),
-                    "account_type": d.get("accountTypeId", ""),
+                    "account_type": acct_type,
                     "department_type": d.get("departmentType", ""),
                     "active": d.get("active", True),
                 })
@@ -463,6 +475,81 @@ class TekionApiClient:
 
         print(f"[API] Fetched {len(accounts)} GL accounts for dealer {self.dealer_id}")
         return accounts
+
+    def upload_document(self, file_path: str, mime_type: str = "application/pdf") -> str:
+        """Upload a document to Tekion's media service.
+
+        Flow:
+          1. POST /api/media-v3/u/v2/initiate-upload → get presigned S3 URL + mediaId
+          2. PUT the file directly to S3
+          3. Poll GET /api/media-v3/u/upload-status/{mediaId} until COMPLETED
+          4. POST /api/media-v3/u/v2/presignedurls → confirm upload
+
+        Returns the mediaId (used in preInvoice attachments).
+        """
+        file_name = os.path.basename(file_path)
+        content_length = os.path.getsize(file_path)
+
+        # Step 1: Initiate upload
+        print(f"[API] Uploading {file_name} ({content_length} bytes)…")
+        res = self._req_json(
+            "/api/media-v3/u/v2/initiate-upload",
+            method="POST",
+            body={
+                "generateThumbnail": False,
+                "folderName": "",
+                "globalMedia": False,
+                "stripMetadata": False,
+                "hlsVideoEnabled": False,
+                "moduleType": "CDMS",
+                "compressionEnabled": False,
+                "mimeType": mime_type,
+                "fileName": file_name,
+                "contentLength": content_length,
+                "fragment": False,
+            },
+        )
+        upload_data = (res.get("data") or {})
+        s3_url = upload_data.get("url", "")
+        media_id = upload_data.get("mediaId", "")
+        http_method = upload_data.get("httpMethod", "PUT")
+
+        if not s3_url or not media_id:
+            raise Exception(f"initiate-upload failed: {res}")
+
+        # Step 2: Upload file to S3
+        with open(file_path, "rb") as f:
+            s3_resp = requests.request(
+                http_method,
+                s3_url,
+                data=f,
+                headers={"Content-Type": mime_type},
+                timeout=120,
+            )
+        if not s3_resp.ok:
+            raise Exception(f"S3 upload failed: {s3_resp.status_code} {s3_resp.text[:300]}")
+
+        print(f"[API] S3 upload complete, mediaId={media_id}")
+
+        # Step 3: Poll upload status
+        for _ in range(30):
+            status_res = self._req_json(f"/api/media-v3/u/upload-status/{media_id}")
+            status = (status_res.get("data") or {}).get("uploadStatus", "")
+            if status == "COMPLETED":
+                break
+            if status == "FAILED":
+                raise Exception(f"Upload failed for mediaId={media_id}")
+            time.sleep(1)
+
+        # Step 4: Confirm via presignedurls
+        self._req_json(
+            "/api/media-v3/u/v2/presignedurls",
+            method="POST",
+            body=[media_id],
+        )
+
+        print(f"[API] Document uploaded successfully, mediaId={media_id}")
+        return media_id
 
     def create_stock_order(
         self,
@@ -836,6 +923,7 @@ class TekionApiClient:
         po_type: str,
         sales_tax: float = 0.0,
         invoice_date: str | None = None,
+        attachment_media_ids: list[str] | None = None,
     ) -> dict[str, str]:
         amount_cents = round(invoice_amount * 100)
         tax_cents = round(sales_tax * 100)
@@ -915,7 +1003,7 @@ class TekionApiClient:
                 "fees": {"amount": 0, "currency": "USD"},
                 "shippingCharges": {"amount": 0, "currency": "USD"},
                 "discount": {"amount": 0, "currency": "USD"},
-                "attachments": [],
+                "attachments": [{"mediaId": mid} for mid in (attachment_media_ids or [])],
                 "transactionDetails": None,
                 "accountingDetails": [
                     {
