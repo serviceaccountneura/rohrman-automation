@@ -10,7 +10,7 @@ Adds the columns the unified upload pipeline needs:
   journal_id         — "{dealerId}_{journalNumber}" (OEM folder)
 
 Revision ID: b3f5a91c7d24
-Revises: 49d305ce3f9b
+Revises: bd511c76eabf
 Create Date: 2026-08-18 10:12:44.318602
 
 """
@@ -23,7 +23,9 @@ import sqlmodel
 
 # revision identifiers, used by Alembic.
 revision: str = 'b3f5a91c7d24'
-down_revision: Union[str, Sequence[str], None] = '49d305ce3f9b'
+# Rebased onto the invite-codes migration from the unified branch: both were
+# written against 49d305ce3f9b, which would leave alembic with two heads.
+down_revision: Union[str, Sequence[str], None] = 'bd511c76eabf'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

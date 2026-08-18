@@ -209,7 +209,9 @@ def _run(doc: Document, session: Session) -> None:
     if doc.po_type == FOLDER_OEM:
         _run_journal_entry(doc, ocr, session)
     else:
-        _run_purchase_order(doc, ocr, session)
+        # `source` is handed on so the PO flow can attach the invoice PDF to the
+        # pre-invoice — we already have the file, so there is no reason not to.
+        _run_purchase_order(doc, ocr, session, source)
 
 
 # ── OEM -> Journal entry ──────────────────────────────────────────────────────
@@ -273,8 +275,18 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
 # ── SUBLET / MISCELLANEOUS / STOCK -> Purchase order ─────────────────────────
 
 
-def _run_purchase_order(doc: Document, ocr: dict[str, Any], session: Session) -> None:
-    """Build the typed PO request from OCR and hand it to the existing flow."""
+def _run_purchase_order(
+    doc: Document,
+    ocr: dict[str, Any],
+    session: Session,
+    source_path: str | None = None,
+) -> None:
+    """Build the typed PO request from OCR and hand it to the existing flow.
+
+    `source_path` is the invoice file. The PO flow uploads it to Tekion's media
+    service and attaches it to the pre-invoice, which is the same thing a clerk
+    does by hand after creating the PO.
+    """
     from fastapi import HTTPException
 
     from api.models.schemas import (
@@ -301,6 +313,9 @@ def _run_purchase_order(doc: Document, ocr: dict[str, Any], session: Session) ->
         "invoice_number": doc.invoice_number,
         "invoice_amount": total,
         "sales_tax": sales_tax,
+        # Attached to the pre-invoice by the PO flow. Stock orders have no
+        # pre-invoice, so it is simply unused there.
+        "invoice_file_path": source_path,
     }
 
     try:
