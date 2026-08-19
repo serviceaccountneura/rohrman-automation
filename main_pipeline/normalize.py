@@ -84,8 +84,26 @@ def _line_items(doc: Any) -> list[dict]:
             "qty": to_number(find_key(row, ["qty", "quantity", "count"])),
             "unit_price": to_number(find_key(row, ["unit_price", "unit_cost", "unit", "price", "cost"])),
             "total_price": to_number(find_key(row, ["total_price", "extended", "line_total", "total", "amount"])),
+            "gl_account": find_key(row, ["gl_account", "gl", "account", "acct"], str),
         })
     return items
+
+
+def _gl_mappings(doc: Any) -> list[dict]:
+    """Extract gl_mappings[] array from the doc (fees/freight/discounts with GL codes)."""
+    mappings = find_key(doc, ["gl_mappings", "gl_mapping"], list)
+    if not mappings or not isinstance(mappings, list):
+        return []
+    out = []
+    for row in mappings:
+        if not isinstance(row, dict):
+            continue
+        out.append({
+            "gl_account": find_key(row, ["gl_account", "gl", "account", "acct"], str),
+            "amount": to_number(find_key(row, ["amount", "value", "price"])),
+            "mapped_description": find_key(row, ["mapped_description", "description", "desc", "label"], str),
+        })
+    return out
 
 
 def to_po_contract(doc: dict) -> dict:
@@ -99,6 +117,7 @@ def to_po_contract(doc: dict) -> dict:
         "po_number": find_key(doc, ["purchase_order_number", "po_number", "po number", "purchase order"]),
         "control_number": find_key(doc, ["control_number", "control_no", "control"]),
         "line_items": _line_items(doc),
+        "gl_mappings": _gl_mappings(doc),
         "total": to_number(find_key(doc, ["grand_total", "total_amount", "amount_due", "balance_due", "total"])),
         "needs_review": bool(validation.get("needs_review", False)),
         "validation": validation.get("checks") or {},

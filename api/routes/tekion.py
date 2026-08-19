@@ -327,16 +327,43 @@ def _create_misc_po(
             items=items,
         )
 
-        # Pre-invoice — resolve GL account via Tekion GL accounts + LLM.
-        descriptions = [li.part_name for li in req.line_items] or ["Misc purchase"]
-        gl_account_id = resolve_misc_gl(
-            dealership_name=req.dealership_name,
-            dealer_id=dealer_id,
-            line_descriptions=descriptions,
-            client=client,
-            session=session,
-        )
+        # Pre-invoice — use OCR-extracted GL accounts if present, else LLM fallback.
         ap_gl_account_id = f"{dealer_id}_3002"
+        gl_splits: list[dict] | None = None
+        gl_account_id: str | None = None
+
+        # Check if line items have GL accounts from OCR.
+        ocr_gl_items = [li for li in req.line_items if li.gl_account]
+
+        if ocr_gl_items:
+            # Build gl_splits from OCR-extracted GL accounts.
+            # Group by GL account number, summing amounts per account.
+            gl_totals: dict[str, float] = {}
+            for li in ocr_gl_items:
+                gl_num = li.gl_account or ""
+                line_total = li.qty * li.unit_price
+                gl_totals[gl_num] = gl_totals.get(gl_num, 0) + line_total
+
+            gl_splits = [
+                {
+                    "gl_account_id": f"{dealer_id}_{gl_num}",
+                    "amount": amt,
+                    "description": None,
+                }
+                for gl_num, amt in gl_totals.items()
+            ]
+            print(f"[Misc] Using OCR GL splits: {len(gl_splits)} GL account(s)")
+        else:
+            # Fall back to LLM resolution.
+            descriptions = [li.part_name for li in req.line_items] or ["Misc purchase"]
+            gl_account_id = resolve_misc_gl(
+                dealership_name=req.dealership_name,
+                dealer_id=dealer_id,
+                line_descriptions=descriptions,
+                client=client,
+                session=session,
+            )
+            print(f"[Misc] Using LLM-resolved GL: {gl_account_id}")
 
         # Upload invoice document if provided.
         attachment_media_ids: list[str] = []
@@ -355,12 +382,13 @@ def _create_misc_po(
             universal_id=po["universalId"],
             invoice_number=req.invoice_number,
             invoice_amount=req.invoice_amount,
-            gl_account_id=gl_account_id,
+            gl_account_id=gl_account_id or "",
             ap_gl_account_id=ap_gl_account_id,
             ref_text="",
             po_type="MISCELLANEOUS",
             sales_tax=req.sales_tax,
             attachment_media_ids=attachment_media_ids or None,
+            gl_splits=gl_splits,
         )
 
         return CreatePoResponse(

@@ -88,6 +88,33 @@ MULTI-DOCUMENT UPLOADS:
 - Ignore page chrome: repeated letterheads, "Page 1 of 2", "Dealer Copy", print timestamps, QR
   codes. Reconcile a value that appears on multiple pages into a single reading.
 
+GL ACCOUNTS & SPATIAL BINDING:
+- DETECT ALL GL CODES: Locate any printed or handwritten General Ledger account codes anywhere on
+  the page (typically 4-digit or 5-digit numeric codes, often appearing alongside terms or symbols
+  like "GL", "Acct", "Account", "#", or descriptive tags like "Credit", "Tires", "Supplies"). Do
+  not limit detection to predefined numbers.
+- BIND GL CODES TO CHARGES (LAYOUT-AGNOSTIC SPATIAL RULES):
+  Use the visual layout and handwritten annotations to map each detected GL code to its
+  corresponding line item, charge, or fee:
+  1. Horizontal Row Alignment: If a GL code shares the same horizontal row/band as a line item,
+     assign it directly to that line item's description and amount.
+  2. Vector / Arrow Anchoring: If a line or arrow points from a GL code to a specific cell, part
+     description, or amount, bind the GL code to that target item regardless of where it appears.
+  3. Enclosure & Contour Grouping: If a dollar amount, line item, fee, discount, or tax line is
+     circled, boxed, or underlined, and a GL code is written inside or adjacent to that boundary,
+     bind the GL code exclusively to that enclosed item and amount.
+  4. Unanchored / Global Fallback: If a GL code is written in a header, margin, or blank area
+     without arrows or enclosures targeting a specific row, treat it as the default GL code for
+     all unmapped items/charges on the document.
+  5. Multi-GL Split Handling: If an invoice contains multiple GL codes, resolve each code's
+     spatial target independently to ensure every line item, subtotal, discount, or extra fee is
+     assigned its correct GL code and corresponding dollar amount.
+- POPULATE OUTPUT:
+  - For items in `line_items[]`, populate the string field `gl_account` (e.g. `gl_account: "2410"`).
+  - For fees, discounts, freight, or subtotals outside the main table that have an assigned GL
+    code, populate `gl_mappings[]` with: `gl_account`, `amount`, and `mapped_description`
+    (e.g. `{"gl_account": "7555", "amount": "15.12", "mapped_description": "Delivery Charge"}`).
+
 Return ONLY the JSON object described by the schema. No commentary, no markdown fences.
 """
 
@@ -129,6 +156,7 @@ def build_response_schema() -> types.Schema:
             "qty": _str(),
             "unit_price": _str(),
             "total_price": _str(),
+            "gl_account": _str(),
         })),
         "tables": _arr(_obj({
             "title": _str(),
@@ -136,6 +164,11 @@ def build_response_schema() -> types.Schema:
             "rows": _arr(_arr(_S(type=_T.STRING))),
         })),
         "totals": _arr(label_value),
+        "gl_mappings": _arr(_obj({
+            "gl_account": _str(),
+            "amount": _str(),
+            "mapped_description": _str(),
+        })),
         "handwritten_notes": _arr(_S(type=_T.STRING)),
         "illegible": _arr(_S(type=_T.STRING)),
     }, required=["document_type"])

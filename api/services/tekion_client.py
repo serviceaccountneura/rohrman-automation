@@ -924,6 +924,7 @@ class TekionApiClient:
         sales_tax: float = 0.0,
         invoice_date: str | None = None,
         attachment_media_ids: list[str] | None = None,
+        gl_splits: list[dict[str, Any]] | None = None,
     ) -> dict[str, str]:
         amount_cents = round(invoice_amount * 100)
         tax_cents = round(sales_tax * 100)
@@ -1005,15 +1006,28 @@ class TekionApiClient:
                 "discount": {"amount": 0, "currency": "USD"},
                 "attachments": [{"mediaId": mid} for mid in (attachment_media_ids or [])],
                 "transactionDetails": None,
-                "accountingDetails": [
-                    {
-                        "description": None,
-                        "glAccountId": gl_account_id,
-                        "postingAmount": {"amount": subtotal_cents, "currency": "USD"},
-                        "controlNumberList": None,
-                        "refText": ref_text,
-                    }
-                ],
+                "accountingDetails": (
+                    [
+                        {
+                            "description": s.get("description"),
+                            "glAccountId": s["gl_account_id"],
+                            "postingAmount": {"amount": round(s["amount"] * 100), "currency": "USD"},
+                            "controlNumberList": None,
+                            "refText": ref_text,
+                        }
+                        for s in gl_splits
+                    ]
+                    if gl_splits
+                    else [
+                        {
+                            "description": None,
+                            "glAccountId": gl_account_id,
+                            "postingAmount": {"amount": subtotal_cents, "currency": "USD"},
+                            "controlNumberList": None,
+                            "refText": ref_text,
+                        }
+                    ]
+                ),
                 "type": "INVOICE",
                 "payeeNumber": vendor_display_id,
                 "payeeName": vendor_name,
