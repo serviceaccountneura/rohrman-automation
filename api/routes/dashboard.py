@@ -122,6 +122,7 @@ def list_documents(
     items = [
         DocumentItem(
             id=doc.id,
+            duplicate_of=doc.duplicate_of,
             file_name=doc.file_name,
             dealership_name=doc.dealership_name,
             vendor_name=doc.vendor_name,

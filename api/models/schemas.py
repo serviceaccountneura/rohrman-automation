@@ -357,6 +357,10 @@ class DashboardResponse(BaseModel):
 
 class DocumentItem(BaseModel):
     id: UUID
+    # Set when status is DUPLICATE — the already-processed document this
+    # repeats. Exposed on the list so the table can pair them up and offer the
+    # decision without opening each row.
+    duplicate_of: UUID | None = None
     file_name: str
     dealership_name: str
     vendor_name: str
