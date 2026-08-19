@@ -202,7 +202,7 @@ def resolve_misc_gl(
     # Find the full account ID
     for acc in gl_accounts:
         if acc.account_name == account_name:
-            print(f"[GL-Misc] Resolved '{account_name}' → {acc.account_id}")
+            print(f"[GL-Misc] Resolved '{account_name}' -> {acc.account_id}")
             return acc.account_id
 
     raise Exception(f"GL account '{account_name}' not found in cache for dealer {dealer_id}")

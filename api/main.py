@@ -2,9 +2,22 @@
 """
 from __future__ import annotations
 
+import sys
+
 from dotenv import load_dotenv
 
 load_dotenv()  # Load TEKION_* and other env vars before anything imports them.
+
+# The Windows console defaults to cp1252, which cannot encode characters like
+# "->" arrows or em dashes. A print() that raises inside a worker aborts the job
+# mid-flight — one such line failed a run *after* it had already created a
+# purchase order in Tekion, and the retry then created a second one. Logging
+# must never be able to do that.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):  # not a real console (tests, pipes)
+        pass
 
 from contextlib import asynccontextmanager
 

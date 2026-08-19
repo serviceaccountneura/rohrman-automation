@@ -309,6 +309,8 @@ class PipelineStatusResponse(BaseModel):
     journal_id: str = Field(default="", alias="journalId")
     # What OCR thought the document was — for review when it disagrees.
     ocr_document_type: str = Field(default="", alias="ocrDocumentType")
+    # Set when status is DUPLICATE: the already-processed document this repeats.
+    duplicate_of: UUID | None = Field(default=None, alias="duplicateOf")
     exception_type: str | None = Field(default=None, alias="exceptionType")
     severity: str | None = None
     # Queue bookkeeping — how many times it has been tried and why it last failed.
@@ -355,6 +357,10 @@ class DashboardResponse(BaseModel):
 
 class DocumentItem(BaseModel):
     id: UUID
+    # Set when status is DUPLICATE — the already-processed document this
+    # repeats. Exposed on the list so the table can pair them up and offer the
+    # decision without opening each row.
+    duplicate_of: UUID | None = None
     file_name: str
     dealership_name: str
     vendor_name: str

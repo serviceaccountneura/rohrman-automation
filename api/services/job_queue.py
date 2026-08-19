@@ -31,6 +31,8 @@ STATUS_QUEUED = "QUEUED"
 STATUS_PROCESSING = "PROCESSING"
 STATUS_PROCESSED = "PROCESSED"
 STATUS_EXCEPTION = "EXCEPTION"
+# Held for a human decision, not a failure — nothing was sent to Tekion.
+STATUS_DUPLICATE = "DUPLICATE"
 
 # Attempts per document before it is parked as an EXCEPTION.
 MAX_ATTEMPTS = 3
@@ -128,6 +130,94 @@ def fail(
     session.add(doc)
     session.commit()
     print(f"[QUEUE] {doc.id} -> EXCEPTION ({exception_type})")
+
+
+def hold_as_duplicate(session: Session, doc: Document, original: Document) -> None:
+    """Park a run that repeats an already-processed invoice.
+
+    Deliberately not an exception: nothing went wrong and nothing was posted.
+    Someone decides whether to reprocess it (see confirm_duplicate) or discard
+    it, and until they do the row simply waits.
+    """
+    doc.status = STATUS_DUPLICATE
+    doc.duplicate_of = original.id
+    doc.exception_type = None
+    doc.severity = None
+    doc.locked_at = None
+    doc.locked_by = ""
+    doc.next_attempt_at = None
+    doc.processed_at = _utcnow()
+    doc.last_error = (
+        f"Matches invoice {original.invoice_number or '(unknown)'} "
+        f"already processed on {original.created_at:%d %b %Y}"
+    )
+    session.add(doc)
+    session.commit()
+    print(f"[QUEUE] {doc.id} -> DUPLICATE of {original.id}")
+
+
+def confirm_duplicate(session: Session, doc: Document) -> Document:
+    """Reprocess a duplicate against the ORIGINAL document, not a second one.
+
+    The point of the confirmation is that the invoice keeps one identity. The
+    newly uploaded file and everything OCR read from it are moved onto the
+    original row, the original is re-queued with the duplicate check waived for
+    one run, and the extra row is dropped.
+
+    Returns the original document — the caller should follow that id from here.
+    """
+    original = session.get(Document, doc.duplicate_of) if doc.duplicate_of else None
+    if original is None:
+        # The original was deleted while this sat in review; the duplicate is
+        # no longer a duplicate, so let it run on its own.
+        doc.status = STATUS_QUEUED
+        doc.duplicate_of = None
+        doc.duplicate_override = True
+        doc.last_error = ""
+        doc.processed_at = None
+        session.add(doc)
+        session.commit()
+        return doc
+
+    # Carry the new upload over: the file itself, and what OCR made of it.
+    original.file_name = doc.file_name or original.file_name
+    original.source_path = doc.source_path
+    original.s3_key = doc.s3_key or original.s3_key
+    original.file_hash = doc.file_hash or original.file_hash
+    original.dealership_name = doc.dealership_name or original.dealership_name
+    original.po_type = doc.po_type or original.po_type
+    original.vendor_name = doc.vendor_name or original.vendor_name
+    original.invoice_number = doc.invoice_number or original.invoice_number
+    original.ro_number = doc.ro_number or original.ro_number
+    original.ocr_document_type = doc.ocr_document_type or original.ocr_document_type
+
+    # Previous Tekion references belong to the earlier run and would be
+    # misleading if this one fails. The UI shows them before confirming.
+    original.po_number = ""
+    original.transaction_id = ""
+    original.transaction_number = ""
+    original.journal_id = ""
+
+    original.status = STATUS_QUEUED
+    original.duplicate_override = True
+    original.duplicate_of = None
+    original.attempts = 0
+    original.exception_type = None
+    original.severity = None
+    original.last_error = ""
+    original.locked_at = None
+    original.locked_by = ""
+    original.next_attempt_at = None
+    original.processed_at = None
+
+    session.add(original)
+    # The duplicate row hands over its file, so do not delete it from disk here.
+    doc.source_path = ""
+    session.delete(doc)
+    session.commit()
+    session.refresh(original)
+    print(f"[QUEUE] duplicate confirmed -- re-running {original.id}")
+    return original
 
 
 def requeue_stale(session: Session) -> int:

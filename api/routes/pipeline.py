@@ -27,7 +27,11 @@ from sqlmodel import Session
 
 from api.db import get_session
 from api.models.db import Document
-from api.models.schemas import PipelineAcceptedResponse, PipelineStatusResponse
+from api.models.schemas import (
+    MessageResponse,
+    PipelineAcceptedResponse,
+    PipelineStatusResponse,
+)
 from api.services import job_queue, s3_service
 from api.services.pipeline_service import VALID_FOLDERS, normalize_folder
 
@@ -122,6 +126,59 @@ async def process_upload(
     )
 
 
+@router.post("/jobs/{document_id}/confirm-duplicate", response_model=PipelineStatusResponse)
+def confirm_duplicate(
+    document_id: UUID,
+    session: Annotated[Session, Depends(get_session)],
+) -> PipelineStatusResponse:
+    """Reprocess a document that was held as a duplicate.
+
+    The invoice keeps ONE identity: the new upload is folded into the original
+    document, which is re-queued with the duplicate check waived for that run,
+    and the extra row is dropped. The response is the ORIGINAL document — poll
+    that id from here, not the one that was posted to.
+
+    This will create a second record in Tekion. That is the point of confirming,
+    but it is worth saying plainly.
+    """
+    doc = session.get(Document, document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if doc.status != job_queue.STATUS_DUPLICATE:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Document is {doc.status}, not awaiting a duplicate decision",
+        )
+
+    original = job_queue.confirm_duplicate(session, doc)
+    return _to_status(original)
+
+
+@router.post("/jobs/{document_id}/discard", response_model=MessageResponse)
+def discard_duplicate(
+    document_id: UUID,
+    session: Annotated[Session, Depends(get_session)],
+) -> MessageResponse:
+    """Drop a held duplicate. The original document is untouched."""
+    doc = session.get(Document, document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if doc.status != job_queue.STATUS_DUPLICATE:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Document is {doc.status}, not awaiting a duplicate decision",
+        )
+
+    if doc.source_path:
+        try:
+            Path(doc.source_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+    session.delete(doc)
+    session.commit()
+    return MessageResponse(message="Duplicate discarded")
+
+
 @router.get("/jobs/{document_id}", response_model=PipelineStatusResponse)
 def get_job(
     document_id: UUID,
@@ -132,6 +189,10 @@ def get_job(
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
 
+    return _to_status(doc)
+
+
+def _to_status(doc: Document) -> PipelineStatusResponse:
     return PipelineStatusResponse(
         document_id=doc.id,
         status=doc.status,
@@ -147,6 +208,7 @@ def get_job(
         transaction_number=doc.transaction_number,
         journal_id=doc.journal_id,
         ocr_document_type=doc.ocr_document_type,
+        duplicate_of=doc.duplicate_of,
         exception_type=doc.exception_type,
         severity=doc.severity,
         attempts=doc.attempts,

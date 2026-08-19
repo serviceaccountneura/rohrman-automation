@@ -130,7 +130,7 @@ class TekionApiClient:
         if not resp.ok:
             # 401/403 → session expired. Re-login once and retry.
             if resp.status_code in (401, 403) and _relogin and not path.startswith("/api/loginservice"):
-                print(f"[API] Got {resp.status_code} on {method} {path} — re-logging in…")
+                print(f"[API] Got {resp.status_code} on {method} {path} -- re-logging in...")
                 # login() resets dealer_id to the account default (the dealer on
                 # loginData). Since _req() rebuilds the dealerid/roleid/tek-siteid
                 # headers from that field on every call, letting it stand would
@@ -491,7 +491,7 @@ class TekionApiClient:
         content_length = os.path.getsize(file_path)
 
         # Step 1: Initiate upload
-        print(f"[API] Uploading {file_name} ({content_length} bytes)…")
+        print(f"[API] Uploading {file_name} ({content_length} bytes)...")
         res = self._req_json(
             "/api/media-v3/u/v2/initiate-upload",
             method="POST",

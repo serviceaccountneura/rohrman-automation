@@ -30,17 +30,43 @@ def get_dealership_name(ocr: dict[str, Any]) -> str:
     return user_input.get("dealership") or dealership or ""
 
 
+def _clean_ro_number(raw: Any) -> str:
+    """Strip the label off a repair order number.
+
+    Invoices print the RO as "RO 1575659", "RO# 1575659", "R.O. 1575659" — and
+    OCR routinely reads that leading "RO" as "R0" with a digit zero. Tekion
+    searches on the number itself, so a value carrying the prefix finds nothing
+    and the run fails with "No RO found" even though the number was read
+    correctly.
+
+    Only a recognisable RO label is removed. A number that genuinely contains
+    letters is left alone rather than guessed at.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    # "RO", "R0", "R.O.", "RO#", "REPAIR ORDER" — optionally followed by
+    # punctuation and whitespace, at the start only.
+    stripped = re.sub(
+        r"^\s*(?:R[O0]|R\.?\s*[O0]\.?|REPAIR\s+ORDER)\s*[#:.\-]?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+    return stripped or text
+
+
 def get_control_number(ocr: dict[str, Any]) -> str:
     po_contract = ocr.get("_po_contract") or {}
     if po_contract.get("ro_number"):
-        return str(po_contract["ro_number"]).strip()
+        return _clean_ro_number(po_contract["ro_number"])
 
     for id_entry in ocr.get("identifiers", []):
         label = (id_entry.get("label") or "").lower()
         if "ro" in label or "repair order" in label or "control" in label:
-            return str(id_entry.get("value") or "").strip()
+            return _clean_ro_number(id_entry.get("value"))
 
-    return (
+    return _clean_ro_number(
         ocr.get("control_number")
         or ocr.get("controlNumber")
         or (po_contract.get("control_number") or "")
