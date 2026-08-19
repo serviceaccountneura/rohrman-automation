@@ -187,11 +187,59 @@ def get_sales_tax(ocr: dict[str, Any]) -> float:
     return 0.0
 
 
+# Labels that look like a total but are not the amount owed. "SUBTOTAL"
+# contains "total", so a naive substring match returns the pre-tax figure — and
+# anything that then subtracts tax from it takes the tax off twice.
+_NOT_A_GRAND_TOTAL = (
+    "sub", "line", "item", "extended", "tax", "discount", "rate",
+    "qty", "quantity", "freight", "shipping", "handling", "paid", "credit",
+)
+
+# Tried in order. An explicit grand-total label beats a bare "total".
+_GRAND_TOTAL_LABELS = (
+    "grand total", "total amount due", "amount due", "balance due",
+    "invoice total", "total due", "total amount", "net due", "please pay",
+)
+
+
 def get_total_amount(ocr: dict[str, Any]) -> float:
-    for t in ocr.get("totals", []):
-        label = (t.get("label") or "").lower()
-        if "grand total" in label or "total" in label or "balance due" in label:
-            return _parse_amount(t.get("value"))
+    """The amount owed on the invoice, tax included.
+
+    Label matching is deliberately prioritised rather than first-match: an
+    invoice prints several numbers that read as totals, and picking the wrong
+    one is not a rounding error. One S&S invoice listed EXTENDED 411.26, SALES
+    TAX 34.96 and TOTAL 446.22; returning 411.26 as "the total" and then
+    deducting tax produced a purchase order for 376.30 against a 446.22 bill.
+    """
+    totals = ocr.get("totals") or []
+
+    def value_for(predicate) -> float | None:
+        for entry in totals:
+            label = (entry.get("label") or "").strip().lower()
+            if not label or any(bad in label for bad in _NOT_A_GRAND_TOTAL):
+                continue
+            if predicate(label):
+                amount = _parse_amount(entry.get("value"))
+                if amount:
+                    return amount
+        return None
+
+    # 1. An unambiguous grand-total label.
+    for wanted in _GRAND_TOTAL_LABELS:
+        found = value_for(lambda label, w=wanted: w in label)
+        if found is not None:
+            return found
+
+    # 2. The word "total" on its own.
+    found = value_for(lambda label: label == "total")
+    if found is not None:
+        return found
+
+    # 3. Any surviving label containing "total" — subtotals and line totals
+    #    were excluded above.
+    found = value_for(lambda label: "total" in label)
+    if found is not None:
+        return found
 
     po_contract = ocr.get("_po_contract") or {}
     summary = ocr.get("summary") or {}
