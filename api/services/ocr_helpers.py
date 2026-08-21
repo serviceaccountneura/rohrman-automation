@@ -288,6 +288,7 @@ def get_raw_line_items(ocr: dict[str, Any]) -> list[dict[str, Any]]:
                 "qty": qty,
                 "unitPrice": unit_price,
                 "totalPrice": total_price,
+                "glAccount": item.get("gl_account") or "",
             }
         )
     return result

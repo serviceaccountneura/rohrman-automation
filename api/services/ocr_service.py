@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +30,9 @@ from normalize import to_po_contract  # noqa: E402
 from pipeline import get_client, load_pages, pil_to_part  # noqa: E402
 from vision_extract import VISION_PROMPT, build_response_schema, validate  # noqa: E402
 
-VISION_MODEL = "gemini-2.5-pro"
+VISION_MODEL = "gemini-3.6-flash"
+# Gemini 3 models are only served from the global endpoint, not us-central1.
+VISION_LOCATION = "global"
 
 
 def extract_document(file_path: str | Path) -> dict[str, Any]:
@@ -41,21 +44,36 @@ def extract_document(file_path: str | Path) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
 
-    client = get_client()
+    client = get_client(location=VISION_LOCATION)
     images = load_pages(path)
     parts = [pil_to_part(img) for img in images]
     parts.append(types.Part.from_text(text=VISION_PROMPT))
 
-    resp = client.models.generate_content(
-        model=VISION_MODEL,
-        contents=parts,
-        config=types.GenerateContentConfig(
-            temperature=0.0,
-            response_mime_type="application/json",
-            response_schema=build_response_schema(),
-            max_output_tokens=65535,
-        ),
-    )
+    # Vertex AI intermittently drops the connection on long structured-schema
+    # calls. Retry a few times with backoff before giving up — the pipeline's
+    # own retry is coarser (30s/120s) and burns a full OCR re-run per attempt.
+    last_err: Exception | None = None
+    for attempt in range(3):
+        try:
+            resp = client.models.generate_content(
+                model=VISION_MODEL,
+                contents=parts,
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                    response_mime_type="application/json",
+                    response_schema=build_response_schema(),
+                    max_output_tokens=65535,
+                ),
+            )
+            break
+        except Exception as e:  # noqa: BLE001 — Vertex drops show up as various errors
+            last_err = e
+            if attempt < 2:
+                wait = 5 * (attempt + 1)
+                print(f"[OCR] Vertex call failed (attempt {attempt + 1}/3): {e}; retrying in {wait}s")
+                time.sleep(wait)
+    else:
+        raise last_err  # type: ignore[misc]
 
     try:
         doc = json.loads(resp.text or "{}")

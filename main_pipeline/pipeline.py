@@ -58,7 +58,7 @@ WHEN UNCERTAIN:
 - If a token is readable but you are unsure between options, give your best reading then alternates in brackets, e.g. "Naylor [?Naylar]".
 """
 
-def get_client() -> genai.Client:
+def get_client(location: str | None = None) -> genai.Client:
     if not CREDENTIALS_PATH.exists():
         raise FileNotFoundError(f"Credentials not found: {CREDENTIALS_PATH}")
     with open(CREDENTIALS_PATH) as f:
@@ -67,7 +67,7 @@ def get_client() -> genai.Client:
         str(CREDENTIALS_PATH),
         scopes=["https://www.googleapis.com/auth/cloud-platform"],
     )
-    return genai.Client(vertexai=True, project=project, location=LOCATION, credentials=creds)
+    return genai.Client(vertexai=True, project=project, location=location or LOCATION, credentials=creds)
 
 
 def pdf_to_pil_images(pdf_path: Path) -> list[Image.Image]:

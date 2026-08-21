@@ -404,6 +404,7 @@ def _run_purchase_order(
                     part_name=item["description"] or "Misc purchase",
                     qty=item["qty"],
                     unit_price=item["unitPrice"],
+                    gl_account=item.get("glAccount") or None,
                 )
                 for item in line_items
             ] or [
