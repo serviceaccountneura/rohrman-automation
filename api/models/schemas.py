@@ -311,6 +311,13 @@ class PipelineStatusResponse(BaseModel):
     ocr_document_type: str = Field(default="", alias="ocrDocumentType")
     # Set when status is DUPLICATE: the already-processed document this repeats.
     duplicate_of: UUID | None = Field(default=None, alias="duplicateOf")
+    # Set when this document was cut out of a batch scan: the batch it came
+    # from, and which of its pages this is ("1-2", "3").
+    split_from: UUID | None = Field(default=None, alias="splitFrom")
+    page_range: str = Field(default="", alias="pageRange")
+    # Set when status is SPLIT: the documents this batch was broken into. The
+    # parent does no work of its own, so this is what the user follows instead.
+    children: list[UUID] = Field(default_factory=list)
     exception_type: str | None = Field(default=None, alias="exceptionType")
     severity: str | None = None
     # Queue bookkeeping — how many times it has been tried and why it last failed.

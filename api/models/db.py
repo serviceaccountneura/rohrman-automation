@@ -161,6 +161,15 @@ class Document(SQLModel, table=True):
     # so a later upload is still checked normally.
     duplicate_override: bool = Field(default=False)
 
+    # ── Batch scans ───────────────────────────────────────────────────────────
+    # Several invoices scanned into one file are split into one document each.
+    # The parent keeps the original file and the SPLIT status; each child points
+    # back here and owns the pages it was cut from. A child is never re-split.
+    split_from: UUID | None = Field(default=None, foreign_key="documents.id")
+    # Which pages of the parent this document is, e.g. "1-2" or "3". Empty for
+    # anything that was not split out of a batch.
+    page_range: str = Field(default="", max_length=20)
+
 
 class GlVendorMapping(SQLModel, table=True):
     """Master Miscellaneous Vendor-to-GL lookup table.

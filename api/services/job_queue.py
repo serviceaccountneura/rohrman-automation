@@ -33,6 +33,9 @@ STATUS_PROCESSED = "PROCESSED"
 STATUS_EXCEPTION = "EXCEPTION"
 # Held for a human decision, not a failure — nothing was sent to Tekion.
 STATUS_DUPLICATE = "DUPLICATE"
+# A batch scan that was broken into one child document per invoice. Terminal:
+# the parent itself is never processed, its children carry the actual work.
+STATUS_SPLIT = "SPLIT"
 
 # Attempts per document before it is parked as an EXCEPTION.
 MAX_ATTEMPTS = 3

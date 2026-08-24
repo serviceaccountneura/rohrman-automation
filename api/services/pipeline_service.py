@@ -38,7 +38,7 @@ from sqlmodel import Session
 
 from api.db import engine
 from api.models.db import Document
-from api.services import job_queue, ocr_helpers, s3_service
+from api.services import document_splitter, job_queue, ocr_helpers, s3_service
 from api.services.ocr_service import extract_document
 from api.services.tekion_lock import tekion_scope
 
@@ -178,11 +178,87 @@ def _resolve_source(doc: Document) -> str | None:
     return None
 
 
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _split_batch(doc: Document, source: str, session: Session) -> bool:
+    """Break a batch scan into one child document per invoice.
+
+    Returns True when the document was split and this run is finished — the
+    children are queued and the workers pick them up as ordinary jobs.
+
+    Splitting wrongly would post invented invoices to Tekion, so every doubt
+    resolves to "not a batch": a single segment, an unreadable file, or a
+    segmentation the splitter would not vouch for all fall through to the
+    normal single-document path.
+    """
+    if document_splitter.page_count(source) < 2:
+        return False
+
+    try:
+        segments = document_splitter.segment_documents(source)
+    except Exception as e:  # noqa: BLE001 — never fail a job over segmentation
+        print(f"[SPLIT] {doc.id} segmentation error ({e}); processing as one document")
+        return False
+
+    if len(segments) < 2:
+        return False
+
+    print(f"[SPLIT] {doc.id} holds {len(segments)} invoices:")
+    for seg in segments:
+        print(f"[SPLIT]   {seg}")
+
+    try:
+        written = document_splitter.split_pdf(source, segments)
+    except Exception as e:  # noqa: BLE001
+        print(f"[SPLIT] {doc.id} could not be split ({e}); processing as one document")
+        return False
+
+    for index, (seg, path, digest) in enumerate(written, start=1):
+        session.add(
+            Document(
+                file_name=document_splitter.child_file_name(doc.file_name, seg, index),
+                s3_key=doc.s3_key,
+                source_path=path,
+                file_hash=digest,
+                dealership_name=doc.dealership_name,
+                # The folder decides the flow, so children inherit it — the
+                # batch was dropped into one folder deliberately.
+                po_type=doc.po_type,
+                status=job_queue.STATUS_QUEUED,
+                split_from=doc.id,
+                page_range=(
+                    str(seg.page_start)
+                    if seg.page_count == 1
+                    else f"{seg.page_start}-{seg.page_end}"
+                ),
+            )
+        )
+
+    # The parent is a container, not work. Terminal, so nothing reclaims it.
+    doc.status = job_queue.STATUS_SPLIT
+    doc.processed_at = _utcnow()
+    doc.locked_by = ""
+    doc.next_attempt_at = None
+    session.add(doc)
+    session.commit()
+    print(f"[SPLIT] {doc.id} -> SPLIT into {len(written)} queued documents")
+    return True
+
+
 def _run(doc: Document, session: Session) -> None:
     # ── 1. Locate the file ───────────────────────────────────────────────────
     source = _resolve_source(doc)
     if not source:
         _fail(session, doc, EX_FILE_MISSING, error=f"no readable source for {doc.file_name!r}")
+        return
+
+    # ── 1b. Split a batch scan before OCR ────────────────────────────────────
+    # OCR describes one document, so several invoices in one file have to become
+    # several documents first. Children are never re-segmented.
+    if not doc.split_from and _split_batch(doc, source, session):
         return
 
     # ── 2. OCR ───────────────────────────────────────────────────────────────
