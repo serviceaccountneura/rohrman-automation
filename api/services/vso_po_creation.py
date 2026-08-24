@@ -65,6 +65,8 @@ class ExpectedStockInvoice:
     invoice_date: str | None = None  # MM/DD/YYYY as printed
     # Local path to the invoice file, attached to the pre-invoice when present.
     invoice_file_path: str | None = None
+    # Original filename, shown in Tekion. The path above is usually a temp file.
+    invoice_file_name: str | None = None
     # Dollar tolerance when comparing the invoice against the PO.
     amount_tolerance: float = 0.005
 
@@ -121,7 +123,7 @@ class VsoPreInvoiceService:
 
     # ── Step 2: attach the invoice ───────────────────────────────────────────
 
-    def upload_invoice(self, file_path: str) -> str | None:
+    def upload_invoice(self, file_path: str, display_name: str | None = None) -> str | None:
         """Push the invoice PDF to Tekion's media service. Returns the mediaId.
 
         Best-effort: a pre-invoice without its attachment is still correct
@@ -129,7 +131,7 @@ class VsoPreInvoiceService:
         than posting it and attaching the file by hand.
         """
         try:
-            media_id = self.client.upload_document(file_path)
+            media_id = self.client.upload_document(file_path, display_name=display_name)
             print(f"[VSO] invoice attached, mediaId={media_id}")
             return media_id
         except Exception as e:  # noqa: BLE001
@@ -306,7 +308,9 @@ def pre_invoice_stock_order(
 
     # ── Step 3 + 4: attach and post ──────────────────────────────────────────
     if expected.invoice_file_path:
-        result.media_id = svc.upload_invoice(expected.invoice_file_path)
+        result.media_id = svc.upload_invoice(
+            expected.invoice_file_path, expected.invoice_file_name
+        )
 
     posted = svc.pre_invoice(po, expected, result.dealer_id, net, result.media_id)
     result.invoice_id = posted.get("invoiceId")

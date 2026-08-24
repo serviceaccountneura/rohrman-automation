@@ -18,6 +18,8 @@ Env: TEKION_USERNAME, TEKION_PASSWORD, TEKION_TOTP_SECRET
 from __future__ import annotations
 
 import json
+import mimetypes
+import tempfile
 import os
 import time
 import uuid
@@ -33,6 +35,35 @@ from api.models.db import TekionSession
 BASE = "https://app.tekioncloud.com"
 TENANT = "rohrmanautomotivegroup"
 
+
+
+def _as_pdf(file_path: str, file_name: str) -> tuple[str, str, Any]:
+    """Return the file as a PDF, converting it if it is an image.
+
+    Tekion's viewer only renders PDFs. Returns the path to use, the name to
+    show, and the NamedTemporaryFile holding the conversion — the caller must
+    keep that third value referenced until the upload completes, or the file is
+    deleted out from under it.
+
+    A conversion failure is not fatal: an unviewable attachment beats a failed
+    invoice, so the original is uploaded instead.
+    """
+    if os.path.splitext(file_path)[1].lower() == ".pdf":
+        return file_path, file_name, None
+    try:
+        from PIL import Image
+
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        tmp.close()
+        with Image.open(file_path) as img:
+            # PDF has no alpha channel; RGBA and palette images need flattening.
+            img.convert("RGB").save(tmp.name, "PDF", resolution=200.0)
+        pdf_name = f"{os.path.splitext(file_name)[0]}.pdf"
+        print(f"[API] converted {file_name} to PDF for Tekion's viewer")
+        return tmp.name, pdf_name, tmp
+    except Exception as e:  # noqa: BLE001
+        print(f"[API] could not convert {file_name} to PDF ({e}); uploading as-is")
+        return file_path, file_name, None
 
 class TekionApiClient:
     def __init__(self, db_session: Session | None = None) -> None:
@@ -476,8 +507,22 @@ class TekionApiClient:
         print(f"[API] Fetched {len(accounts)} GL accounts for dealer {self.dealer_id}")
         return accounts
 
-    def upload_document(self, file_path: str, mime_type: str = "application/pdf") -> str:
+    def upload_document(
+        self,
+        file_path: str,
+        mime_type: str | None = None,
+        display_name: str | None = None,
+    ) -> str:
         """Upload a document to Tekion's media service.
+
+        Tekion's document viewer renders PDFs and nothing else, so an image is
+        converted to one before it goes up. Uploading a JPEG as-is stores the
+        bytes intact but leaves the clerk looking at "Failed to load PDF file"
+        forever — the format is the problem, not the mimeType we declare.
+
+        `display_name` is the name shown in Tekion. Pass the invoice's original
+        filename — the caller usually holds the bytes in a temp file, and
+        "tmp8h24mg32.jpg" means nothing to whoever opens the PO later.
 
         Flow:
           1. POST /api/media-v3/u/v2/initiate-upload → get presigned S3 URL + mediaId
@@ -487,8 +532,13 @@ class TekionApiClient:
 
         Returns the mediaId (used in preInvoice attachments).
         """
-        file_name = os.path.basename(file_path)
+        file_name = display_name or os.path.basename(file_path)
+        # Tekion only previews PDFs. Convert anything else first, and keep the
+        # converted file alive until the upload finishes.
+        file_path, file_name, _tmp_pdf = _as_pdf(file_path, file_name)
         content_length = os.path.getsize(file_path)
+        if not mime_type:
+            mime_type = mimetypes.guess_type(file_path)[0] or "application/pdf"
 
         # Step 1: Initiate upload
         print(f"[API] Uploading {file_name} ({content_length} bytes)...")

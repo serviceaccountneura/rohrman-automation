@@ -343,6 +343,7 @@ def _run_stock_pre_invoice(
         dealership_name=doc.dealership_name,
         invoice_date=ocr_helpers.get_invoice_date(ocr) or None,
         invoice_file_path=source_path,
+        invoice_file_name=doc.file_name or None,
     )
 
     try:
