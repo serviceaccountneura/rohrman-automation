@@ -82,6 +82,10 @@ EX_FILE_MISSING = "SOURCE_FILE_MISSING"
 EX_MISSING_FIELD = "MISSING_REQUIRED_FIELD"
 EX_DUPLICATE = "DUPLICATE_DOCUMENT"
 EX_VENDOR_NOT_FOUND = "VENDOR_NOT_FOUND"
+# Vendor stock orders are invoiced against an existing PO. If the number on the
+# invoice does not resolve, there is nothing to attach to.
+EX_PO_NOT_FOUND = "PO_NOT_FOUND"
+EX_AMOUNT_MISMATCH = "AMOUNT_MISMATCH"
 EX_UNBALANCED = "UNBALANCED_ENTRY"
 EX_TEKION_ERROR = "TEKION_ERROR"
 # Tekion answered, and the answer was no. Distinct from TEKION_ERROR because a
@@ -94,6 +98,8 @@ _SEVERITY = {
     EX_MISSING_FIELD: "HIGH",
     EX_DUPLICATE: "LOW",
     EX_VENDOR_NOT_FOUND: "HIGH",
+    EX_PO_NOT_FOUND: "HIGH",
+    EX_AMOUNT_MISMATCH: "HIGH",
     EX_UNBALANCED: "HIGH",
     EX_TEKION_ERROR: "HIGH",
     EX_TEKION_REJECTED: "HIGH",
@@ -221,6 +227,10 @@ def _run(doc: Document, session: Session) -> None:
     # ── 5. Dispatch on the folder ────────────────────────────────────────────
     if doc.po_type == FOLDER_OEM:
         _run_journal_entry(doc, ocr, session)
+    elif doc.po_type == FOLDER_STOCK:
+        # A vendor stock order is not created here — the PO already exists and
+        # the invoice arrives afterwards to be attached to it.
+        _run_stock_pre_invoice(doc, ocr, session, source)
     else:
         # `source` is handed on so the PO flow can attach the invoice PDF to the
         # pre-invoice — we already have the file, so there is no reason not to.
@@ -285,7 +295,93 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
     print(f"[PIPE] {doc.id} -> PROCESSED (JE {doc.transaction_number}, {result.status})")
 
 
-# ── SUBLET / MISCELLANEOUS / STOCK -> Purchase order ─────────────────────────
+# ── STOCK -> pre-invoice an existing vendor stock order ──────────────────────
+
+
+def _run_stock_pre_invoice(
+    doc: Document,
+    ocr: dict[str, Any],
+    session: Session,
+    source_path: str | None = None,
+) -> None:
+    """Attach the invoice to the purchase order it names, and pre-invoice it."""
+    from api.routes.tekion import get_client, reset_client
+    from api.services.vso_po_creation import (
+        ExpectedStockInvoice,
+        pre_invoice_stock_order,
+    )
+
+    po_number = ocr_helpers.get_po_number(ocr)
+    invoice_number = doc.invoice_number
+    total = ocr_helpers.get_total_amount(ocr)
+    sales_tax = ocr_helpers.get_sales_tax(ocr)
+
+    # The PO number is what makes this flow possible at all.
+    if not po_number:
+        _fail(
+            session,
+            doc,
+            EX_PO_NOT_FOUND,
+            error="No purchase order number could be read from the invoice",
+        )
+        return
+    if not invoice_number or not total:
+        _fail(session, doc, EX_MISSING_FIELD, error="missing invoice number or total")
+        return
+
+    # Record it now so the row shows which PO this is about, even if the run
+    # fails later.
+    doc.po_number = po_number
+    session.add(doc)
+    session.commit()
+
+    expected = ExpectedStockInvoice(
+        po_number=po_number,
+        invoice_number=invoice_number,
+        invoice_amount=total,
+        sales_tax=sales_tax,
+        dealership_name=doc.dealership_name,
+        invoice_date=ocr_helpers.get_invoice_date(ocr) or None,
+        invoice_file_path=source_path,
+    )
+
+    try:
+        with tekion_scope():
+            client = get_client(session)
+            result = pre_invoice_stock_order(client, expected, dry_run=False)
+    except Exception as e:  # noqa: BLE001
+        print(f"[PIPE] {doc.id} stock pre-invoice failed: {e}")
+        reset_client()
+        _fail(session, doc, EX_TEKION_ERROR, error=str(e))
+        return
+
+    if not result.po_id:
+        _fail(
+            session,
+            doc,
+            EX_PO_NOT_FOUND,
+            error="; ".join(result.notes) or f"PO {po_number} not found",
+        )
+        return
+    if result.discrepancies:
+        _fail(
+            session,
+            doc,
+            EX_AMOUNT_MISMATCH,
+            error="; ".join(str(d) for d in result.discrepancies),
+        )
+        return
+    if not result.posted:
+        _fail(session, doc, EX_TEKION_ERROR, error="; ".join(result.notes) or "not posted")
+        return
+
+    doc.po_number = result.po_number or po_number
+    doc.vendor_name = result.vendor_name or doc.vendor_name
+    job_queue.complete(session, doc)
+    print(f"[PIPE] {doc.id} -> PROCESSED (pre-invoiced PO {doc.po_number})")
+
+
+# ── SUBLET / MISCELLANEOUS -> Purchase order ─────────────────────────────────
 
 
 def _run_purchase_order(

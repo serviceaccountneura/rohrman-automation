@@ -26,6 +26,8 @@
     "pw:analyze:ap": "tsx src/playwright/analyzeApproval.ts",
     "pw:capture:je": "tsx src/playwright/captureJE.ts",
     "pw:analyze:je": "tsx src/playwright/analyzeJE.ts",
+    "pw:capture:vso": "tsx src/playwright/captureVSO.ts",
+    "pw:analyze:vso": "tsx src/playwright/analyzeVSO.ts",
     "pw:codegen": "playwright codegen --load-storage=tekion-auth.json https://app.tekioncloud.com/parts/purchase-order/list",
     "server": "tsx src/apcServer.ts",
     "dev": "tsx watch src/apcServer.ts",

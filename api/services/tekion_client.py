@@ -682,6 +682,40 @@ class TekionApiClient:
             "vendorName": (data.get("vendorDetails") or {}).get("vendorName"),
         }
 
+    def find_purchase_order(self, po_number: str) -> dict[str, Any] | None:
+        """Find an existing purchase order by the number printed on an invoice.
+
+        The vendor stock order flow does not create a PO — one already exists in
+        Tekion and the invoice references it. This is the lookup the clerk does
+        by typing the number into the purchase order list.
+
+        Returns the PO with the fields the pre-invoice needs (id, orderNumber,
+        universalId, orderType, totalAmount, vendorDetails), or None.
+        """
+        res = self._req_json(
+            "/api/partTrade/u/purchase/search",
+            method="POST",
+            body={
+                "sort": [],
+                "filters": [
+                    {"field": "orderNumber", "operator": "IN", "values": [str(po_number).strip()]}
+                ],
+                "searchText": "",
+                "groupBy": [],
+                "includeFields": [],
+                "searchableFields": [],
+                "excludeFields": [],
+                "pageInfo": {"start": 0, "rows": 10},
+            },
+        )
+        hits = (res.get("data") or {}).get("hits") or []
+        wanted = str(po_number).strip()
+        for hit in hits:
+            if str(hit.get("orderNumber") or "").strip() == wanted:
+                return hit
+        # The search is fuzzy; only an exact number is safe to act on.
+        return None
+
     def search_ro(self, ro_number: str) -> list[dict[str, str]]:
         res = self._req_json(
             "/api/lookup/search",
@@ -925,6 +959,7 @@ class TekionApiClient:
         invoice_date: str | None = None,
         attachment_media_ids: list[str] | None = None,
         gl_splits: list[dict[str, Any]] | None = None,
+        use_returned_postings: bool = False,
     ) -> dict[str, str]:
         amount_cents = round(invoice_amount * 100)
         tax_cents = round(sales_tax * 100)
@@ -973,7 +1008,7 @@ class TekionApiClient:
 
         # Step 3: Get postings
         print("[API] Pre-invoice: postings...")
-        self._req_json(
+        postings_res = self._req_json(
             "/api/accounting/u/poInvoice/preInvoicing/postings",
             method="POST",
             body={
@@ -984,6 +1019,56 @@ class TekionApiClient:
                 "poNumbers": [po_number],
             },
         )
+
+        # Tekion works out the expense side itself and hands it back: one
+        # posting per part line on the PO, each with the GL account that part
+        # belongs to. A stock order has as many lines as it has parts, so
+        # inventing a single posting from one GL account -- which is right for
+        # sublet and misc -- would post the wrong breakdown here.
+        #
+        # Opt-in so the existing callers keep their single-line behaviour.
+        accounting_details: list[dict[str, Any]] | None = None
+        if use_returned_postings:
+            returned = postings_res.get("data") or []
+            # The response is a balanced double entry: one debit per part plus
+            # the AP credit, which sums to zero. Only the expense side belongs in
+            # accountingDetails -- the AP side travels separately as
+            # apGlAccountId, and including it here posts a zero invoice.
+            returned = [
+                p for p in returned if p.get("glAccountId") != ap_gl_account_id
+            ]
+            if returned:
+                accounting_details = [
+                    {
+                        "description": p.get("description"),
+                        "glAccountId": p.get("glAccountId"),
+                        # The postings response is in dollars; the post body is
+                        # in cents, like every other amount here.
+                        "postingAmount": {
+                            "amount": round(float(p.get("amount") or 0) * 100),
+                            "currency": "USD",
+                        },
+                        "controlNumberList": p.get("controlNumberList"),
+                        "refText": p.get("refText"),
+                    }
+                    for p in returned
+                ]
+                total = sum(d["postingAmount"]["amount"] for d in accounting_details)
+                print(f"[API] Pre-invoice: {len(accounting_details)} posting(s) from Tekion, "
+                      f"totalling {total / 100:.2f}")
+            else:
+                print("[API] Pre-invoice: Tekion returned no postings; falling back")
+
+        if accounting_details is None:
+            accounting_details = [
+                {
+                    "description": None,
+                    "glAccountId": gl_account_id,
+                    "postingAmount": {"amount": subtotal_cents, "currency": "USD"},
+                    "controlNumberList": None,
+                    "refText": ref_text,
+                }
+            ]
 
         # Step 4: Post pre-invoice
         print("[API] Pre-invoice: post...")

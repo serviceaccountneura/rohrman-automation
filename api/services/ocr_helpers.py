@@ -100,6 +100,61 @@ def get_invoice_number(ocr: dict[str, Any]) -> str:
     return _clean_invoice_number(str(fallback)) if fallback else ""
 
 
+def _clean_po_number(raw: Any) -> str:
+    """Strip a leading PO label, the way _clean_ro_number does for repair orders."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    stripped = re.sub(
+        r"^\s*(?:P\.?\s*O\.?|PURCHASE\s+ORDER)\s*(?:NUMBER|NO|#)?\s*[#:.\-]?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+    return stripped or text
+
+
+def get_po_number(ocr: dict[str, Any]) -> str:
+    """The purchase order number printed on the invoice.
+
+    Vendor stock orders are invoiced against a PO that already exists in Tekion,
+    so this is the field the whole flow hangs on.
+
+    "PO BOX" is excluded outright — it is part of the vendor's address and
+    appears on most invoices, so a loose match would confidently return a
+    postal box number as a purchase order.
+    """
+    po_contract = ocr.get("_po_contract") or {}
+    if po_contract.get("po_number"):
+        return _clean_po_number(po_contract["po_number"])
+
+    identifiers = ocr.get("identifiers") or []
+
+    def scan(predicate) -> str:
+        for entry in identifiers:
+            label = (entry.get("label") or "").strip().lower()
+            if not label or "box" in label:
+                continue
+            if predicate(label):
+                cleaned = _clean_po_number(entry.get("value"))
+                if cleaned:
+                    return cleaned
+        return ""
+
+    # An explicit purchase-order label first.
+    found = scan(lambda label: "purchase order" in label)
+    if found:
+        return found
+    # Then the abbreviation, but only where it stands as its own word.
+    found = scan(
+        lambda label: label.replace(".", "").replace(" ", "").startswith("po")
+    )
+    if found:
+        return found
+
+    return _clean_po_number(ocr.get("po_number") or ocr.get("poNumber") or "")
+
+
 def get_document_type(ocr: dict[str, Any]) -> str:
     """Whatever OCR decided the document is.
 
