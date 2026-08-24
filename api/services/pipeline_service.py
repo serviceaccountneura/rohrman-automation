@@ -193,6 +193,7 @@ def _run(doc: Document, session: Session) -> None:
     doc.vendor_name = ocr_helpers.get_vendor_name(ocr) or doc.vendor_name
     doc.invoice_number = ocr_helpers.get_invoice_number(ocr)
     doc.ro_number = ocr_helpers.get_control_number(ocr)
+    doc.vin = ocr_helpers.get_vin(ocr)
     if not doc.dealership_name:
         doc.dealership_name = ocr_helpers.get_dealership_name(ocr)
     session.add(doc)
@@ -310,7 +311,8 @@ def _run_purchase_order(
         StockPartInput,
         SubletLineItem,
     )
-    from api.routes.tekion import _create_misc_po, _create_stock_po, _create_sublet_po
+    from api.routes.tekion import _create_misc_po, _create_stock_po, _create_sublet_po, _resolve_dealer, get_client
+    from api.services.job_matching import match_line_items_to_jobs
 
     total = ocr_helpers.get_total_amount(ocr)
     sales_tax = ocr_helpers.get_sales_tax(ocr)
@@ -355,30 +357,56 @@ def _run_purchase_order(
 
     try:
         if doc.po_type == FOLDER_SUBLET:
-            if not doc.ro_number:
-                _fail(session, doc, EX_MISSING_FIELD, error="sublet with no RO number")
+            # Sublet invoices do not carry a trustworthy RO number, so the RO
+            # is found by VIN instead: switch to the invoice's dealership,
+            # search for repair orders on that VIN, and take the most recent
+            # one that is still open. Each job on that RO is then matched
+            # against the invoice's line-item descriptions by the LLM, using
+            # the job's captured concern + tech story text — the OCR'd RO
+            # number is no longer used at all.
+            if not doc.vin:
+                _fail(session, doc, EX_MISSING_FIELD, error="sublet with no VIN")
                 return
-            items = [
-                SubletLineItem(
-                    ro_number=doc.ro_number,
-                    # Blank means "first job on the RO", matching the existing flow.
-                    job_number="",
-                    description=item["description"] or "Sublet repair",
-                    labor_amount=0.0,
-                    parts_amount=item["totalPrice"] or item["unitPrice"],
-                )
-                for item in line_items
-            ] or [
-                SubletLineItem(
-                    ro_number=doc.ro_number,
-                    job_number="",
-                    description="Sublet repair",
-                    labor_amount=0.0,
-                    parts_amount=expected_po_total,
-                )
-            ]
-            req = CreateSubletPoRequest(**common, line_items=items)
+
             with tekion_scope():
+                client = get_client(session)
+                _resolve_dealer(client, doc.dealership_name)
+                ro = client.find_latest_open_ro_by_vin(doc.vin)
+                if not ro:
+                    _fail(session, doc, EX_TEKION_REJECTED, error=f"no open RO found for VIN {doc.vin}")
+                    return
+                jobs = client.get_ro_job_details(ro["id"])
+                if not jobs:
+                    _fail(session, doc, EX_TEKION_REJECTED, error=f"no jobs found on RO for VIN {doc.vin}")
+                    return
+
+                descriptions = [item["description"] or "Sublet repair" for item in line_items] or ["Sublet repair"]
+                job_numbers = match_line_items_to_jobs(descriptions, jobs)
+                ro_number = ro.get("roNo") or ""
+
+                if line_items:
+                    items = [
+                        SubletLineItem(
+                            ro_number=ro_number,
+                            job_number=job_numbers[i],
+                            description=item["description"] or "Sublet repair",
+                            labor_amount=0.0,
+                            parts_amount=item["totalPrice"] or item["unitPrice"],
+                        )
+                        for i, item in enumerate(line_items)
+                    ]
+                else:
+                    items = [
+                        SubletLineItem(
+                            ro_number=ro_number,
+                            job_number=job_numbers[0],
+                            description="Sublet repair",
+                            labor_amount=0.0,
+                            parts_amount=expected_po_total,
+                        )
+                    ]
+
+                req = CreateSubletPoRequest(**common, line_items=items)
                 response = _create_sublet_po(req, session)
 
         elif doc.po_type == FOLDER_STOCK:
