@@ -246,6 +246,9 @@ class InviteCode(SQLModel, table=True):
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     code: str = Field(index=True, unique=True, max_length=32)
+    # Who it was sent to. Signup must use this address, so an invite cannot be
+    # forwarded and redeemed by someone else.
+    email: str = Field(default="", index=True, max_length=255)
     # Role to assign when the invite is used
     role: str = Field(default="AP_CLERK", max_length=50)
     # Pre-filled name (optional — user can override on signup)

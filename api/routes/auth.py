@@ -86,6 +86,15 @@ def signup(req: UserCreate, session: Annotated[Session, Depends(get_session)]) -
             exp = exp.replace(tzinfo=timezone.utc)
         if exp < now:
             raise HTTPException(status_code=400, detail="Invite code has expired")
+        # The invite names who it is for. Without this check a forwarded link
+        # would let anyone create an account under any address, which defeats
+        # the point of inviting a specific person.
+        if invite.email and invite.email.strip().lower() != req.email.strip().lower():
+            raise HTTPException(
+                status_code=400,
+                detail=f"This invitation was sent to {invite.email}. "
+                       "Sign up with that address.",
+            )
 
     role = invite.role if invite else "AP_CLERK"
     full_name = req.full_name or (invite.full_name if invite else None)
@@ -136,6 +145,7 @@ def validate_invite(
 
     return InviteValidateResponse(
         valid=True,
+        email=invite.email or None,
         role=invite.role,
         full_name=invite.full_name,
         expires_at=invite.expires_at,

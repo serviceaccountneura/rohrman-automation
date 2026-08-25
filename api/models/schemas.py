@@ -6,7 +6,7 @@ from enum import Enum
 from typing import Annotated, Any, Literal, Union
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 
 
 # ── OCR ──────────────────────────────────────────────────────────────────────
@@ -179,6 +179,7 @@ class UserCreate(BaseModel):
 
 
 class CreateInviteRequest(BaseModel):
+    email: EmailStr
     role: str = Field(default="AP_CLERK", max_length=50)
     full_name: str | None = Field(default=None, max_length=255)
 
@@ -186,13 +187,21 @@ class CreateInviteRequest(BaseModel):
 class InviteResponse(BaseModel):
     invite_code: str
     invite_url: str
+    email: str
     role: str
     full_name: str | None
     expires_at: datetime
+    # False when mail is not configured or the send failed. The invite is still
+    # valid -- the UI shows the link so an admin can pass it on by hand.
+    email_sent: bool = False
+    email_error: str = ""
 
 
 class InviteValidateResponse(BaseModel):
     valid: bool
+    # Shown on the signup page and used as the account's address, so the person
+    # cannot register under a different one.
+    email: str | None = None
     role: str | None = None
     full_name: str | None = None
     expires_at: datetime | None = None

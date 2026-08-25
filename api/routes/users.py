@@ -12,10 +12,11 @@ import secrets
 from datetime import datetime, timezone
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session, select
 
 from api.config import settings
+from api.services import email_service
 from api.db import get_session
 from api.deps import CurrentUserDep
 from api.models.db import InviteCode, User
@@ -27,6 +28,14 @@ from api.models.schemas import (
     UserListItem,
     UserListResponse,
 )
+
+# The two roles the UI offers. ADMIN can manage users; AP_CLERK is everyone
+# else. Kept as the existing internal names so seeded accounts stay valid --
+# the friendlier "Admin" / "User" wording lives in the frontend.
+ROLE_ADMIN = "ADMIN"
+ROLE_USER = "AP_CLERK"
+ROLE_LABELS = {ROLE_ADMIN: "an administrator", ROLE_USER: "a user"}
+
 
 router = APIRouter(prefix="/api/users", tags=["users"])
 
@@ -98,10 +107,33 @@ def create_invite(
     current_user: CurrentUserDep,
     session: Annotated[Session, Depends(get_session)],
 ) -> InviteResponse:
-    """Create a single-use invite link valid for 24 hours."""
+    """Invite someone by email. Single-use link, valid for 24 hours.
+
+    The link is emailed when SMTP is configured, and always returned either
+    way -- a mail server that is unset or refusing should not stop an admin
+    adding somebody, so the response carries the link for them to pass on.
+    """
+    email = req.email.strip().lower()
+
+    existing = session.exec(select(User).where(User.email == email)).first()
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"{email} already has an account.",
+        )
+
+    # Supersede any invite already outstanding for this address, so a resend
+    # cannot leave two live links to the same account.
+    for stale in session.exec(
+        select(InviteCode).where(InviteCode.email == email, InviteCode.used == False)  # noqa: E712
+    ).all():
+        stale.used = True
+        session.add(stale)
+
     code = secrets.token_urlsafe(16)[:24]
     invite = InviteCode(
         code=code,
+        email=email,
         role=req.role,
         full_name=req.full_name,
         created_by=current_user.id,
@@ -112,10 +144,22 @@ def create_invite(
 
     invite_url = f"{settings.frontend_url}/invite?code={code}"
 
+    result = email_service.send_invite(
+        to_email=email,
+        invite_url=invite_url,
+        role_label=ROLE_LABELS.get(req.role, req.role),
+        invited_by=current_user.full_name or current_user.email,
+    )
+    if not result.sent:
+        print(f"[USERS] invite for {email} created but not emailed: {result.detail}")
+
     return InviteResponse(
         invite_code=code,
         invite_url=invite_url,
+        email=email,
         role=req.role,
         full_name=req.full_name,
         expires_at=invite.expires_at,
+        email_sent=result.sent,
+        email_error=result.detail,
     )
