@@ -341,6 +341,30 @@ class PipelineStatusResponse(BaseModel):
 # ── Dashboard ─────────────────────────────────────────────────────────────────
 
 
+
+class TrendPoint(BaseModel):
+    """One month on the processing trend chart."""
+
+    # "Jan", "Feb" ... for the axis, plus the real month so the client can sort
+    # or label a year boundary without parsing the short name back.
+    month: str
+    year: int
+    month_number: int
+    total: int
+    processed: int
+    exceptions: int
+    auto_resolved: int
+
+
+class TrendsResponse(BaseModel):
+    points: list[TrendPoint]
+    # Totals across the whole window, for the breakdown beside the chart.
+    total: int
+    processed: int
+    exceptions: int
+    auto_resolved: int
+
+
 class DashboardSummary(BaseModel):
     total: int
     processed: int
