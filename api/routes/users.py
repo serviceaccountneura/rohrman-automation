@@ -19,7 +19,7 @@ from api.config import settings
 from api.services import email_service
 from api.db import get_session
 from api.deps import CurrentUserDep
-from api.models.db import InviteCode, User
+from api.models.db import InviteCode, Notification, RefreshToken, User
 from api.models.schemas import (
     CreateInviteRequest,
     InviteResponse,
@@ -73,6 +73,43 @@ def delete_user(
     user = session.get(User, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
+    # Three tables point at users, and Postgres refuses the delete while any of
+    # them still does. Each one gets a different answer rather than a blanket
+    # cascade, because they do not all mean the same thing.
+
+    # Sessions die with the account -- a deleted user must not keep a working
+    # refresh token.
+    for token in session.exec(
+        select(RefreshToken).where(RefreshToken.user_id == user.id)
+    ).all():
+        session.delete(token)
+
+    # Notifications were addressed to this person and mean nothing without them.
+    for note in session.exec(
+        select(Notification).where(Notification.user_id == user.id)
+    ).all():
+        session.delete(note)
+
+    # Invites are kept: who was invited, when, and whether it was taken up is
+    # worth having after the admin who sent it has gone. The references to this
+    # user are nulled instead.
+    for invite in session.exec(
+        select(InviteCode).where(InviteCode.created_by == user.id)
+    ).all():
+        if invite.used:
+            invite.created_by = None
+            session.add(invite)
+        else:
+            # An unused invite is a live link. Removing the person who sent it
+            # should not leave a way into the system that nobody owns.
+            session.delete(invite)
+
+    for invite in session.exec(
+        select(InviteCode).where(InviteCode.used_by == user.id)
+    ).all():
+        invite.used_by = None
+        session.add(invite)
 
     session.delete(user)
     session.commit()

@@ -253,8 +253,9 @@ class InviteCode(SQLModel, table=True):
     role: str = Field(default="AP_CLERK", max_length=50)
     # Pre-filled name (optional — user can override on signup)
     full_name: str | None = Field(default=None, max_length=255)
-    # Who created the invite
-    created_by: UUID = Field(foreign_key="users.id")
+    # Who created the invite. Nulled rather than blocking when that admin is
+    # deleted -- the invite record itself is still worth keeping.
+    created_by: UUID | None = Field(default=None, foreign_key="users.id")
     used: bool = Field(default=False, index=True)
     used_by: UUID | None = Field(default=None, foreign_key="users.id")
     used_at: datetime | None = Field(default=None)
