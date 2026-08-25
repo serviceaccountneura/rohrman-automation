@@ -102,6 +102,12 @@ class ExpectedJournalEntry:
     # Dollar tolerance when checking the entry balances.
     balance_tolerance: float = 0.005
 
+    # Parts read off the invoice. Each becomes its own debit line, so the entry
+    # itemises the way the invoice does. When these are absent -- or when they
+    # do not add up to the invoice total -- the debit falls back to one summary
+    # line, which is what this flow did before and is always balanced.
+    line_items: list[dict[str, Any]] = field(default_factory=list)
+
 
 # Dummy data from the sample Toyota Parts Ticket (Oakbrook Toy. in Westmont):
 # invoice 6045891767, dated 05/12/2026, $147.78 -- which is exactly the entry in
@@ -122,12 +128,19 @@ class Discrepancy:
     found: Any
 
     def __str__(self) -> str:
-        return f"{self.field_name}: expected {self.expected!r}, Tekion has {self.found!r}"
+        return f"{self.field_name}: expected {self.expected!r}, found {self.found!r}"
 
 
 @dataclass
 class JournalEntryResult:
     balanced: bool = False
+    # Set when the parts read off the invoice do not sum to the invoice total.
+    # Terminal: nothing was sent to Tekion.
+    line_items_mismatch: bool = False
+    # Narrower case of the above: nothing readable at all, rather than a
+    # disagreement. Worth separating so the UI can say which happened.
+    no_line_items: bool = False
+    line_items_total: float | None = None
     saved: bool = False
     transaction_id: str | None = None
     transaction_number: str | None = None
@@ -163,6 +176,56 @@ def _parse_date(date_str: str) -> datetime:
         except ValueError:
             continue
     raise ValueError(f"Unrecognised invoice date {date_str!r} (expected MM/DD/YYYY)")
+
+
+# Tekion truncates long reference text on the JE screen; keep part names short
+# enough to stay readable rather than relying on where it happens to cut.
+_REF_TEXT_MAX = 60
+
+
+def _debit_lines(expected: ExpectedJournalEntry) -> list[tuple[float, str]]:
+    """One (amount, description) per part read off the invoice.
+
+    Returns [] only when there were no parts to read at all. Parts that do not
+    add up are rejected by `check_line_items()` long before this runs, so
+    anything reaching here is already known to reconcile.
+    """
+    rows: list[tuple[float, str]] = []
+    for item in expected.line_items or []:
+        try:
+            value = round(float(item.get("totalPrice") or item.get("total_price") or 0), 2)
+        except (TypeError, ValueError):
+            continue
+        if value == 0:
+            continue
+        rows.append((value, str(item.get("description") or "").strip()))
+    return rows
+
+
+def check_line_items(expected: ExpectedJournalEntry) -> tuple[float, Discrepancy | None]:
+    """Do the parts on the invoice add up to what the invoice says it is worth?
+
+    Returns the parts total and, when they disagree, the discrepancy that stops
+    the entry.
+
+    This is a refusal rather than something to work around. The parts ARE the
+    entry, so if they do not sum to the invoice then either OCR misread the page
+    or the invoice itself does not add up -- and both need a person to look.
+    Posting a summary line instead would bury the problem inside an entry that
+    balances perfectly and looks right.
+
+    Reading no parts at all is refused for the same reason. A summary line would
+    still balance and still post, so the failure would be invisible: the entry
+    would look finished while saying nothing about what was actually bought.
+    """
+    rows = _debit_lines(expected)
+    if not rows:
+        return 0.0, Discrepancy("line_items", "one line per part", "no parts could be read")
+    total = round(sum(value for value, _ in rows), 2)
+    invoice = round(expected.invoice_amount, 2)
+    if abs(total - invoice) > expected.balance_tolerance:
+        return total, Discrepancy("line_items", invoice, total)
+    return total, None
 
 
 def _control_number(accounting_date: datetime) -> str:
@@ -267,8 +330,15 @@ class JournalEntryService:
         """The two balanced postings, in the captured wire format.
 
         Line 1 is always GL 3000 as the CREDIT, carrying the MMYY control number
-        in refId/refText with refType VENDOR. Line 2 is the parts inventory
-        account as the balancing DEBIT.
+        in refId/refText with refType VENDOR. The parts inventory account then
+        takes the balancing DEBIT -- one line per part on the invoice, so the
+        entry reads like the invoice it came from.
+
+        The itemised debit is only used when the parts add up to the invoice
+        total. They come from OCR, so a missed line or a misread price would
+        otherwise post an entry that does not balance; in that case the debit
+        collapses to a single summary line for the full amount. Detail is worth
+        having, but not at the cost of a broken entry.
 
         Amounts are DOLLARS (the JE API does not use cents) and the sign carries
         the credit/debit direction -- `amountCredited` stays False on both lines,
@@ -278,7 +348,7 @@ class JournalEntryService:
         credit = resolved.get("credit") or {}
         debit = resolved.get("debit") or {}
 
-        return [
+        postings = [
             {
                 "dealerId": dealer_id,
                 "glAccountId": credit.get("account_id"),
@@ -289,22 +359,36 @@ class JournalEntryService:
                 "countAdjusted": False,
                 "postingOrder": 0,
                 "amountCredited": False,
-                # Not sent to Tekion — kept for printing/debugging.
+                # Not sent to Tekion -- kept for printing/debugging.
                 "_glAccountNumber": credit.get("account_number", expected.credit_gl_number),
                 "_glAccountName": credit.get("account_name"),
-            },
-            {
+            }
+        ]
+
+        def _debit(value: float, order: int, description: str | None) -> dict[str, Any]:
+            row = {
                 "dealerId": dealer_id,
                 "glAccountId": debit.get("account_id"),
-                "amount": amount,
+                "amount": value,
                 "refType": "CUSTOM",
                 "countAdjusted": False,
-                "postingOrder": 1,
+                "postingOrder": order,
                 "amountCredited": False,
                 "_glAccountNumber": debit.get("account_number", expected.debit_gl_number),
                 "_glAccountName": debit.get("account_name"),
-            },
-        ]
+            }
+            if description:
+                # The part name, so the line says what it is on the JE screen.
+                row["refText"] = description[:_REF_TEXT_MAX]
+            return row
+
+        parts = _debit_lines(expected)
+        if parts:
+            for order, (value, description) in enumerate(parts, start=1):
+                postings.append(_debit(value, order, description))
+        else:
+            postings.append(_debit(amount, 1, None))
+        return postings
 
     @staticmethod
     def check_balance(postings: list[dict[str, Any]]) -> tuple[float, float, float]:
@@ -395,6 +479,31 @@ def create_journal_entry(
     svc = JournalEntryService(client)
     result = JournalEntryResult()
 
+    # ── The parts have to account for the invoice ────────────────────────────
+    # Checked first, before the dealer switch and before a single Tekion call,
+    # so a mismatch costs nothing and can write nothing.
+    parts_total, mismatch = check_line_items(expected)
+    result.line_items_total = parts_total
+    if mismatch:
+        result.line_items_mismatch = True
+        result.discrepancies.append(mismatch)
+        if not expected.line_items or parts_total == 0:
+            result.no_line_items = True
+            result.notes.append(
+                "No parts could be read from this invoice, so there is nothing "
+                "to post. The entry lists one line per part, so it cannot be "
+                "built from the total alone -- upload a clearer scan."
+            )
+        else:
+            result.notes.append(
+                f"The parts on this invoice add up to ${parts_total:.2f}, but the "
+                f"invoice total is ${expected.invoice_amount:.2f} "
+                f"(${abs(parts_total - expected.invoice_amount):.2f} apart). Nothing "
+                "was posted -- check the invoice against what was read from it."
+            )
+        print(f"[JE] {result.notes[-1]}")
+        return result
+
     # ── Dealer context ───────────────────────────────────────────────────────
     target_dealership = dealership_name or expected.dealership_name
     if target_dealership:
@@ -438,7 +547,7 @@ def create_journal_entry(
             "shows a warning on this field but still allows the draft to save."
         )
 
-    # ── Step 3: the two postings, and the balance check ──────────────────────
+    # ── Step 3: the postings, and the balance check ──────────────────────────
     result.postings = svc.build_postings(
         expected, resolved, result.control_number, result.dealer_id
     )

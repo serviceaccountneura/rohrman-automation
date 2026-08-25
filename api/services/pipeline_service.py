@@ -87,6 +87,13 @@ EX_VENDOR_NOT_FOUND = "VENDOR_NOT_FOUND"
 EX_PO_NOT_FOUND = "PO_NOT_FOUND"
 EX_AMOUNT_MISMATCH = "AMOUNT_MISMATCH"
 EX_UNBALANCED = "UNBALANCED_ENTRY"
+# The parts read off an invoice do not add up to its total. Either OCR misread
+# the page or the invoice itself does not add up -- either way a person has to
+# look, so nothing is posted.
+EX_LINE_ITEMS_MISMATCH = "LINE_ITEMS_MISMATCH"
+# Nothing readable to itemise. A journal entry lists one line per part, so it
+# cannot be built from the invoice total alone.
+EX_NO_LINE_ITEMS = "NO_LINE_ITEMS"
 EX_TEKION_ERROR = "TEKION_ERROR"
 # Tekion answered, and the answer was no. Distinct from TEKION_ERROR because a
 # rejection is final — retrying re-runs OCR and asks the same question again.
@@ -101,6 +108,8 @@ _SEVERITY = {
     EX_PO_NOT_FOUND: "HIGH",
     EX_AMOUNT_MISMATCH: "HIGH",
     EX_UNBALANCED: "HIGH",
+    EX_LINE_ITEMS_MISMATCH: "HIGH",
+    EX_NO_LINE_ITEMS: "HIGH",
     EX_TEKION_ERROR: "HIGH",
     EX_TEKION_REJECTED: "HIGH",
 }
@@ -344,6 +353,8 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         invoice_date=invoice_date,
         invoice_amount=invoice_amount,
         dealership_name=doc.dealership_name,
+        # Each part becomes its own debit line on the entry.
+        line_items=ocr_helpers.get_raw_line_items(ocr),
     )
 
     try:
@@ -357,6 +368,16 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         _fail(session, doc, EX_TEKION_ERROR, error=str(e))
         return
 
+    # Checked before `balanced`: a refused entry never got as far as balancing,
+    # so "balance $0.00" would be a confusing thing to show someone.
+    if result.line_items_mismatch:
+        _fail(
+            session,
+            doc,
+            EX_NO_LINE_ITEMS if result.no_line_items else EX_LINE_ITEMS_MISMATCH,
+            error="; ".join(result.notes) or "invoice parts do not match the total",
+        )
+        return
     if not result.balanced:
         _fail(session, doc, EX_UNBALANCED, error=f"balance ${result.balance:.2f}")
         return
