@@ -815,6 +815,79 @@ class TekionApiClient:
             for j in jobs
         ]
 
+    # Statuses that make a repair order NOT open for VIN-based sublet lookup —
+    # the same exclusion list search_ro() already uses for RO-number search.
+    CLOSED_RO_STATUSES = {"INVOICED", "CLOSED", "VOIDED"}
+
+    def search_ro_by_vin(self, vin: str) -> list[dict[str, Any]]:
+        """Search repair orders by VIN via the global search service.
+
+        Returns raw RO hits (id, status, createdTime, modifiedTime, ...),
+        newest first (by createdTime) so callers can pick "most recent".
+        """
+        res = self._req_json(
+            "/api/gss/u/v2/search/v2",
+            method="POST",
+            body={
+                "entities": [
+                    {
+                        "entity": "ro",
+                        "advancedFilters": [],
+                        "rows": 20,
+                        "offset": 0,
+                        "searchRequestV3List": [
+                            {
+                                "searchableFields": ["RO_NO", "TAG_NO", "MODEL", "VIN", "CUSTOMER_NAME"],
+                                "searchText": vin,
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+        entity_responses = (res.get("data") or {}).get("entityResponses") or []
+        hits = list(entity_responses[0].get("hits") or []) if entity_responses else []
+        hits.sort(key=lambda h: h.get("createdTime", 0), reverse=True)
+        return hits
+
+    def find_latest_open_ro_by_vin(self, vin: str) -> dict[str, Any] | None:
+        """Most recent open repair order for a VIN, or None if none is open."""
+        for ro in self.search_ro_by_vin(vin):
+            if (ro.get("status") or "").upper() not in self.CLOSED_RO_STATUSES:
+                return ro
+        return None
+
+    def get_ro_job_details(self, ro_id: str) -> list[dict[str, Any]]:
+        """Per-job capture (concern) + tech story text for a repair order.
+
+        Used to let the LLM match sublet invoice line items to the job they
+        belong to, instead of trusting the RO number printed on the invoice.
+        """
+        res = self._req_json(
+            f"/api/service-module/u/ro/{ro_id}/job/calculate?roDetailsReq=true&forceCalculate=false",
+            method="POST",
+            body=[],
+        )
+        job_lines = (res.get("data") or {}).get("jobLines") or []
+        jobs: list[dict[str, Any]] = []
+        for line in job_lines:
+            job = line.get("job") or {}
+            story_lines = [
+                story.get("text", "")
+                for op in job.get("operations") or []
+                for story in op.get("storyLines") or []
+                if story.get("text")
+            ]
+            jobs.append(
+                {
+                    "id": job.get("id"),
+                    "jobNumber": str(job.get("jobNumber", "")),
+                    "capture": job.get("concern") or "",
+                    "techStory": " ".join(story_lines),
+                }
+            )
+        return jobs
+
     # ── Sublet PO Creation ────────────────────────────────────────────────────
 
     def create_sublet_po(

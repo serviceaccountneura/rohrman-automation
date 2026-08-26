@@ -56,6 +56,15 @@ def _clean_ro_number(raw: Any) -> str:
     return stripped or text
 
 
+def get_vin(ocr: dict[str, Any]) -> str:
+    vehicle = ocr.get("vehicle") or {}
+    vin = str(vehicle.get("vin") or "").strip().upper()
+    # Drop obvious OCR noise ("[illegible]", stray punctuation) rather than
+    # feeding a garbage VIN into a Tekion search.
+    vin = re.sub(r"[^A-Z0-9]", "", vin)
+    return vin if len(vin) >= 11 else ""
+
+
 def get_control_number(ocr: dict[str, Any]) -> str:
     po_contract = ocr.get("_po_contract") or {}
     if po_contract.get("ro_number"):
