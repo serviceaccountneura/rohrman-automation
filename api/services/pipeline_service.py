@@ -356,6 +356,8 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         dealership_name=doc.dealership_name,
         # Each part becomes its own debit line on the entry.
         line_items=ocr_helpers.get_raw_line_items(ocr),
+        # A GL account written on the invoice outranks anything we infer.
+        invoice_gl_account=ocr_helpers.get_document_gl_account(ocr),
     )
 
     try:
@@ -442,6 +444,8 @@ def _run_stock_pre_invoice(
         invoice_date=ocr_helpers.get_invoice_date(ocr) or None,
         invoice_file_path=source_path,
         invoice_file_name=doc.file_name or None,
+        # Only consulted if Tekion has no GL accounts of its own for these parts.
+        gl_account=ocr_helpers.get_document_gl_account(ocr),
     )
 
     try:

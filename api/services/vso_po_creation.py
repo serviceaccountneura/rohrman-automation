@@ -67,6 +67,9 @@ class ExpectedStockInvoice:
     invoice_file_path: str | None = None
     # Original filename, shown in Tekion. The path above is usually a temp file.
     invoice_file_name: str | None = None
+    # The GL account written on the invoice, usually by hand in the margin.
+    # Consulted only when Tekion has no account of its own for these parts.
+    gl_account: str = ""
     # Dollar tolerance when comparing the invoice against the PO.
     amount_tolerance: float = 0.005
 
@@ -177,7 +180,23 @@ class VsoPreInvoiceService:
         if not vendor_id:
             raise ValueError(f"PO {po.get('orderNumber')} has no vendor on it")
 
-        universal_id = po.get("universalId") or f"PARTS%{po.get('id')}"
+        # Tekion normally answers with a GL account per part line, taken from
+            # its own parts inventory setup, and that is authoritative -- it is
+            # how the parts department has actually configured these items.
+            #
+            # When it answers with nothing, there is still an invoice with an
+            # account written on it. Using that beats posting to an empty GL,
+            # which is what an unset gl_account_id would do.
+            fallback_gl = (
+                f"{dealer_id}_{expected.gl_account}" if expected.gl_account else ""
+            )
+            if fallback_gl:
+                print(
+                    f"[VSO] invoice names GL {expected.gl_account}; will use it only "
+                    "if Tekion returns no postings of its own"
+                )
+
+            universal_id = po.get("universalId") or f"PARTS%{po.get('id')}"
         # The universalId carries the PO type Tekion expects back, e.g.
         # "MISCELLANEOUS%10366" -> "MISCELLANEOUS".
         po_type = str(universal_id).split("%")[0] or "PARTS"
@@ -193,11 +212,10 @@ class VsoPreInvoiceService:
             universal_id=universal_id,
             invoice_number=expected.invoice_number,
             invoice_amount=expected.invoice_amount,
-            # A stock order carries its own GL accounts on the parts lines.
-            # Tekion returns one posting per part from the postings call, so the
-            # breakdown comes from there rather than from a single account here;
-            # gl_account_id is only the fallback if it returns nothing.
-            gl_account_id="",
+            # A stock order carries its own GL accounts on the parts lines, and
+            # Tekion returns one posting per part. This is only consulted when
+            # that call comes back empty.
+            gl_account_id=fallback_gl,
             ap_gl_account_id=f"{dealer_id}_{_AP_GL_SUFFIX}",
             ref_text=expected.po_number,
             po_type=po_type,

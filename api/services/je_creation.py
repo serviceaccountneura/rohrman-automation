@@ -107,6 +107,12 @@ class ExpectedJournalEntry:
     # do not add up to the invoice total -- the debit falls back to one summary
     # line, which is what this flow did before and is always balanced.
     line_items: list[dict[str, Any]] = field(default_factory=list)
+    # The GL account written on the invoice, usually by hand. When present it
+    # wins: it is the parts department saying where this belongs.
+    invoice_gl_account: str = ""
+    # Dealership used to turn a classified category into an account number.
+    # Defaults to dealership_name; only needed when the two differ.
+    gl_dealership_name: str = ""
 
 
 # Dummy data from the sample Toyota Parts Ticket (Oakbrook Toy. in Westmont):
@@ -141,6 +147,9 @@ class JournalEntryResult:
     # disagreement. Worth separating so the UI can say which happened.
     no_line_items: bool = False
     line_items_total: float | None = None
+    # How the debit account was decided: written on the invoice, classified, or
+    # the SOP default. Worth surfacing -- the three are not equally trustworthy.
+    debit_gl_source: str = ""
     saved: bool = False
     transaction_id: str | None = None
     transaction_number: str | None = None
@@ -236,6 +245,53 @@ def _control_number(accounting_date: datetime) -> str:
     """
     return accounting_date.strftime("%m%y")
 
+
+
+def resolve_debit_gl(expected: ExpectedJournalEntry) -> tuple[str, str]:
+    """Which parts account the journal entry debits, and how that was decided.
+
+    Three sources, in order of how much they should be trusted:
+
+      1. The account written on the invoice. A clerk circling "GL# 2410" in the
+         margin is the parts department stating where this belongs, which beats
+         anything inferred from the text.
+
+      2. Classifying the line items. A journal entry has no purchase order
+         behind it, so unlike a vendor stock order there is no Tekion answer to
+         fall back on -- nothing else knows what these parts are. Only used when
+         every line agrees, because the entry debits ONE account: a mixed
+         invoice cannot be reduced to a single category honestly.
+
+      3. The SOP default, 2410 parts inventory, which is what this flow used
+         before either of the above existed.
+
+    Returns (account_number, how_it_was_decided) so the run can say which.
+    """
+    written = str(expected.invoice_gl_account or "").strip()
+    if written:
+        return written, "written on the invoice"
+
+    if expected.line_items:
+        try:
+            from api.services import gl_line_classifier
+
+            classified = gl_line_classifier.classify_line_items(
+                expected.line_items,
+                expected.gl_dealership_name or expected.dealership_name,
+            )
+            accounts = {line.gl_account for line in classified.lines}
+            if len(accounts) == 1:
+                account = accounts.pop()
+                return account, "classified from the line items"
+            if len(accounts) > 1:
+                print(
+                    f"[JE] line items span {sorted(accounts)}; a journal entry debits one "
+                    f"account, so falling back to {expected.debit_gl_number}"
+                )
+        except Exception as e:  # noqa: BLE001 - never fail an entry over classification
+            print(f"[JE] classification unavailable ({e}); using the default account")
+
+    return expected.debit_gl_number, "SOP default"
 
 # ── Service ───────────────────────────────────────────────────────────────────
 
@@ -482,6 +538,12 @@ def create_journal_entry(
     # ── The parts have to account for the invoice ────────────────────────────
     # Checked first, before the dealer switch and before a single Tekion call,
     # so a mismatch costs nothing and can write nothing.
+    debit_number, debit_source = resolve_debit_gl(expected)
+    if debit_number != expected.debit_gl_number:
+        print(f"[JE] Debit account {debit_number} ({debit_source})")
+        expected.debit_gl_number = debit_number
+    result.debit_gl_source = debit_source
+
     parts_total, mismatch = check_line_items(expected)
     result.line_items_total = parts_total
     if mismatch:
