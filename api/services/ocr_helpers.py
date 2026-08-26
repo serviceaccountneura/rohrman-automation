@@ -65,14 +65,47 @@ def get_vin(ocr: dict[str, Any]) -> str:
     return vin if len(vin) >= 11 else ""
 
 
+# Labels that really do name a repair order, most specific first. Matched as
+# whole words against a label stripped of punctuation and spaces.
+#
+# The obvious `"ro" in label` is what this replaces, and it was wrong in a way
+# that is easy to miss: "ro" appears inside "shipped f-r-o-m", so every invoice
+# with a Shipped From field filed its shipping origin as a repair order number.
+_RO_LABELS = (
+    "repairorder",
+    "repairordernumber",
+    "ronumber",
+    "rono",
+    "controlnumber",
+    "controlno",
+)
+
+# Fields that contain an RO label as a substring but mean something else.
+_NOT_AN_RO = ("shippedfrom", "shipto", "billto", "salesorder", "purchaseorder")
+
+
+def _looks_like_ro_label(label: str) -> bool:
+    """True when this label names a repair order rather than merely containing 'ro'."""
+    key = "".join(str(label or "").lower().split()).replace(".", "").replace("-", "")
+    if not key or any(key.startswith(bad) for bad in _NOT_AN_RO):
+        return False
+    if key in _RO_LABELS:
+        return True
+    # A bare "RO" or "R/O" column heading is common and legitimate.
+    if key in ("ro", "r/o", "ro#"):
+        return True
+    # Otherwise require the words, not the letters: "repair order" anywhere, or
+    # a label that starts with "ro" followed by a separator ("ro no", "ro #").
+    return "repairorder" in key or key.startswith("rono") or key.startswith("ro#")
+
+
 def get_control_number(ocr: dict[str, Any]) -> str:
     po_contract = ocr.get("_po_contract") or {}
     if po_contract.get("ro_number"):
         return _clean_ro_number(po_contract["ro_number"])
 
     for id_entry in ocr.get("identifiers", []):
-        label = (id_entry.get("label") or "").lower()
-        if "ro" in label or "repair order" in label or "control" in label:
+        if _looks_like_ro_label(id_entry.get("label")):
             return _clean_ro_number(id_entry.get("value"))
 
     return _clean_ro_number(
