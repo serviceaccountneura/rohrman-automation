@@ -1,0 +1,42 @@
+# A Postgres for local development only.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
+#
+# Kept out of the main file on purpose. On EC2 the database is RDS, and a
+# Postgres sitting in the deployment compose file is one `docker compose up`
+# away from becoming production storage on a container with no backups.
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: rohrman-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-rohrman}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rohrman}
+      POSTGRES_DB: ${POSTGRES_DB:-rohrman}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    ports:
+      # Loopback only, so a laptop on a café network is not serving Postgres.
+      - "127.0.0.1:5432:5432"
+    networks:
+      - rohrman
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rohrman}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    # The API runs migrations at startup, so it must not start against a
+    # database that is still initialising.
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: >-
+        postgresql+psycopg://${POSTGRES_USER:-rohrman}:${POSTGRES_PASSWORD:-rohrman}@db:5432/${POSTGRES_DB:-rohrman}
+
+volumes:
+  db-data:
