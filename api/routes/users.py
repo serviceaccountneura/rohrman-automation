@@ -23,6 +23,8 @@ from api.deps import CurrentUserDep
 from api.models.db import InviteCode, Notification, RefreshToken, User
 from api.models.schemas import (
     CurrentUserResponse,
+    PendingInviteItem,
+    PendingInviteListResponse,
     UpdateMeRequest,
     CreateInviteRequest,
     InviteResponse,
@@ -216,6 +218,153 @@ def update_user_status(
         "user_id": user_id,
         "is_active": req.is_active,
     }
+
+
+@router.get("/invites", response_model=PendingInviteListResponse)
+def list_pending_invites(
+    session: Annotated[Session, Depends(get_session)],
+    current_user: CurrentUserDep,
+) -> PendingInviteListResponse:
+    """Invitations sent but not yet taken up.
+
+    Administrators only, same as the user roster. Expired invitations are
+    included and flagged rather than dropped -- an invitation that quietly
+    disappears looks like it was never sent, and "it expired" is the answer to
+    why somebody never got in.
+    """
+    access.require_admin(current_user)
+
+    now = datetime.now(timezone.utc)
+    invites = session.exec(
+        select(InviteCode)
+        .where(InviteCode.used == False)  # noqa: E712
+        .order_by(InviteCode.created_at.desc())  # type: ignore[union-attr]
+    ).all()
+
+    # Resolve inviter names in one pass rather than a query per row.
+    inviter_ids = {i.created_by for i in invites if i.created_by}
+    inviters: dict = {}
+    if inviter_ids:
+        for u in session.exec(select(User).where(User.id.in_(inviter_ids))).all():  # type: ignore[union-attr]
+            inviters[u.id] = u.full_name or u.email
+
+    items = []
+    for invite in invites:
+        expires = invite.expires_at
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        items.append(
+            PendingInviteItem(
+                id=invite.id,
+                email=invite.email,
+                role=invite.role,
+                full_name=invite.full_name,
+                dealerships=access.parse_dealerships(invite.dealerships),
+                invited_by=inviters.get(invite.created_by, "") if invite.created_by else "",
+                created_at=invite.created_at,
+                expires_at=invite.expires_at,
+                expired=expires < now,
+            )
+        )
+    return PendingInviteListResponse(items=items, total=len(items))
+
+
+@router.post("/invites/{invite_id}/resend", response_model=InviteResponse)
+def resend_invite(
+    invite_id: str,
+    session: Annotated[Session, Depends(get_session)],
+    current_user: CurrentUserDep,
+) -> InviteResponse:
+    """Send an invitation again, on a fresh link.
+
+    A new code is issued rather than the old one re-sent, and the old one is
+    retired. That resets the 24-hour window -- which is the point of resending,
+    since the usual reason is that the first one expired -- and means a link
+    forwarded from the original email stops working.
+
+    The role and dealerships are carried over unchanged. Resending is not a
+    place to quietly widen somebody's access.
+    """
+    access.require_admin(current_user)
+
+    invite = session.get(InviteCode, invite_id)
+    if invite is None:
+        raise HTTPException(status_code=404, detail="Invitation not found")
+    if invite.used:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{invite.email} has already signed up.",
+        )
+
+    # An admin cannot resend access they do not themselves have -- the original
+    # may have been sent by someone with a wider reach.
+    for name in access.parse_dealerships(invite.dealerships):
+        access.require_dealership(current_user, name)
+
+    invite.used = True  # retire the old link
+    session.add(invite)
+
+    code = secrets.token_urlsafe(16)[:24]
+    fresh = InviteCode(
+        code=code,
+        email=invite.email,
+        role=invite.role,
+        full_name=invite.full_name,
+        dealerships=invite.dealerships,
+        created_by=current_user.id,
+    )
+    session.add(fresh)
+    session.commit()
+    session.refresh(fresh)
+
+    invite_url = f"{settings.frontend_url}/invite?code={code}"
+    result = email_service.send_invite(
+        to_email=invite.email,
+        invite_url=invite_url,
+        role_label=ROLE_LABELS.get(invite.role, invite.role),
+        invited_by=current_user.full_name or current_user.email,
+    )
+    if not result.sent:
+        print(f"[USERS] resend for {invite.email} not emailed: {result.detail}")
+
+    return InviteResponse(
+        invite_code=code,
+        invite_url=invite_url,
+        email=invite.email,
+        role=invite.role,
+        full_name=invite.full_name,
+        dealerships=access.parse_dealerships(invite.dealerships),
+        expires_at=fresh.expires_at,
+        email_sent=result.sent,
+        email_error=result.detail,
+    )
+
+
+@router.delete("/invites/{invite_id}")
+def revoke_invite(
+    invite_id: str,
+    session: Annotated[Session, Depends(get_session)],
+    current_user: CurrentUserDep,
+) -> dict:
+    """Cancel an invitation that has not been used.
+
+    Without this a mistaken invite stays live for 24 hours with no way to stop
+    it, which for an ADMIN invitation is worth being able to undo immediately.
+    """
+    access.require_admin(current_user)
+
+    invite = session.get(InviteCode, invite_id)
+    if invite is None:
+        raise HTTPException(status_code=404, detail="Invitation not found")
+    if invite.used:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="That invitation has already been used.",
+        )
+
+    session.delete(invite)
+    session.commit()
+    return {"message": "Invitation revoked", "email": invite.email}
 
 
 @router.post("/invite", response_model=InviteResponse)

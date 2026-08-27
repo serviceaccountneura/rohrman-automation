@@ -203,6 +203,27 @@ class InviteResponse(BaseModel):
     email_error: str = ""
 
 
+class PendingInviteItem(BaseModel):
+    id: UUID
+    email: str
+    role: str
+    full_name: str | None = None
+    # Empty means every dealership.
+    dealerships: list[str] = Field(default_factory=list)
+    invited_by: str = ""
+    created_at: datetime
+    expires_at: datetime
+    # True once the 24-hour window has passed. Kept in the list rather than
+    # filtered out: "expired" is why nobody signed up, and hiding it makes an
+    # invitation look like it was never sent.
+    expired: bool = False
+
+
+class PendingInviteListResponse(BaseModel):
+    items: list[PendingInviteItem]
+    total: int
+
+
 class UpdateMeRequest(BaseModel):
     full_name: str | None = Field(default=None, max_length=255)
     current_password: str | None = None
