@@ -28,7 +28,11 @@ class Settings(BaseSettings):
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
     aws_region: str = "us-east-2"
-    s3_bucket: str = "rohrman-invoices"
+    # Empty by default, which switches archiving OFF. Setting the bucket is
+    # what turns it on -- so a developer with no AWS access is not retrying a
+    # failing upload on every document, and a deployment that forgot to set it
+    # is obvious rather than silently degraded.
+    s3_bucket: str = ""
     s3_presign_expiry: int = 300  # seconds (5 min)
 
     # ── Frontend ──────────────────────────────────────────────────────────────

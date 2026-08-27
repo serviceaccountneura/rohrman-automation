@@ -1,7 +1,21 @@
-"""S3 presigned URL service.
+"""S3 storage for invoice files.
 
-Generates temporary upload URLs so the frontend can PUT invoice files
-directly to S3 without proxying through the backend.
+Two jobs:
+
+  * archive every uploaded invoice, so a document that outlives its temp file
+    can still be processed. On EC2 that is not a corner case -- every deploy
+    restarts the container, and anything queued at that moment loses its local
+    copy. `_resolve_source` in the pipeline restores from here.
+
+  * generate presigned upload URLs, so a browser can PUT a file straight to S3
+    without proxying through the API.
+
+CREDENTIALS
+    Explicit keys from the environment when set; otherwise boto3's own chain,
+    which on EC2 means the instance role. Prefer the role in production.
+
+    The BUCKET, not the keys, decides whether archiving is on -- see
+    `is_configured`.
 """
 from __future__ import annotations
 
@@ -18,13 +32,25 @@ ALLOWED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", 
 
 
 def _get_s3_client():
-    return boto3.client(
-        "s3",
-        region_name=settings.aws_region,
-        aws_access_key_id=settings.aws_access_key_id,
-        aws_secret_access_key=settings.aws_secret_access_key,
-        config=BotoConfig(signature_version="s3v4"),
-    )
+    """An S3 client, however this environment supplies credentials.
+
+    Explicit keys win when set, which keeps local development working from a
+    .env. When they are absent boto3 falls back to its own chain -- on EC2 that
+    is the instance role, which is the better answer in production: nothing
+    long-lived sits on the box and the credentials rotate themselves.
+
+    The arguments are built rather than always passed: handing botocore an
+    explicit None is not the same as omitting the key, and suppresses the
+    fallback chain entirely.
+    """
+    kwargs: dict = {
+        "region_name": settings.aws_region,
+        "config": BotoConfig(signature_version="s3v4"),
+    }
+    if settings.aws_access_key_id and settings.aws_secret_access_key:
+        kwargs["aws_access_key_id"] = settings.aws_access_key_id
+        kwargs["aws_secret_access_key"] = settings.aws_secret_access_key
+    return boto3.client("s3", **kwargs)
 
 
 def generate_upload_url(
@@ -81,13 +107,22 @@ def build_s3_key(file_name: str, dealership_name: str | None = None) -> str:
 
 
 def is_configured() -> bool:
-    """Whether S3 credentials are present.
+    """Whether archiving to S3 is switched on.
 
-    The pipeline treats archiving as best-effort so local runs work without AWS
-    configured — processing must not fail just because the file could not be
-    stored.
+    Keyed on the BUCKET, not on access keys. On EC2 there are no keys -- the
+    instance role supplies them -- so the old check reported "not configured"
+    on exactly the deployment where archiving matters most, and silently
+    disabled it. A missing bucket name is the real signal that nobody set this
+    up.
+
+    Credentials are deliberately not probed: that would mean a network call on
+    a path that runs per upload, and a credential problem should surface as a
+    logged failure on the archive attempt rather than as a silent skip.
+
+    Archiving stays best-effort either way -- processing must not fail because
+    a file could not be stored.
     """
-    return bool(settings.aws_access_key_id and settings.aws_secret_access_key)
+    return bool(settings.s3_bucket)
 
 
 def upload_file(local_path: str | Path, s3_key: str) -> None:
