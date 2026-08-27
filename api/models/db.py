@@ -26,6 +26,13 @@ class User(SQLModel, table=True):
     full_name: str | None = Field(default=None, max_length=255)
     hashed_password: str
     role: str = Field(default="AP_CLERK", max_length=50, index=True)
+    # Dealerships this user may see, as a JSON array of Tekion display names.
+    # An EMPTY string means every dealership -- the historical behaviour, and
+    # what admins get. A populated array restricts to exactly those names.
+    #
+    # Stored as JSON rather than a join table: the list is short, it is always
+    # read whole, and nothing queries across it.
+    dealerships: str = Field(default="", max_length=4000)
     is_active: bool = Field(default=True)
     is_superuser: bool = Field(default=False)
     created_at: datetime = Field(default_factory=_utcnow)
@@ -251,6 +258,8 @@ class InviteCode(SQLModel, table=True):
     email: str = Field(default="", index=True, max_length=255)
     # Role to assign when the invite is used
     role: str = Field(default="AP_CLERK", max_length=50)
+    # Dealerships to grant on signup. Same encoding as User.dealerships.
+    dealerships: str = Field(default="", max_length=4000)
     # Pre-filled name (optional — user can override on signup)
     full_name: str | None = Field(default=None, max_length=255)
     # Who created the invite. Nulled rather than blocking when that admin is

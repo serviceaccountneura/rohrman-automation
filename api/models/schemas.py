@@ -182,6 +182,10 @@ class CreateInviteRequest(BaseModel):
     email: EmailStr
     role: str = Field(default="AP_CLERK", max_length=50)
     full_name: str | None = Field(default=None, max_length=255)
+    # Dealerships to grant. None means every dealership; a list restricts to
+    # those names. An empty list is rejected rather than treated as "all" -- a
+    # form that forgot to send its selection must not hand out everything.
+    dealerships: list[str] | None = None
 
 
 class InviteResponse(BaseModel):
@@ -190,11 +194,29 @@ class InviteResponse(BaseModel):
     email: str
     role: str
     full_name: str | None
+    # Empty means every dealership.
+    dealerships: list[str] = Field(default_factory=list)
     expires_at: datetime
     # False when mail is not configured or the send failed. The invite is still
     # valid -- the UI shows the link so an admin can pass it on by hand.
     email_sent: bool = False
     email_error: str = ""
+
+
+class UpdateMeRequest(BaseModel):
+    full_name: str | None = Field(default=None, max_length=255)
+    current_password: str | None = None
+    new_password: str | None = Field(default=None, min_length=8, max_length=128)
+
+
+class CurrentUserResponse(BaseModel):
+    id: UUID
+    email: str
+    full_name: str | None = None
+    role: str
+    is_admin: bool = False
+    dealerships: list[str] = Field(default_factory=list)
+    all_dealerships: bool = True
 
 
 class InviteValidateResponse(BaseModel):
@@ -228,6 +250,7 @@ class UserListItem(BaseModel):
     full_name: str | None
     email: str
     role: str
+    dealerships: list[str] = Field(default_factory=list)
     status: str  # ACTIVE / INACTIVE
 
 

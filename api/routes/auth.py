@@ -104,6 +104,9 @@ def signup(req: UserCreate, session: Annotated[Session, Depends(get_session)]) -
         full_name=full_name,
         hashed_password=hash_password(req.password),
         role=role,
+        # Whatever the invite granted. Empty means every dealership, which is
+        # what someone signing up without an invite gets.
+        dealerships=(invite.dealerships if invite else ""),
     )
     session.add(user)
     session.commit()

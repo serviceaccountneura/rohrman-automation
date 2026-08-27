@@ -16,11 +16,14 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session, select
 
 from api.config import settings
-from api.services import email_service
+from api.services import access, email_service
+from api.services.security import hash_password, verify_password
 from api.db import get_session
 from api.deps import CurrentUserDep
 from api.models.db import InviteCode, Notification, RefreshToken, User
 from api.models.schemas import (
+    CurrentUserResponse,
+    UpdateMeRequest,
     CreateInviteRequest,
     InviteResponse,
     InviteValidateResponse,
@@ -43,9 +46,15 @@ router = APIRouter(prefix="/api/users", tags=["users"])
 @router.get("", response_model=UserListResponse)
 def list_users(
     session: Annotated[Session, Depends(get_session)],
-    _current_user: CurrentUserDep,
+    current_user: CurrentUserDep,
 ) -> UserListResponse:
-    """List all users with name, email, role, and status."""
+    """Every user, with name, email, role, dealerships and status.
+
+    Administrators only. A regular user has no reason to see the roster, and
+    exposing it would leak every colleague's email address.
+    """
+    access.require_admin(current_user)
+
     users = session.exec(select(User).order_by(User.created_at.desc())).all()
     items = [
         UserListItem(
@@ -53,11 +62,72 @@ def list_users(
             full_name=u.full_name,
             email=u.email,
             role=u.role,
+            dealerships=access.parse_dealerships(u.dealerships),
             status="ACTIVE" if u.is_active else "INACTIVE",
         )
         for u in users
     ]
     return UserListResponse(items=items, total=len(items))
+
+
+@router.get("/me", response_model=CurrentUserResponse)
+def read_me(current_user: CurrentUserDep) -> CurrentUserResponse:
+    """The signed-in user, including what they are allowed to do and see.
+
+    The frontend needs this to decide whether to offer user management at all.
+    Hiding the controls is not the security boundary -- the routes enforce that
+    -- but showing someone a button that always fails is its own bug.
+    """
+    return CurrentUserResponse(
+        id=current_user.id,
+        email=current_user.email,
+        full_name=current_user.full_name,
+        role=current_user.role,
+        is_admin=access.is_admin(current_user),
+        dealerships=access.parse_dealerships(current_user.dealerships),
+        all_dealerships=access.has_all_dealerships(current_user),
+    )
+
+
+@router.patch("/me", response_model=CurrentUserResponse)
+def update_me(
+    req: UpdateMeRequest,
+    session: Annotated[Session, Depends(get_session)],
+    current_user: CurrentUserDep,
+) -> CurrentUserResponse:
+    """Edit your own details.
+
+    Deliberately narrow: a name, and a password when the current one is given.
+    Role and dealership assignment are NOT editable here -- letting someone
+    change their own role or reach is the whole point of having an admin.
+    """
+    if req.full_name is not None:
+        current_user.full_name = req.full_name.strip() or None
+
+    if req.new_password:
+        if not req.current_password or not verify_password(
+            req.current_password, current_user.hashed_password
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Your current password is not correct.",
+            )
+        current_user.hashed_password = hash_password(req.new_password)
+
+    current_user.updated_at = datetime.now(timezone.utc)
+    session.add(current_user)
+    session.commit()
+    session.refresh(current_user)
+
+    return CurrentUserResponse(
+        id=current_user.id,
+        email=current_user.email,
+        full_name=current_user.full_name,
+        role=current_user.role,
+        is_admin=access.is_admin(current_user),
+        dealerships=access.parse_dealerships(current_user.dealerships),
+        all_dealerships=access.has_all_dealerships(current_user),
+    )
 
 
 @router.delete("/{user_id}")
@@ -66,7 +136,9 @@ def delete_user(
     session: Annotated[Session, Depends(get_session)],
     current_user: CurrentUserDep,
 ) -> dict:
-    """Delete a user by ID. Cannot delete yourself."""
+    """Delete a user by ID. Administrators only; cannot delete yourself."""
+    access.require_admin(current_user)
+
     if str(current_user.id) == user_id:
         raise HTTPException(status_code=400, detail="Cannot delete your own account")
 
@@ -121,9 +193,17 @@ def update_user_status(
     user_id: str,
     req: UpdateUserStatusRequest,
     session: Annotated[Session, Depends(get_session)],
-    _current_user: CurrentUserDep,
+    current_user: CurrentUserDep,
 ) -> dict:
-    """Activate or deactivate a user."""
+    """Activate or deactivate a user. Administrators only."""
+    access.require_admin(current_user)
+
+    if str(current_user.id) == user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You cannot disable your own sign-in.",
+        )
+
     user = session.get(User, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -146,10 +226,33 @@ def create_invite(
 ) -> InviteResponse:
     """Invite someone by email. Single-use link, valid for 24 hours.
 
+    Administrators only. An admin may invite another admin, so the group can
+    grow without a single person becoming a bottleneck; a regular user cannot
+    invite anyone at all.
+
     The link is emailed when SMTP is configured, and always returned either
     way -- a mail server that is unset or refusing should not stop an admin
     adding somebody, so the response carries the link for them to pass on.
     """
+    access.require_admin(current_user)
+
+    # An admin who is themselves restricted cannot hand out access they do not
+    # have. Without this, a single-store admin could invite someone to all 19.
+    requested = list(req.dealerships or [])
+    if req.dealerships is not None and not requested:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Select at least one dealership, or choose all dealerships.",
+        )
+    if requested:
+        for name in requested:
+            access.require_dealership(current_user, name)
+    elif not access.has_all_dealerships(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only invite someone to the dealerships you have access to.",
+        )
+
     email = req.email.strip().lower()
 
     existing = session.exec(select(User).where(User.email == email)).first()
@@ -173,6 +276,7 @@ def create_invite(
         email=email,
         role=req.role,
         full_name=req.full_name,
+        dealerships=access.encode_dealerships(requested),
         created_by=current_user.id,
     )
     session.add(invite)
@@ -196,6 +300,7 @@ def create_invite(
         email=email,
         role=req.role,
         full_name=req.full_name,
+        dealerships=access.parse_dealerships(invite.dealerships),
         expires_at=invite.expires_at,
         email_sent=result.sent,
         email_error=result.detail,
