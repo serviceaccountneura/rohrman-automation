@@ -281,7 +281,16 @@ class UserListResponse(BaseModel):
 
 
 class UpdateUserStatusRequest(BaseModel):
-    is_active: bool
+    # Both optional so one call can change either without disturbing the other.
+    # An omitted field is left alone; sending is_active alone must not wipe a
+    # dealership assignment.
+    is_active: bool | None = None
+    # null grants every dealership; a list restricts to those names. An empty
+    # list is refused rather than read as "all".
+    dealerships: list[str] | None = None
+    # Distinguishes "do not change the dealerships" from "grant all of them",
+    # which `dealerships: null` alone cannot express.
+    update_dealerships: bool = False
 
 
 class Token(BaseModel):

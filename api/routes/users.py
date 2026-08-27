@@ -197,26 +197,60 @@ def update_user_status(
     session: Annotated[Session, Depends(get_session)],
     current_user: CurrentUserDep,
 ) -> dict:
-    """Activate or deactivate a user. Administrators only."""
+    """Change a user's sign-in access or their dealerships. Administrators only."""
     access.require_admin(current_user)
-
-    if str(current_user.id) == user_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="You cannot disable your own sign-in.",
-        )
 
     user = session.get(User, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    user.is_active = req.is_active
+    if req.is_active is not None:
+        if str(current_user.id) == user_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="You cannot disable your own sign-in.",
+            )
+        user.is_active = req.is_active
+
+    if req.update_dealerships:
+        requested = list(req.dealerships or [])
+        if req.dealerships is not None and not requested:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Select at least one dealership, or choose all dealerships.",
+            )
+        # An admin cannot hand out access they do not have themselves, the same
+        # rule the invite path enforces -- otherwise a single-store admin could
+        # widen someone to all 19 by editing them afterwards.
+        if requested:
+            for name in requested:
+                access.require_dealership(current_user, name)
+        elif not access.has_all_dealerships(current_user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You can only grant the dealerships you have access to.",
+            )
+
+        # Changing your own reach is what having an admin is for; an admin
+        # narrowing themselves by accident would be awkward to undo.
+        if str(current_user.id) == user_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="You cannot change your own dealerships.",
+            )
+
+        user.dealerships = access.encode_dealerships(requested)
+
+    user.updated_at = datetime.now(timezone.utc)
     session.add(user)
     session.commit()
+    session.refresh(user)
+
     return {
-        "message": "User status updated",
+        "message": "User updated",
         "user_id": user_id,
-        "is_active": req.is_active,
+        "is_active": user.is_active,
+        "dealerships": access.parse_dealerships(user.dealerships),
     }
 
 
