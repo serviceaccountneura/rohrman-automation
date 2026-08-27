@@ -740,6 +740,9 @@ class TekionApiClient:
 
         Returns raw RO hits (id, status, createdTime, modifiedTime, ...),
         newest first (by createdTime) so callers can pick "most recent".
+
+        Tekion's GSS search index stores VINs in lowercase, so the search text
+        is lowercased here regardless of how the caller stored it.
         """
         res = self._req_json(
             "/api/gss/u/v2/search/v2",
@@ -754,7 +757,7 @@ class TekionApiClient:
                         "searchRequestV3List": [
                             {
                                 "searchableFields": ["RO_NO", "TAG_NO", "MODEL", "VIN", "CUSTOMER_NAME"],
-                                "searchText": vin,
+                                "searchText": vin.lower(),
                             }
                         ],
                     }
