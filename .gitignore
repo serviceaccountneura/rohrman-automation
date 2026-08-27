@@ -46,3 +46,10 @@ architecture_decision.txt
 
 # OS / editor
 .DS_Store
+
+# Every environment file except the documented template. .env.production holds
+# live database credentials; an un-ignored variant is how those reach a public
+# repository.
+.env
+.env.*
+!.env.example

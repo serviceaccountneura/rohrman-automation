@@ -39,7 +39,7 @@ git clone <backend-repo> && cd rohrman-automation
 Create `.env`:
 
 ```
-DATABASE_URL=postgresql+psycopg://USER:PASSWORD@your-rds-endpoint:5432/rohrman
+DATABASE_URL=postgresql+psycopg://USER:PASSWORD@your-rds-endpoint:5432/rohrman_de1
 JWT_SECRET=<64+ random characters>
 
 TEKION_USERNAME=...
@@ -49,7 +49,7 @@ TEKION_TOTP_SECRET=...
 AWS_ACCESS_KEY_ID=...          # omit if the instance has an IAM role
 AWS_SECRET_ACCESS_KEY=...
 S3_BUCKET=rohrman-invoices
-AWS_REGION=us-east-2
+AWS_REGION=eu-north-1
 
 SMTP_USER=you@yourdomain.com
 SMTP_PASSWORD=<16-char Gmail App Password>
@@ -90,6 +90,13 @@ the service name.
 ```bash
 docker compose up -d --build
 ```
+
+## Region
+
+The production database is in **eu-north-1** (Stockholm). Put the EC2 instance
+and the S3 bucket in the same region. Cross-region adds latency to every query
+and charges for data transfer between them — and this application makes a lot
+of small queries per document.
 
 ## First administrator
 
