@@ -1,11 +1,11 @@
 # Backend: the FastAPI app and its document queue.
 #
-# The frontend has its own compose file in the other repository. They talk over
-# the shared external network declared at the bottom, so either can be rebuilt
-# and restarted without touching the other.
-#
-#   docker network create rohrman        # once, before the first up
 #   docker compose up -d --build
+#
+# Independent of the frontend's compose file. The API is published on the
+# host's loopback and the frontend container reaches it through the host, so
+# there is no shared Docker network to create first and nothing to keep in step
+# between the two repositories.
 #
 # Postgres is NOT here. On EC2 the database is RDS, and running one in the same
 # compose file invites someone deploying it to production by accident. For a
@@ -55,9 +55,6 @@ services:
       # put the API on the internet with no reverse proxy in front.
       - "127.0.0.1:8099:8000"
 
-    networks:
-      - rohrman
-
     healthcheck:
       # Hits the app rather than the port: a process that is listening but has
       # failed to reach the database is not healthy.
@@ -78,8 +75,3 @@ services:
 
 volumes:
   api-uploads:
-
-networks:
-  rohrman:
-    external: true
-    name: rohrman

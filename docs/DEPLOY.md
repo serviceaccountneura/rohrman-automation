@@ -1,7 +1,8 @@
 # Deploying to EC2
 
-Two repositories, two images, two compose files. They meet on a shared Docker
-network so either can be rebuilt and restarted without touching the other.
+Two repositories, two images, two compose files, and no coupling between them.
+The frontend reaches the API through the host, so either can be rebuilt and
+restarted without touching the other.
 
 ```
 browser ──443──► nginx ──► rohrman-web  (Next.js, :3000)
@@ -22,13 +23,7 @@ server-side, which is why the API is published on loopback only.
 sudo dnf install -y docker git
 sudo systemctl enable --now docker
 sudo usermod -aG docker ec2-user      # log out and back in
-
-docker network create rohrman
 ```
-
-The network is external and shared. Create it before the first `up`, or both
-compose files fail with "network rohrman declared as external, but could not be
-found".
 
 ## Backend
 
@@ -79,13 +74,22 @@ Create `.env.local`:
 ```
 AUTH_SECRET=<32+ random characters, different from JWT_SECRET>
 AUTH_URL=https://invoices.yourdomain.com
-API_BASE_URL=http://api:8000
+API_BASE_URL=http://host.docker.internal:8099
 ```
 
-`AUTH_URL` must be the URL a browser uses. next-auth builds callback URLs from
-it, so a container name there produces a redirect nobody can follow.
-`API_BASE_URL` is the opposite: resolved inside the Docker network, so it is
-the service name.
+The two URLs point at different things on purpose.
+
+`AUTH_URL` must be what a **browser** types. next-auth builds callback URLs
+from it, so anything internal there redirects people somewhere they cannot
+reach.
+
+`API_BASE_URL` is resolved **inside the frontend container**, and a container's
+own `localhost` is the container — not the host — so `http://localhost:8099`
+finds nothing. `host.docker.internal` is the host as seen from inside a
+container, which the compose file makes resolve on Linux via `host-gateway`.
+
+A public URL would work too, but the request would leave the instance and come
+back through the internet to reach a process on the same machine.
 
 ```bash
 docker compose up -d --build

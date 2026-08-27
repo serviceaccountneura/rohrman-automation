@@ -20,8 +20,6 @@ services:
     ports:
       # Loopback only, so a laptop on a café network is not serving Postgres.
       - "127.0.0.1:5432:5432"
-    networks:
-      - rohrman
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rohrman}"]
       interval: 10s
