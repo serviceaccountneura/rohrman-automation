@@ -138,6 +138,11 @@ class Document(SQLModel, table=True):
     exception_type: str | None = Field(default=None, max_length=100)
     # HIGH, MEDIUM, LOW
     severity: str | None = Field(default=None, max_length=10, index=True)
+    # Who uploaded it. Null for rows created before this was tracked, and if the
+    # uploader's account is later deleted (the FK is ON DELETE SET NULL).
+    uploaded_by_id: UUID | None = Field(
+        default=None, foreign_key="users.id", index=True
+    )
     created_at: datetime = Field(default_factory=_utcnow, index=True)
     processed_at: datetime | None = Field(default=None)
 

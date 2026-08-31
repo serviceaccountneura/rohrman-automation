@@ -385,6 +385,8 @@ class PipelineStatusResponse(BaseModel):
     # Queue bookkeeping — how many times it has been tried and why it last failed.
     attempts: int = 0
     last_error: str = Field(default="", alias="lastError")
+    # Display name (or email) of the user who uploaded it; "" if unknown.
+    uploaded_by: str = Field(default="", alias="uploadedBy")
     created_at: datetime = Field(alias="createdAt")
     processed_at: datetime | None = Field(default=None, alias="processedAt")
 

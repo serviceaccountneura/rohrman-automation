@@ -26,7 +26,8 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlmodel import Session, select
 
 from api.db import get_session
-from api.models.db import Document
+from api.deps import CurrentUserDep
+from api.models.db import Document, User
 from api.models.schemas import (
     MessageResponse,
     PipelineAcceptedResponse,
@@ -60,6 +61,7 @@ def queue_stats(session: Annotated[Session, Depends(get_session)]) -> dict[str, 
 @router.post("/process", response_model=PipelineAcceptedResponse, status_code=202)
 async def process_upload(
     session: Annotated[Session, Depends(get_session)],
+    current_user: CurrentUserDep,
     file: UploadFile = File(...),
     folder: str = Form(..., description="SUBLET | MISCELLANEOUS | STOCK | OEM"),
     dealership_name: str = Form("", description="Dealership the invoice belongs to"),
@@ -111,6 +113,7 @@ async def process_upload(
         dealership_name=dealership_name,
         po_type=po_type,
         status=job_queue.STATUS_QUEUED,
+        uploaded_by_id=current_user.id,
     )
     session.add(doc)
     session.commit()
@@ -151,7 +154,7 @@ def confirm_duplicate(
         )
 
     original = job_queue.confirm_duplicate(session, doc)
-    return _to_status(original)
+    return _to_status(original, session=session)
 
 
 @router.post("/jobs/{document_id}/discard", response_model=MessageResponse)
@@ -200,12 +203,19 @@ def get_job(
             ).all()
         )
 
-    return _to_status(doc, children)
+    return _to_status(doc, children, session=session)
 
 
 def _to_status(
-    doc: Document, children: list[UUID] | None = None
+    doc: Document,
+    children: list[UUID] | None = None,
+    session: Session | None = None,
 ) -> PipelineStatusResponse:
+    uploaded_by = ""
+    if session is not None and doc.uploaded_by_id is not None:
+        uploader = session.get(User, doc.uploaded_by_id)
+        if uploader is not None:
+            uploaded_by = uploader.full_name or uploader.email
     return PipelineStatusResponse(
         document_id=doc.id,
         status=doc.status,
@@ -229,6 +239,7 @@ def _to_status(
         severity=doc.severity,
         attempts=doc.attempts,
         last_error=doc.last_error,
+        uploaded_by=uploaded_by,
         created_at=doc.created_at,
         processed_at=doc.processed_at,
     )
