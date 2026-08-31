@@ -4,6 +4,9 @@ Two repositories, two images, two compose files, and no coupling between them.
 The frontend reaches the API through the host, so either can be rebuilt and
 restarted without touching the other.
 
+Once it is up, see [PRODUCTION.md](PRODUCTION.md) — the runbook for operating
+it, including the rules that must not be broken.
+
 ```
 browser ──443──► nginx ──► rohrman-web  (Next.js, :3000)
                               │
