@@ -193,6 +193,8 @@ def confirm_duplicate(session: Session, doc: Document) -> Document:
     original.invoice_number = doc.invoice_number or original.invoice_number
     original.ro_number = doc.ro_number or original.ro_number
     original.ocr_document_type = doc.ocr_document_type or original.ocr_document_type
+    # The person who re-uploaded and confirmed now owns this row's result.
+    original.uploaded_by_id = doc.uploaded_by_id or original.uploaded_by_id
 
     # Previous Tekion references belong to the earlier run and would be
     # misleading if this one fails. The UI shows them before confirming.
