@@ -50,10 +50,16 @@ services:
       - api-uploads:/tmp/rohrman
 
     ports:
-      # Bound to loopback. Nothing outside the host should reach the API
-      # directly -- the frontend proxies to it, and exposing it publicly would
-      # put the API on the internet with no reverse proxy in front.
-      - "127.0.0.1:8099:8000"
+      # Published on all host interfaces so the ALB can reach it on the
+      # instance's private IP (target group -> :8099). This is NOT public: the
+      # instance security group only admits the ALB's security group on 8099.
+      # 0.0.0.0 also covers 127.0.0.1 (operator/health checks on the box) and
+      # 172.17.0.1 (the docker0 gateway, which is what host.docker.internal
+      # resolves to inside the web container).
+      #
+      # Do not open 8099 to 0.0.0.0/0 in the security group -- the API has no
+      # rate limiting and no reverse proxy of its own; the ALB is the edge.
+      - "8099:8000"
 
     healthcheck:
       # Hits the app rather than the port: a process that is listening but has
