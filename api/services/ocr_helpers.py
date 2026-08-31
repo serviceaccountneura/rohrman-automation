@@ -62,7 +62,11 @@ def get_vin(ocr: dict[str, Any]) -> str:
     # Drop obvious OCR noise ("[illegible]", stray punctuation) rather than
     # feeding a garbage VIN into a Tekion search.
     vin = re.sub(r"[^A-Z0-9]", "", vin)
-    return vin if len(vin) >= 11 else ""
+    # Sublet invoices often print only a partial VIN (e.g. the last 8
+    # characters like "TL012280"). Tekion's GSS search matches on those
+    # fragments, so accept anything 6+ chars after cleaning — anything
+    # shorter is almost certainly OCR noise, not a real VIN fragment.
+    return vin if len(vin) >= 6 else ""
 
 
 # Labels that really do name a repair order, most specific first. Matched as
