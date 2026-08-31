@@ -1,21 +1,83 @@
+# Backend: the FastAPI app and its document queue.
+#
+#   docker compose up -d --build
+#
+# Independent of the frontend's compose file. The API is published on the
+# host's loopback and the frontend container reaches it through the host, so
+# there is no shared Docker network to create first and nothing to keep in step
+# between the two repositories.
+#
+# Postgres is NOT here. On EC2 the database is RDS, and running one in the same
+# compose file invites someone deploying it to production by accident. For a
+# local database, see docker-compose.local.yml.
+
 services:
-  db:
-    image: postgres:17-alpine
-    container_name: rohrman_db
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rohrman-api:latest
+    container_name: rohrman-api
     restart: unless-stopped
+
+    # NOT scalable. TEKION_LOCK serialises Tekion work within one process, so a
+    # second replica posts invoices to the wrong dealership. Raise
+    # PIPELINE_WORKERS for throughput instead -- those are threads inside this
+    # process, where the lock still applies.
+    deploy:
+      replicas: 1
+
+    env_file:
+      - .env
+
     environment:
-      POSTGRES_USER: rohrman
-      POSTGRES_PASSWORD: rohrman
-      POSTGRES_DB: rohrman
-    ports:
-      - "5432:5432"
+      # Threads that read documents in parallel. OCR renders each page at 300
+      # DPI, roughly 24 MB per page held in memory, and a ten-page invoice
+      # holds all of it at once -- so this multiplies peak memory. Two is
+      # comfortable on a t3.medium; raise it only with the memory to match.
+      PIPELINE_WORKERS: ${PIPELINE_WORKERS:-2}
+      # Where the invite links point. Must be the browser-facing URL, not the
+      # container name: it is emailed to people outside this network.
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+
     volumes:
-      - rohrman_pgdata:/var/lib/postgresql/data
+      # Google service account for Vertex AI. Mounted read-only rather than
+      # copied into the image, where it would persist in the layer history.
+      - ./neura_vertex_ai.json:/app/neura_vertex_ai.json:ro
+      # Uploaded invoices while they are being processed. A named volume, not a
+      # tmpfs: a restart mid-job must not lose a document the queue still
+      # intends to run. S3 is the real durable copy.
+      - api-uploads:/tmp/rohrman
+
+    ports:
+      # Published on all host interfaces so the ALB can reach it on the
+      # instance's private IP (target group -> :8099). This is NOT public: the
+      # instance security group only admits the ALB's security group on 8099.
+      # 0.0.0.0 also covers 127.0.0.1 (operator/health checks on the box) and
+      # 172.17.0.1 (the docker0 gateway, which is what host.docker.internal
+      # resolves to inside the web container).
+      #
+      # Do not open 8099 to 0.0.0.0/0 in the security group -- the API has no
+      # rate limiting and no reverse proxy of its own; the ALB is the edge.
+      - "8099:8000"
+
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U rohrman -d rohrman"]
-      interval: 5s
+      # Hits the app rather than the port: a process that is listening but has
+      # failed to reach the database is not healthy.
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/docs"]
+      interval: 30s
       timeout: 5s
-      retries: 10
+      # Generous: the container runs migrations before it serves anything.
+      start_period: 60s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        # Unbounded container logs are a common way to fill a disk, and this
+        # application logs every Tekion call.
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
-  rohrman_pgdata:
+  api-uploads:

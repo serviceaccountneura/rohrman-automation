@@ -26,6 +26,13 @@ class User(SQLModel, table=True):
     full_name: str | None = Field(default=None, max_length=255)
     hashed_password: str
     role: str = Field(default="AP_CLERK", max_length=50, index=True)
+    # Dealerships this user may see, as a JSON array of Tekion display names.
+    # An EMPTY string means every dealership -- the historical behaviour, and
+    # what admins get. A populated array restricts to exactly those names.
+    #
+    # Stored as JSON rather than a join table: the list is short, it is always
+    # read whole, and nothing queries across it.
+    dealerships: str = Field(default="", max_length=4000)
     is_active: bool = Field(default=True)
     is_superuser: bool = Field(default=False)
     created_at: datetime = Field(default_factory=_utcnow)
@@ -161,6 +168,15 @@ class Document(SQLModel, table=True):
     # so a later upload is still checked normally.
     duplicate_override: bool = Field(default=False)
 
+    # ── Batch scans ───────────────────────────────────────────────────────────
+    # Several invoices scanned into one file are split into one document each.
+    # The parent keeps the original file and the SPLIT status; each child points
+    # back here and owns the pages it was cut from. A child is never re-split.
+    split_from: UUID | None = Field(default=None, foreign_key="documents.id")
+    # Which pages of the parent this document is, e.g. "1-2" or "3". Empty for
+    # anything that was not split out of a batch.
+    page_range: str = Field(default="", max_length=20)
+
 
 class GlVendorMapping(SQLModel, table=True):
     """Master Miscellaneous Vendor-to-GL lookup table.
@@ -237,12 +253,18 @@ class InviteCode(SQLModel, table=True):
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     code: str = Field(index=True, unique=True, max_length=32)
+    # Who it was sent to. Signup must use this address, so an invite cannot be
+    # forwarded and redeemed by someone else.
+    email: str = Field(default="", index=True, max_length=255)
     # Role to assign when the invite is used
     role: str = Field(default="AP_CLERK", max_length=50)
+    # Dealerships to grant on signup. Same encoding as User.dealerships.
+    dealerships: str = Field(default="", max_length=4000)
     # Pre-filled name (optional — user can override on signup)
     full_name: str | None = Field(default=None, max_length=255)
-    # Who created the invite
-    created_by: UUID = Field(foreign_key="users.id")
+    # Who created the invite. Nulled rather than blocking when that admin is
+    # deleted -- the invite record itself is still worth keeping.
+    created_by: UUID | None = Field(default=None, foreign_key="users.id")
     used: bool = Field(default=False, index=True)
     used_by: UUID | None = Field(default=None, foreign_key="users.id")
     used_at: datetime | None = Field(default=None)

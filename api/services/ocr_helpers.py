@@ -69,14 +69,47 @@ def get_vin(ocr: dict[str, Any]) -> str:
     return vin if len(vin) >= 6 else ""
 
 
+# Labels that really do name a repair order, most specific first. Matched as
+# whole words against a label stripped of punctuation and spaces.
+#
+# The obvious `"ro" in label` is what this replaces, and it was wrong in a way
+# that is easy to miss: "ro" appears inside "shipped f-r-o-m", so every invoice
+# with a Shipped From field filed its shipping origin as a repair order number.
+_RO_LABELS = (
+    "repairorder",
+    "repairordernumber",
+    "ronumber",
+    "rono",
+    "controlnumber",
+    "controlno",
+)
+
+# Fields that contain an RO label as a substring but mean something else.
+_NOT_AN_RO = ("shippedfrom", "shipto", "billto", "salesorder", "purchaseorder")
+
+
+def _looks_like_ro_label(label: str) -> bool:
+    """True when this label names a repair order rather than merely containing 'ro'."""
+    key = "".join(str(label or "").lower().split()).replace(".", "").replace("-", "")
+    if not key or any(key.startswith(bad) for bad in _NOT_AN_RO):
+        return False
+    if key in _RO_LABELS:
+        return True
+    # A bare "RO" or "R/O" column heading is common and legitimate.
+    if key in ("ro", "r/o", "ro#"):
+        return True
+    # Otherwise require the words, not the letters: "repair order" anywhere, or
+    # a label that starts with "ro" followed by a separator ("ro no", "ro #").
+    return "repairorder" in key or key.startswith("rono") or key.startswith("ro#")
+
+
 def get_control_number(ocr: dict[str, Any]) -> str:
     po_contract = ocr.get("_po_contract") or {}
     if po_contract.get("ro_number"):
         return _clean_ro_number(po_contract["ro_number"])
 
     for id_entry in ocr.get("identifiers", []):
-        label = (id_entry.get("label") or "").lower()
-        if "ro" in label or "repair order" in label or "control" in label:
+        if _looks_like_ro_label(id_entry.get("label")):
             return _clean_ro_number(id_entry.get("value"))
 
     return _clean_ro_number(
@@ -112,6 +145,131 @@ def get_invoice_number(ocr: dict[str, Any]) -> str:
     )
     return _clean_invoice_number(str(fallback)) if fallback else ""
 
+
+def _clean_po_number(raw: Any) -> str:
+    """Strip a leading PO label, the way _clean_ro_number does for repair orders."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    stripped = re.sub(
+        r"^\s*(?:P\.?\s*O\.?|PURCHASE\s+ORDER)\s*(?:NUMBER|NO|#)?\s*[#:.\-]?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+    return stripped or text
+
+
+def get_po_number(ocr: dict[str, Any]) -> str:
+    """The purchase order number printed on the invoice.
+
+    Vendor stock orders are invoiced against a PO that already exists in Tekion,
+    so this is the field the whole flow hangs on.
+
+    "PO BOX" is excluded outright — it is part of the vendor's address and
+    appears on most invoices, so a loose match would confidently return a
+    postal box number as a purchase order.
+    """
+    po_contract = ocr.get("_po_contract") or {}
+    if po_contract.get("po_number"):
+        return _clean_po_number(po_contract["po_number"])
+
+    identifiers = ocr.get("identifiers") or []
+
+    def scan(predicate) -> str:
+        for entry in identifiers:
+            label = (entry.get("label") or "").strip().lower()
+            if not label or "box" in label:
+                continue
+            if predicate(label):
+                cleaned = _clean_po_number(entry.get("value"))
+                if cleaned:
+                    return cleaned
+        return ""
+
+    # An explicit purchase-order label first.
+    found = scan(lambda label: "purchase order" in label)
+    if found:
+        return found
+    # Then the abbreviation, but only where it stands as its own word.
+    found = scan(
+        lambda label: label.replace(".", "").replace(" ", "").startswith("po")
+    )
+    if found:
+        return found
+
+    return _clean_po_number(ocr.get("po_number") or ocr.get("poNumber") or "")
+
+
+
+# A dealership GL account is four or five digits. Anything shorter is a line
+# number or a quantity; anything longer is an invoice or part number.
+_GL_PATTERN = re.compile(r"\b(\d{4,5})\b")
+
+# Labels and note text that introduce a GL account, so "GL# 2410" scrawled in
+# the margin is read as an account and "Invoice Number 135624720" is not.
+_GL_HINTS = ("gl", "g/l", "account", "acct", "acc#", "post to", "charge to")
+
+
+def _first_gl(text: Any) -> str:
+    """The first plausible GL account in a string, or ""."""
+    match = _GL_PATTERN.search(str(text or ""))
+    return match.group(1) if match else ""
+
+
+def get_line_item_gl_accounts(ocr: dict[str, Any]) -> dict[int, str]:
+    """GL account per line item index, for the lines that carry one."""
+    out: dict[int, str] = {}
+    for i, item in enumerate(ocr.get("line_items") or []):
+        account = _first_gl(item.get("gl_account"))
+        if account:
+            out[i] = account
+    return out
+
+
+def get_document_gl_account(ocr: dict[str, Any]) -> str:
+    """The GL account written on the invoice, for the whole document.
+
+    Clerks write the account on the page by hand -- "GL# 2410" circled in the
+    margin -- and the OCR prompt already binds a code like that to everything on
+    the document when no arrow points it at one line. This reads that back.
+
+    Searched most reliable first:
+      1. an account every line item agrees on
+      2. gl_mappings[], which the prompt fills for fees and charges
+      3. an identifier labelled like a GL account
+      4. handwritten notes, where a margin scrawl ends up
+
+    Returns "" when the invoice does not name one. Callers treat that as
+    "nothing was written here", not as an error.
+    """
+    per_line = set(get_line_item_gl_accounts(ocr).values())
+    if len(per_line) == 1:
+        return per_line.pop()
+
+    for mapping in ocr.get("gl_mappings") or []:
+        account = _first_gl(mapping.get("gl_account"))
+        if account:
+            return account
+
+    for entry in ocr.get("identifiers") or []:
+        label = str(entry.get("label") or "").lower()
+        if any(hint in label for hint in _GL_HINTS):
+            account = _first_gl(entry.get("value"))
+            if account:
+                return account
+
+    # A handwritten note only counts when it says it is an account. Invoices are
+    # covered in stray numbers, and picking one at random would post real money
+    # to whatever four digits happened to be legible.
+    for note in ocr.get("handwritten_notes") or []:
+        text = str(note or "").lower()
+        if any(hint in text for hint in _GL_HINTS):
+            account = _first_gl(note)
+            if account:
+                return account
+
+    return ""
 
 def get_document_type(ocr: dict[str, Any]) -> str:
     """Whatever OCR decided the document is.

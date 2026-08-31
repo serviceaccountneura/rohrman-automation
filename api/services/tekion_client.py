@@ -18,6 +18,8 @@ Env: TEKION_USERNAME, TEKION_PASSWORD, TEKION_TOTP_SECRET
 from __future__ import annotations
 
 import json
+import mimetypes
+import tempfile
 import os
 import time
 import uuid
@@ -33,6 +35,35 @@ from api.models.db import TekionSession
 BASE = "https://app.tekioncloud.com"
 TENANT = "rohrmanautomotivegroup"
 
+
+
+def _as_pdf(file_path: str, file_name: str) -> tuple[str, str, Any]:
+    """Return the file as a PDF, converting it if it is an image.
+
+    Tekion's viewer only renders PDFs. Returns the path to use, the name to
+    show, and the NamedTemporaryFile holding the conversion — the caller must
+    keep that third value referenced until the upload completes, or the file is
+    deleted out from under it.
+
+    A conversion failure is not fatal: an unviewable attachment beats a failed
+    invoice, so the original is uploaded instead.
+    """
+    if os.path.splitext(file_path)[1].lower() == ".pdf":
+        return file_path, file_name, None
+    try:
+        from PIL import Image
+
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        tmp.close()
+        with Image.open(file_path) as img:
+            # PDF has no alpha channel; RGBA and palette images need flattening.
+            img.convert("RGB").save(tmp.name, "PDF", resolution=200.0)
+        pdf_name = f"{os.path.splitext(file_name)[0]}.pdf"
+        print(f"[API] converted {file_name} to PDF for Tekion's viewer")
+        return tmp.name, pdf_name, tmp
+    except Exception as e:  # noqa: BLE001
+        print(f"[API] could not convert {file_name} to PDF ({e}); uploading as-is")
+        return file_path, file_name, None
 
 class TekionApiClient:
     def __init__(self, db_session: Session | None = None) -> None:
@@ -476,8 +507,22 @@ class TekionApiClient:
         print(f"[API] Fetched {len(accounts)} GL accounts for dealer {self.dealer_id}")
         return accounts
 
-    def upload_document(self, file_path: str, mime_type: str = "application/pdf") -> str:
+    def upload_document(
+        self,
+        file_path: str,
+        mime_type: str | None = None,
+        display_name: str | None = None,
+    ) -> str:
         """Upload a document to Tekion's media service.
+
+        Tekion's document viewer renders PDFs and nothing else, so an image is
+        converted to one before it goes up. Uploading a JPEG as-is stores the
+        bytes intact but leaves the clerk looking at "Failed to load PDF file"
+        forever — the format is the problem, not the mimeType we declare.
+
+        `display_name` is the name shown in Tekion. Pass the invoice's original
+        filename — the caller usually holds the bytes in a temp file, and
+        "tmp8h24mg32.jpg" means nothing to whoever opens the PO later.
 
         Flow:
           1. POST /api/media-v3/u/v2/initiate-upload → get presigned S3 URL + mediaId
@@ -487,8 +532,13 @@ class TekionApiClient:
 
         Returns the mediaId (used in preInvoice attachments).
         """
-        file_name = os.path.basename(file_path)
+        file_name = display_name or os.path.basename(file_path)
+        # Tekion only previews PDFs. Convert anything else first, and keep the
+        # converted file alive until the upload finishes.
+        file_path, file_name, _tmp_pdf = _as_pdf(file_path, file_name)
         content_length = os.path.getsize(file_path)
+        if not mime_type:
+            mime_type = mimetypes.guess_type(file_path)[0] or "application/pdf"
 
         # Step 1: Initiate upload
         print(f"[API] Uploading {file_name} ({content_length} bytes)...")
@@ -681,6 +731,40 @@ class TekionApiClient:
             "totalAmount": data.get("totalAmount"),
             "vendorName": (data.get("vendorDetails") or {}).get("vendorName"),
         }
+
+    def find_purchase_order(self, po_number: str) -> dict[str, Any] | None:
+        """Find an existing purchase order by the number printed on an invoice.
+
+        The vendor stock order flow does not create a PO — one already exists in
+        Tekion and the invoice references it. This is the lookup the clerk does
+        by typing the number into the purchase order list.
+
+        Returns the PO with the fields the pre-invoice needs (id, orderNumber,
+        universalId, orderType, totalAmount, vendorDetails), or None.
+        """
+        res = self._req_json(
+            "/api/partTrade/u/purchase/search",
+            method="POST",
+            body={
+                "sort": [],
+                "filters": [
+                    {"field": "orderNumber", "operator": "IN", "values": [str(po_number).strip()]}
+                ],
+                "searchText": "",
+                "groupBy": [],
+                "includeFields": [],
+                "searchableFields": [],
+                "excludeFields": [],
+                "pageInfo": {"start": 0, "rows": 10},
+            },
+        )
+        hits = (res.get("data") or {}).get("hits") or []
+        wanted = str(po_number).strip()
+        for hit in hits:
+            if str(hit.get("orderNumber") or "").strip() == wanted:
+                return hit
+        # The search is fuzzy; only an exact number is safe to act on.
+        return None
 
     def search_ro(self, ro_number: str) -> list[dict[str, str]]:
         res = self._req_json(
@@ -1001,6 +1085,7 @@ class TekionApiClient:
         invoice_date: str | None = None,
         attachment_media_ids: list[str] | None = None,
         gl_splits: list[dict[str, Any]] | None = None,
+        use_returned_postings: bool = False,
     ) -> dict[str, str]:
         amount_cents = round(invoice_amount * 100)
         tax_cents = round(sales_tax * 100)
@@ -1049,7 +1134,7 @@ class TekionApiClient:
 
         # Step 3: Get postings
         print("[API] Pre-invoice: postings...")
-        self._req_json(
+        postings_res = self._req_json(
             "/api/accounting/u/poInvoice/preInvoicing/postings",
             method="POST",
             body={
@@ -1060,6 +1145,56 @@ class TekionApiClient:
                 "poNumbers": [po_number],
             },
         )
+
+        # Tekion works out the expense side itself and hands it back: one
+        # posting per part line on the PO, each with the GL account that part
+        # belongs to. A stock order has as many lines as it has parts, so
+        # inventing a single posting from one GL account -- which is right for
+        # sublet and misc -- would post the wrong breakdown here.
+        #
+        # Opt-in so the existing callers keep their single-line behaviour.
+        accounting_details: list[dict[str, Any]] | None = None
+        if use_returned_postings:
+            returned = postings_res.get("data") or []
+            # The response is a balanced double entry: one debit per part plus
+            # the AP credit, which sums to zero. Only the expense side belongs in
+            # accountingDetails -- the AP side travels separately as
+            # apGlAccountId, and including it here posts a zero invoice.
+            returned = [
+                p for p in returned if p.get("glAccountId") != ap_gl_account_id
+            ]
+            if returned:
+                accounting_details = [
+                    {
+                        "description": p.get("description"),
+                        "glAccountId": p.get("glAccountId"),
+                        # The postings response is in dollars; the post body is
+                        # in cents, like every other amount here.
+                        "postingAmount": {
+                            "amount": round(float(p.get("amount") or 0) * 100),
+                            "currency": "USD",
+                        },
+                        "controlNumberList": p.get("controlNumberList"),
+                        "refText": p.get("refText"),
+                    }
+                    for p in returned
+                ]
+                total = sum(d["postingAmount"]["amount"] for d in accounting_details)
+                print(f"[API] Pre-invoice: {len(accounting_details)} posting(s) from Tekion, "
+                      f"totalling {total / 100:.2f}")
+            else:
+                print("[API] Pre-invoice: Tekion returned no postings; falling back")
+
+        if accounting_details is None:
+            accounting_details = [
+                {
+                    "description": None,
+                    "glAccountId": gl_account_id,
+                    "postingAmount": {"amount": subtotal_cents, "currency": "USD"},
+                    "controlNumberList": None,
+                    "refText": ref_text,
+                }
+            ]
 
         # Step 4: Post pre-invoice
         print("[API] Pre-invoice: post...")

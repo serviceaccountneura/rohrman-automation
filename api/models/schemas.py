@@ -6,7 +6,7 @@ from enum import Enum
 from typing import Annotated, Any, Literal, Union
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 
 
 # ── OCR ──────────────────────────────────────────────────────────────────────
@@ -179,20 +179,72 @@ class UserCreate(BaseModel):
 
 
 class CreateInviteRequest(BaseModel):
+    email: EmailStr
     role: str = Field(default="AP_CLERK", max_length=50)
     full_name: str | None = Field(default=None, max_length=255)
+    # Dealerships to grant. None means every dealership; a list restricts to
+    # those names. An empty list is rejected rather than treated as "all" -- a
+    # form that forgot to send its selection must not hand out everything.
+    dealerships: list[str] | None = None
 
 
 class InviteResponse(BaseModel):
     invite_code: str
     invite_url: str
+    email: str
     role: str
     full_name: str | None
+    # Empty means every dealership.
+    dealerships: list[str] = Field(default_factory=list)
     expires_at: datetime
+    # False when mail is not configured or the send failed. The invite is still
+    # valid -- the UI shows the link so an admin can pass it on by hand.
+    email_sent: bool = False
+    email_error: str = ""
+
+
+class PendingInviteItem(BaseModel):
+    id: UUID
+    email: str
+    role: str
+    full_name: str | None = None
+    # Empty means every dealership.
+    dealerships: list[str] = Field(default_factory=list)
+    invited_by: str = ""
+    created_at: datetime
+    expires_at: datetime
+    # True once the 24-hour window has passed. Kept in the list rather than
+    # filtered out: "expired" is why nobody signed up, and hiding it makes an
+    # invitation look like it was never sent.
+    expired: bool = False
+
+
+class PendingInviteListResponse(BaseModel):
+    items: list[PendingInviteItem]
+    total: int
+
+
+class UpdateMeRequest(BaseModel):
+    full_name: str | None = Field(default=None, max_length=255)
+    current_password: str | None = None
+    new_password: str | None = Field(default=None, min_length=8, max_length=128)
+
+
+class CurrentUserResponse(BaseModel):
+    id: UUID
+    email: str
+    full_name: str | None = None
+    role: str
+    is_admin: bool = False
+    dealerships: list[str] = Field(default_factory=list)
+    all_dealerships: bool = True
 
 
 class InviteValidateResponse(BaseModel):
     valid: bool
+    # Shown on the signup page and used as the account's address, so the person
+    # cannot register under a different one.
+    email: str | None = None
     role: str | None = None
     full_name: str | None = None
     expires_at: datetime | None = None
@@ -219,6 +271,7 @@ class UserListItem(BaseModel):
     full_name: str | None
     email: str
     role: str
+    dealerships: list[str] = Field(default_factory=list)
     status: str  # ACTIVE / INACTIVE
 
 
@@ -228,7 +281,16 @@ class UserListResponse(BaseModel):
 
 
 class UpdateUserStatusRequest(BaseModel):
-    is_active: bool
+    # Both optional so one call can change either without disturbing the other.
+    # An omitted field is left alone; sending is_active alone must not wipe a
+    # dealership assignment.
+    is_active: bool | None = None
+    # null grants every dealership; a list restricts to those names. An empty
+    # list is refused rather than read as "all".
+    dealerships: list[str] | None = None
+    # Distinguishes "do not change the dealerships" from "grant all of them",
+    # which `dealerships: null` alone cannot express.
+    update_dealerships: bool = False
 
 
 class Token(BaseModel):
@@ -311,6 +373,13 @@ class PipelineStatusResponse(BaseModel):
     ocr_document_type: str = Field(default="", alias="ocrDocumentType")
     # Set when status is DUPLICATE: the already-processed document this repeats.
     duplicate_of: UUID | None = Field(default=None, alias="duplicateOf")
+    # Set when this document was cut out of a batch scan: the batch it came
+    # from, and which of its pages this is ("1-2", "3").
+    split_from: UUID | None = Field(default=None, alias="splitFrom")
+    page_range: str = Field(default="", alias="pageRange")
+    # Set when status is SPLIT: the documents this batch was broken into. The
+    # parent does no work of its own, so this is what the user follows instead.
+    children: list[UUID] = Field(default_factory=list)
     exception_type: str | None = Field(default=None, alias="exceptionType")
     severity: str | None = None
     # Queue bookkeeping — how many times it has been tried and why it last failed.
@@ -323,6 +392,30 @@ class PipelineStatusResponse(BaseModel):
 
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
+
+
+
+class TrendPoint(BaseModel):
+    """One month on the processing trend chart."""
+
+    # "Jan", "Feb" ... for the axis, plus the real month so the client can sort
+    # or label a year boundary without parsing the short name back.
+    month: str
+    year: int
+    month_number: int
+    total: int
+    processed: int
+    exceptions: int
+    auto_resolved: int
+
+
+class TrendsResponse(BaseModel):
+    points: list[TrendPoint]
+    # Totals across the whole window, for the breakdown beside the chart.
+    total: int
+    processed: int
+    exceptions: int
+    auto_resolved: int
 
 
 class DashboardSummary(BaseModel):

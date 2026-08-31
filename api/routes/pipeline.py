@@ -23,7 +23,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from api.db import get_session
 from api.models.db import Document
@@ -189,10 +189,23 @@ def get_job(
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    return _to_status(doc)
+    # A split batch does no work itself — the caller polls its children instead.
+    children: list[UUID] = []
+    if doc.status == job_queue.STATUS_SPLIT:
+        children = list(
+            session.exec(
+                select(Document.id)
+                .where(Document.split_from == doc.id)
+                .order_by(Document.page_range)
+            ).all()
+        )
+
+    return _to_status(doc, children)
 
 
-def _to_status(doc: Document) -> PipelineStatusResponse:
+def _to_status(
+    doc: Document, children: list[UUID] | None = None
+) -> PipelineStatusResponse:
     return PipelineStatusResponse(
         document_id=doc.id,
         status=doc.status,
@@ -209,6 +222,9 @@ def _to_status(doc: Document) -> PipelineStatusResponse:
         journal_id=doc.journal_id,
         ocr_document_type=doc.ocr_document_type,
         duplicate_of=doc.duplicate_of,
+        split_from=doc.split_from,
+        page_range=doc.page_range,
+        children=children or [],
         exception_type=doc.exception_type,
         severity=doc.severity,
         attempts=doc.attempts,

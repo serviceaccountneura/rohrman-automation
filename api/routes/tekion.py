@@ -15,8 +15,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 
 from api.db import get_session
+from api.deps import CurrentUserDep
 from api.models.db import Document, VendorMapping
-from api.services import file_source
+from api.services import access, file_source
 from api.models.schemas import (
     CreateMiscPoRequest,
     CreatePoRequest,
@@ -454,6 +455,7 @@ def _create_stock_po(
 @router.get("/dealers")
 def list_dealers(
     session: Annotated[Session, Depends(get_session)],
+    current_user: CurrentUserDep,
     refresh: bool = False,
 ) -> dict[str, Any]:
     """Every dealership this Tekion login can reach.
@@ -477,8 +479,10 @@ def list_dealers(
             and now - _dealers_cached_at < _DEALERS_TTL
         )
         if fresh_enough and not refresh:
+            # The cache holds the FULL roster and is shared by everyone; the
+            # narrowing happens per response, never in the cache itself.
             return {
-                "dealers": _dealers_cache,
+                "dealers": access.visible_dealerships(current_user, _dealers_cache),
                 "cached": True,
                 "fetchedAt": _dealers_cached_at.isoformat(),
             }
@@ -499,7 +503,7 @@ def list_dealers(
             if _dealers_cache:
                 print(f"[TEKION] dealer refresh failed ({e}); serving cached list")
                 return {
-                    "dealers": _dealers_cache,
+                    "dealers": access.visible_dealerships(current_user, _dealers_cache),
                     "cached": True,
                     "stale": True,
                     "fetchedAt": (
@@ -513,7 +517,11 @@ def list_dealers(
         _dealers_cached_at = now
 
     print(f"[TEKION] dealer list refreshed ({len(dealers)} dealerships)")
-    return {"dealers": dealers, "cached": False, "fetchedAt": now.isoformat()}
+    return {
+        "dealers": access.visible_dealerships(current_user, dealers),
+        "cached": False,
+        "fetchedAt": now.isoformat(),
+    }
 
 
 @router.get("/vendors/{dealer_id}")

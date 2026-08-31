@@ -38,7 +38,7 @@ from sqlmodel import Session
 
 from api.db import engine
 from api.models.db import Document
-from api.services import job_queue, ocr_helpers, s3_service
+from api.services import document_splitter, job_queue, ocr_helpers, s3_service
 from api.services.ocr_service import extract_document
 from api.services.tekion_lock import tekion_scope
 
@@ -82,7 +82,18 @@ EX_FILE_MISSING = "SOURCE_FILE_MISSING"
 EX_MISSING_FIELD = "MISSING_REQUIRED_FIELD"
 EX_DUPLICATE = "DUPLICATE_DOCUMENT"
 EX_VENDOR_NOT_FOUND = "VENDOR_NOT_FOUND"
+# Vendor stock orders are invoiced against an existing PO. If the number on the
+# invoice does not resolve, there is nothing to attach to.
+EX_PO_NOT_FOUND = "PO_NOT_FOUND"
+EX_AMOUNT_MISMATCH = "AMOUNT_MISMATCH"
 EX_UNBALANCED = "UNBALANCED_ENTRY"
+# The parts read off an invoice do not add up to its total. Either OCR misread
+# the page or the invoice itself does not add up -- either way a person has to
+# look, so nothing is posted.
+EX_LINE_ITEMS_MISMATCH = "LINE_ITEMS_MISMATCH"
+# Nothing readable to itemise. A journal entry lists one line per part, so it
+# cannot be built from the invoice total alone.
+EX_NO_LINE_ITEMS = "NO_LINE_ITEMS"
 EX_TEKION_ERROR = "TEKION_ERROR"
 # Tekion answered, and the answer was no. Distinct from TEKION_ERROR because a
 # rejection is final — retrying re-runs OCR and asks the same question again.
@@ -94,7 +105,11 @@ _SEVERITY = {
     EX_MISSING_FIELD: "HIGH",
     EX_DUPLICATE: "LOW",
     EX_VENDOR_NOT_FOUND: "HIGH",
+    EX_PO_NOT_FOUND: "HIGH",
+    EX_AMOUNT_MISMATCH: "HIGH",
     EX_UNBALANCED: "HIGH",
+    EX_LINE_ITEMS_MISMATCH: "HIGH",
+    EX_NO_LINE_ITEMS: "HIGH",
     EX_TEKION_ERROR: "HIGH",
     EX_TEKION_REJECTED: "HIGH",
 }
@@ -172,11 +187,87 @@ def _resolve_source(doc: Document) -> str | None:
     return None
 
 
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _split_batch(doc: Document, source: str, session: Session) -> bool:
+    """Break a batch scan into one child document per invoice.
+
+    Returns True when the document was split and this run is finished — the
+    children are queued and the workers pick them up as ordinary jobs.
+
+    Splitting wrongly would post invented invoices to Tekion, so every doubt
+    resolves to "not a batch": a single segment, an unreadable file, or a
+    segmentation the splitter would not vouch for all fall through to the
+    normal single-document path.
+    """
+    if document_splitter.page_count(source) < 2:
+        return False
+
+    try:
+        segments = document_splitter.segment_documents(source)
+    except Exception as e:  # noqa: BLE001 — never fail a job over segmentation
+        print(f"[SPLIT] {doc.id} segmentation error ({e}); processing as one document")
+        return False
+
+    if len(segments) < 2:
+        return False
+
+    print(f"[SPLIT] {doc.id} holds {len(segments)} invoices:")
+    for seg in segments:
+        print(f"[SPLIT]   {seg}")
+
+    try:
+        written = document_splitter.split_pdf(source, segments)
+    except Exception as e:  # noqa: BLE001
+        print(f"[SPLIT] {doc.id} could not be split ({e}); processing as one document")
+        return False
+
+    for index, (seg, path, digest) in enumerate(written, start=1):
+        session.add(
+            Document(
+                file_name=document_splitter.child_file_name(doc.file_name, seg, index),
+                s3_key=doc.s3_key,
+                source_path=path,
+                file_hash=digest,
+                dealership_name=doc.dealership_name,
+                # The folder decides the flow, so children inherit it — the
+                # batch was dropped into one folder deliberately.
+                po_type=doc.po_type,
+                status=job_queue.STATUS_QUEUED,
+                split_from=doc.id,
+                page_range=(
+                    str(seg.page_start)
+                    if seg.page_count == 1
+                    else f"{seg.page_start}-{seg.page_end}"
+                ),
+            )
+        )
+
+    # The parent is a container, not work. Terminal, so nothing reclaims it.
+    doc.status = job_queue.STATUS_SPLIT
+    doc.processed_at = _utcnow()
+    doc.locked_by = ""
+    doc.next_attempt_at = None
+    session.add(doc)
+    session.commit()
+    print(f"[SPLIT] {doc.id} -> SPLIT into {len(written)} queued documents")
+    return True
+
+
 def _run(doc: Document, session: Session) -> None:
     # ── 1. Locate the file ───────────────────────────────────────────────────
     source = _resolve_source(doc)
     if not source:
         _fail(session, doc, EX_FILE_MISSING, error=f"no readable source for {doc.file_name!r}")
+        return
+
+    # ── 1b. Split a batch scan before OCR ────────────────────────────────────
+    # OCR describes one document, so several invoices in one file have to become
+    # several documents first. Children are never re-segmented.
+    if not doc.split_from and _split_batch(doc, source, session):
         return
 
     # ── 2. OCR ───────────────────────────────────────────────────────────────
@@ -222,6 +313,10 @@ def _run(doc: Document, session: Session) -> None:
     # ── 5. Dispatch on the folder ────────────────────────────────────────────
     if doc.po_type == FOLDER_OEM:
         _run_journal_entry(doc, ocr, session)
+    elif doc.po_type == FOLDER_STOCK:
+        # A vendor stock order is not created here — the PO already exists and
+        # the invoice arrives afterwards to be attached to it.
+        _run_stock_pre_invoice(doc, ocr, session, source)
     else:
         # `source` is handed on so the PO flow can attach the invoice PDF to the
         # pre-invoice — we already have the file, so there is no reason not to.
@@ -259,6 +354,10 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         invoice_date=invoice_date,
         invoice_amount=invoice_amount,
         dealership_name=doc.dealership_name,
+        # Each part becomes its own debit line on the entry.
+        line_items=ocr_helpers.get_raw_line_items(ocr),
+        # A GL account written on the invoice outranks anything we infer.
+        invoice_gl_account=ocr_helpers.get_document_gl_account(ocr),
     )
 
     try:
@@ -272,6 +371,16 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         _fail(session, doc, EX_TEKION_ERROR, error=str(e))
         return
 
+    # Checked before `balanced`: a refused entry never got as far as balancing,
+    # so "balance $0.00" would be a confusing thing to show someone.
+    if result.line_items_mismatch:
+        _fail(
+            session,
+            doc,
+            EX_NO_LINE_ITEMS if result.no_line_items else EX_LINE_ITEMS_MISMATCH,
+            error="; ".join(result.notes) or "invoice parts do not match the total",
+        )
+        return
     if not result.balanced:
         _fail(session, doc, EX_UNBALANCED, error=f"balance ${result.balance:.2f}")
         return
@@ -286,7 +395,96 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
     print(f"[PIPE] {doc.id} -> PROCESSED (JE {doc.transaction_number}, {result.status})")
 
 
-# ── SUBLET / MISCELLANEOUS / STOCK -> Purchase order ─────────────────────────
+# ── STOCK -> pre-invoice an existing vendor stock order ──────────────────────
+
+
+def _run_stock_pre_invoice(
+    doc: Document,
+    ocr: dict[str, Any],
+    session: Session,
+    source_path: str | None = None,
+) -> None:
+    """Attach the invoice to the purchase order it names, and pre-invoice it."""
+    from api.routes.tekion import get_client, reset_client
+    from api.services.vso_po_creation import (
+        ExpectedStockInvoice,
+        pre_invoice_stock_order,
+    )
+
+    po_number = ocr_helpers.get_po_number(ocr)
+    invoice_number = doc.invoice_number
+    total = ocr_helpers.get_total_amount(ocr)
+    sales_tax = ocr_helpers.get_sales_tax(ocr)
+
+    # The PO number is what makes this flow possible at all.
+    if not po_number:
+        _fail(
+            session,
+            doc,
+            EX_PO_NOT_FOUND,
+            error="No purchase order number could be read from the invoice",
+        )
+        return
+    if not invoice_number or not total:
+        _fail(session, doc, EX_MISSING_FIELD, error="missing invoice number or total")
+        return
+
+    # Record it now so the row shows which PO this is about, even if the run
+    # fails later.
+    doc.po_number = po_number
+    session.add(doc)
+    session.commit()
+
+    expected = ExpectedStockInvoice(
+        po_number=po_number,
+        invoice_number=invoice_number,
+        invoice_amount=total,
+        sales_tax=sales_tax,
+        dealership_name=doc.dealership_name,
+        invoice_date=ocr_helpers.get_invoice_date(ocr) or None,
+        invoice_file_path=source_path,
+        invoice_file_name=doc.file_name or None,
+        # Only consulted if Tekion has no GL accounts of its own for these parts.
+        gl_account=ocr_helpers.get_document_gl_account(ocr),
+    )
+
+    try:
+        with tekion_scope():
+            client = get_client(session)
+            result = pre_invoice_stock_order(client, expected, dry_run=False)
+    except Exception as e:  # noqa: BLE001
+        print(f"[PIPE] {doc.id} stock pre-invoice failed: {e}")
+        reset_client()
+        _fail(session, doc, EX_TEKION_ERROR, error=str(e))
+        return
+
+    if not result.po_id:
+        _fail(
+            session,
+            doc,
+            EX_PO_NOT_FOUND,
+            error="; ".join(result.notes) or f"PO {po_number} not found",
+        )
+        return
+    if result.discrepancies:
+        _fail(
+            session,
+            doc,
+            EX_AMOUNT_MISMATCH,
+            error="; ".join(str(d) for d in result.discrepancies),
+        )
+        return
+    if not result.posted:
+        _fail(session, doc, EX_TEKION_ERROR, error="; ".join(result.notes) or "not posted")
+        return
+
+    doc.po_number = result.po_number or po_number
+    doc.vendor_name = result.vendor_name or doc.vendor_name
+    job_queue.complete(session, doc)
+    print(f"[PIPE] {doc.id} -> PROCESSED (pre-invoiced PO {doc.po_number})")
+
+
+# ── SUBLET / MISCELLANEOUS -> Purchase order ─────────────────────────────────
 
 
 def _run_purchase_order(
