@@ -19,6 +19,7 @@ CREDENTIALS
 """
 from __future__ import annotations
 
+import mimetypes
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +30,25 @@ from botocore.client import Config as BotoConfig
 from api.config import settings
 
 ALLOWED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
+
+# boto3's upload_file does not infer a content type, so without this every
+# archived file lands as binary/octet-stream and the browser downloads it
+# instead of showing it in the viewer.
+_CONTENT_TYPES = {
+    ".pdf": "application/pdf",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".bmp": "image/bmp",
+    ".tiff": "image/tiff",
+    ".tif": "image/tiff",
+    ".webp": "image/webp",
+}
+
+
+def _content_type_for(key: str) -> str:
+    ext = Path(key).suffix.lower()
+    return _CONTENT_TYPES.get(ext) or mimetypes.guess_type(key)[0] or "application/octet-stream"
 
 
 def _get_s3_client():
@@ -126,8 +146,13 @@ def is_configured() -> bool:
 
 
 def upload_file(local_path: str | Path, s3_key: str) -> None:
-    """Upload a local file to S3 under `s3_key`."""
-    _get_s3_client().upload_file(str(local_path), settings.s3_bucket, s3_key)
+    """Upload a local file to S3 under `s3_key`, tagged with its real type."""
+    _get_s3_client().upload_file(
+        str(local_path),
+        settings.s3_bucket,
+        s3_key,
+        ExtraArgs={"ContentType": _content_type_for(s3_key)},
+    )
 
 
 def download_file(s3_key: str, local_path: str | Path) -> None:
@@ -140,10 +165,20 @@ def download_file(s3_key: str, local_path: str | Path) -> None:
 
 
 def generate_download_url(s3_key: str) -> str:
-    """Generate a temporary GET URL for downloading a file from S3."""
+    """A temporary GET URL for a file, served for viewing rather than download.
+
+    The response overrides force the right type and `inline` disposition even
+    for objects that were stored as octet-stream, so the detail-page viewer
+    renders the invoice instead of the browser saving it.
+    """
     client = _get_s3_client()
     return client.generate_presigned_url(
         "get_object",
-        Params={"Bucket": settings.s3_bucket, "Key": s3_key},
+        Params={
+            "Bucket": settings.s3_bucket,
+            "Key": s3_key,
+            "ResponseContentType": _content_type_for(s3_key),
+            "ResponseContentDisposition": "inline",
+        },
         ExpiresIn=settings.s3_presign_expiry,
     )
