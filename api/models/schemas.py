@@ -340,6 +340,7 @@ class PipelineFolder(str, Enum):
     MISCELLANEOUS = "MISCELLANEOUS"
     STOCK = "STOCK"
     OEM = "OEM"
+    VEHICLE_MANUFACTURING = "VEHICLE_MANUFACTURING"
 
 
 class PipelineAcceptedResponse(BaseModel):

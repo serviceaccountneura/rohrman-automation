@@ -6,7 +6,8 @@ GET  /api/pipeline/queue          — queue depth by status
 GET  /api/pipeline/folders        — the folders the frontend can upload into
 
 The folder decides which Tekion flow runs (see api/services/pipeline_service.py):
-SUBLET / MISCELLANEOUS / STOCK create a purchase order, OEM creates a journal
+SUBLET / MISCELLANEOUS / STOCK create a purchase order; OEM and
+VEHICLE_MANUFACTURING create a journal
 entry saved as a draft.
 
 Upload only enqueues: it writes the file, creates the `documents` row as QUEUED,
@@ -63,7 +64,7 @@ async def process_upload(
     session: Annotated[Session, Depends(get_session)],
     current_user: CurrentUserDep,
     file: UploadFile = File(...),
-    folder: str = Form(..., description="SUBLET | MISCELLANEOUS | STOCK | OEM"),
+    folder: str = Form(..., description="SUBLET | MISCELLANEOUS | STOCK | OEM | VEHICLE_MANUFACTURING"),
     dealership_name: str = Form("", description="Dealership the invoice belongs to"),
 ) -> PipelineAcceptedResponse:
     """Upload an invoice into a folder and queue it for processing."""

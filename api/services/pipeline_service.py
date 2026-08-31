@@ -7,6 +7,8 @@ upload folder decides which Tekion flow runs:
     MISCELLANEOUS  -> Misc PO     + pre-invoice   (api/routes/tekion.py)
     STOCK          -> Vendor stock order          (api/routes/tekion.py)
     OEM            -> Journal entry, saved as draft (api/services/je_creation.py)
+    VEHICLE_MANUFACTURING -> Vehicle purchase journal entry from a
+                      per-manufacturer template (api/services/vmi_je_creation.py)
 
 None of those flows are reimplemented here — this module calls the existing
 functions unchanged.
@@ -48,8 +50,13 @@ FOLDER_SUBLET = "SUBLET"
 FOLDER_MISC = "MISCELLANEOUS"
 FOLDER_STOCK = "STOCK"
 FOLDER_OEM = "OEM"
+# Vehicle manufacturer invoices (Kia, Ford, Honda, Toyota). A journal entry
+# like OEM, but built from a per-manufacturer template rather than the invoice
+# total -- one car produces seven lines across inventory, notes payable and
+# receivables. See api/services/vmi_je_creation.py.
+FOLDER_VMI = "VEHICLE_MANUFACTURING"
 
-VALID_FOLDERS = {FOLDER_SUBLET, FOLDER_MISC, FOLDER_STOCK, FOLDER_OEM}
+VALID_FOLDERS = {FOLDER_SUBLET, FOLDER_MISC, FOLDER_STOCK, FOLDER_OEM, FOLDER_VMI}
 
 # Aliases so the frontend can send the friendlier folder names.
 _FOLDER_ALIASES = {
@@ -61,6 +68,9 @@ _FOLDER_ALIASES = {
     "OEM": FOLDER_OEM,
     "PARTS_STMT": FOLDER_OEM,
     "MANUFACTURER": FOLDER_OEM,
+    "VEHICLE_MANUFACTURING": FOLDER_VMI,
+    "VEHICLE_MANUFACTURER": FOLDER_VMI,
+    "VMI": FOLDER_VMI,
 }
 
 
@@ -94,6 +104,10 @@ EX_LINE_ITEMS_MISMATCH = "LINE_ITEMS_MISMATCH"
 # Nothing readable to itemise. A journal entry lists one line per part, so it
 # cannot be built from the invoice total alone.
 EX_NO_LINE_ITEMS = "NO_LINE_ITEMS"
+# The vehicle flow refused to build an entry: no template for the manufacturer,
+# or an amount the template needs was never written on the invoice. Not an
+# error -- a document that needs a human step before it can be processed.
+EX_VMI_REFUSED = "VEHICLE_ENTRY_REFUSED"
 EX_TEKION_ERROR = "TEKION_ERROR"
 # Tekion answered, and the answer was no. Distinct from TEKION_ERROR because a
 # rejection is final — retrying re-runs OCR and asks the same question again.
@@ -311,7 +325,9 @@ def _run(doc: Document, session: Session) -> None:
             return
 
     # ── 5. Dispatch on the folder ────────────────────────────────────────────
-    if doc.po_type == FOLDER_OEM:
+    if doc.po_type == FOLDER_VMI:
+        _run_vehicle_journal_entry(doc, ocr, session)
+    elif doc.po_type == FOLDER_OEM:
         _run_journal_entry(doc, ocr, session)
     elif doc.po_type == FOLDER_STOCK:
         # A vendor stock order is not created here — the PO already exists and
@@ -393,6 +409,84 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
     doc.journal_id = result.journal_id or ""
     job_queue.complete(session, doc)
     print(f"[PIPE] {doc.id} -> PROCESSED (JE {doc.transaction_number}, {result.status})")
+
+
+# ── VEHICLE_MANUFACTURING -> Auto Posting journal entry ──────────────────────
+
+
+def _run_vehicle_journal_entry(
+    doc: Document, ocr: dict[str, Any], session: Session
+) -> None:
+    """Vehicle manufacturer invoice -> journal entry from a template.
+
+    Unlike the OEM flow this does not derive the entry from the invoice total.
+    The manufacturer decides the shape of the entry, and several of its amounts
+    are only on the page because a clerk wrote them there. When one is missing
+    the document is failed rather than approximated -- see vmi_je_creation.
+    """
+    from api.routes.tekion import get_client, reset_client
+    from api.services import vmi_helpers
+    from api.services.vmi_je_creation import create_vehicle_journal_entry
+
+    facts = vmi_helpers.build_facts(ocr, doc.dealership_name)
+
+    missing = [
+        name
+        for name, value in (
+            ("invoice_number", facts.invoice_number),
+            ("invoice_date", facts.invoice_date),
+        )
+        if not value
+    ]
+    if missing:
+        _fail(session, doc, EX_MISSING_FIELD, error=f"missing: {', '.join(missing)}")
+        return
+
+    print(
+        f"[PIPE] {doc.id} vehicle invoice: {facts.manufacturer or '(unknown make)'} "
+        f"stock={facts.stock_number or '-'} vin={facts.vin or '-'} "
+        f"cost={facts.dealer_cost_total:.2f} annotated={facts.annotated_amounts}"
+    )
+
+    try:
+        # Serialized: the flow switches dealership on the shared client.
+        with tekion_scope():
+            client = get_client(session)
+            result = create_vehicle_journal_entry(client, facts, dry_run=False)
+    except Exception as e:  # noqa: BLE001
+        print(f"[PIPE] {doc.id} vehicle journal entry failed: {e}")
+        reset_client()
+        _fail(session, doc, EX_TEKION_ERROR, error=str(e))
+        return
+
+    # Checked before the balance: a refused entry never reached the balance
+    # check, so reporting "balance $0.00" would be misleading.
+    if result.refusal:
+        _fail(session, doc, EX_VMI_REFUSED, error=result.refusal)
+        return
+    if result.problems:
+        _fail(
+            session,
+            doc,
+            EX_VMI_REFUSED,
+            error="; ".join(str(p) for p in result.problems),
+        )
+        return
+    if not result.balanced:
+        _fail(session, doc, EX_UNBALANCED, error=f"balance ${result.balance:.2f}")
+        return
+    if not result.saved:
+        _fail(session, doc, EX_TEKION_ERROR, error="draft was not saved")
+        return
+
+    doc.transaction_id = result.transaction_id or ""
+    doc.transaction_number = result.transaction_number or ""
+    doc.journal_id = result.journal_id or ""
+    job_queue.complete(session, doc)
+    print(
+        f"[PIPE] {doc.id} -> PROCESSED "
+        f"(vehicle JE {doc.transaction_number}, {len(result.postings)} lines)"
+    )
 
 
 # ── STOCK -> pre-invoice an existing vendor stock order ──────────────────────
