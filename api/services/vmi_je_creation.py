@@ -628,6 +628,11 @@ def create_vehicle_journal_entry(
         return result
 
     # ── Dealer context ───────────────────────────────────────────────────────
+    # Belt and braces: the pipeline already wraps this call in `dealer_scope`,
+    # which switches inside the Tekion lock. This repeat covers the other
+    # callers -- the dry-run script, a future route -- because the cost of
+    # getting it wrong is posting one store's money into another's books.
+    #
     # THIS IS LOAD-BEARING. The Tekion client is a singleton whose dealership is
     # mutable state, so current_dealer_id is whatever the LAST job left it at.
     # Omitting this switch made a Schaumburg Kia invoice read Schaumburg Honda's

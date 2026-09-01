@@ -42,7 +42,7 @@ from api.db import engine
 from api.models.db import Document
 from api.services import document_splitter, job_queue, ocr_helpers, s3_service
 from api.services.ocr_service import extract_document
-from api.services.tekion_lock import tekion_scope
+from api.services.tekion_lock import dealer_scope, tekion_scope
 
 # ── Folders the frontend can upload into ─────────────────────────────────────
 
@@ -454,8 +454,11 @@ def _run_vehicle_journal_entry(
     print(f"[PIPE] {doc.id} ocr.handwritten_notes={ocr.get('handwritten_notes')}")
 
     try:
-        # Serialized: the flow switches dealership on the shared client.
-        with tekion_scope():
+        # dealer_scope, not tekion_scope: it switches dealership INSIDE the lock,
+        # so no other job can retarget the shared client between the switch and
+        # the calls that follow. Using the bare lock here read another store's
+        # templates entirely -- see vmi_je_creation's dealer note.
+        with dealer_scope(get_client(session), doc.dealership_name):
             client = get_client(session)
             result = create_vehicle_journal_entry(client, facts, dry_run=False)
     except Exception as e:  # noqa: BLE001
