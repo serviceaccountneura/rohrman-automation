@@ -446,38 +446,48 @@ class VehicleJournalEntryService:
             order += 1
         return postings
 
-    # Tekion's own Control 2 vocabulary, from the journal entry screen. The
-    # captured template left control2Type null, so this only takes effect on
-    # templates where a store has set it; everything else keys off the stock
-    # number, which is what the majority of lines use.
-    _CONTROL2 = {
-        "LASTSIXOFVIN": Control.LAST_SIX_VIN,
-        "LASTSIXVIN": Control.LAST_SIX_VIN,
-        "LASTEIGHTOFVIN": Control.LAST_EIGHT_VIN,
-        "LASTEIGHTVIN": Control.LAST_EIGHT_VIN,
-        "FULLVIN": Control.FULL_VIN,
+    # What a line's control should be, from the template's own refType. This is
+    # the field that actually carries the answer:
+    #
+    #   VEHICLE   -> the stock number      (N/P, inventory)
+    #   FULL_VIN  -> the whole VIN         (KRS receivable)
+    #   CUSTOM    -> free text; see below
+    #
+    # An earlier version read control2Type instead, which Tekion returns as null
+    # on every template line, so every control silently became the stock number
+    # -- including the two lines that must not be.
+    _CONTROL_BY_REF_TYPE = {
+        LINE_REF_TYPE_VEHICLE: Control.STOCK,
+        "FULL_VIN": Control.FULL_VIN,
         "VIN": Control.FULL_VIN,
-        "STK": Control.STOCK,
-        "STKNUMBER": Control.STOCK,
-        "STOCKNUMBER": Control.STOCK,
+        "LAST_SIX_VIN": Control.LAST_SIX_VIN,
+        "LAST_EIGHT_VIN": Control.LAST_EIGHT_VIN,
+    }
+
+    # CUSTOM lines are free text, so the account decides. Holdback keys off the
+    # last six of the VIN -- that is what the finished Kia entry carries, and
+    # what the Control 2 column labels "LAST SIX OF VIN". Every other CUSTOM
+    # line on that entry uses the stock number.
+    _CONTROL_BY_ROLE = {
+        vmi_template.ROLE_HOLDBACK: Control.LAST_SIX_VIN,
     }
 
     @classmethod
     def _control_for(cls, line: Any, facts: VehicleInvoiceFacts) -> str:
         """The control value for one filled line.
 
-        Tekion carries this per line as `control2Type` -- the Control 2 column
-        reads "LAST SIX OF VIN", "FULL VIN" or "STK #" on the journal entry
-        screen. Where a store has set it we follow it. Where it is null we use
-        the stock number, which is what most lines use and what the transaction
-        itself is referenced by.
+        Falls back to the stock number when a VIN-keyed line has no readable
+        VIN: an empty control reconciles to nothing, which is worse than a
+        coarse one.
         """
-        raw = re.sub(r"[^A-Z]", "", str(getattr(line, "control2_type", "") or "").upper())
-        kind = cls._CONTROL2.get(raw, Control.STOCK)
-        control = resolve_control(kind, facts)
-        # A VIN-keyed line on an invoice with no readable VIN falls back rather
-        # than posting an empty control, which reconciles to nothing.
-        return control or facts.stock_number
+        ref_type = str(getattr(line, "ref_type", "") or "").upper()
+        kind = cls._CONTROL_BY_REF_TYPE.get(ref_type)
+        if kind is None:
+            role = vmi_template.role_of(
+                getattr(line, "description", ""), getattr(line, "description", "")
+            )
+            kind = cls._CONTROL_BY_ROLE.get(role, Control.STOCK)
+        return resolve_control(kind, facts) or facts.stock_number
 
     @classmethod
     def build_postings_from_template(
@@ -745,7 +755,7 @@ def create_vehicle_journal_entry(
     for p in postings:
         print(
             f"[VMI]   {p['_glAccountNumber']:>6}  {p['amount']:>13,.2f}  "
-            f"{p['_control']:<20} {p['_source']}"
+            f"{p['_control']:<20} {p['refType']:<9} {p['_source']}"
         )
 
     if not result.balanced:
