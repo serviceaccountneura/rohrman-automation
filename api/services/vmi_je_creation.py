@@ -102,13 +102,12 @@ _TEMPLATES_PATH = "/api/accounting/u/v2/transaction/upc/templates"
 # "NEW VEHICLE" and "2024 HONDA PROLOGUE". Journal number alone does not
 # identify one there, so name the intended template per dealer here. Without an
 # entry the flow refuses and lists the candidates rather than picking one.
-TEMPLATE_PREFERENCE: dict[str, str] = {
-    # Bob Rohrman Schaumburg Kia. Its Tekion also carries a "2024 HONDA
-    # PROLOGUE" template on journal 70, which the store says is not theirs --
-    # a stray configuration, not a second real option. Named here so the flow
-    # stops asking.
-    "1707": "NEW VEHICLE",
-}
+# Empty, and it should stay that way unless a store genuinely keeps two
+# journal-70 templates. An entry was briefly added here for 1707/"NEW VEHICLE"
+# on the belief that it was Schaumburg Kia's; it was Schaumburg Honda's, seen
+# only because the dealer switch above was missing. Schaumburg Kia has exactly
+# one journal-70 template, "BILL".
+TEMPLATE_PREFERENCE: dict[str, str] = {}
 
 _REF_TEXT_MAX = 50
 
@@ -628,8 +627,25 @@ def create_vehicle_journal_entry(
         )
         return result
 
+    # ── Dealer context ───────────────────────────────────────────────────────
+    # THIS IS LOAD-BEARING. The Tekion client is a singleton whose dealership is
+    # mutable state, so current_dealer_id is whatever the LAST job left it at.
+    # Omitting this switch made a Schaumburg Kia invoice read Schaumburg Honda's
+    # templates, and had the accounts happened to match it would have posted a
+    # Kia purchase into Honda's books. Every flow that touches Tekion switches
+    # first; this one has to as well.
+    if facts.dealership_name:
+        dealer_id = client.find_dealer_by_name(facts.dealership_name)
+        if not dealer_id:
+            result.refusal = (
+                f"could not match dealership {facts.dealership_name!r} in Tekion"
+            )
+            return result
+        client.switch_dealer(dealer_id)
+
     dealer_id = client.current_dealer_id
     result.dealer_id = dealer_id
+    print(f"[VMI] dealer {dealer_id} ({facts.dealership_name or 'from client'})")
     service = VehicleJournalEntryService(client)
 
     tekion_template, template_problem = service.find_template(dealer_id)
