@@ -532,6 +532,20 @@ class VehicleJournalEntryService:
             "assetAttachmentDto": {"attachments": []},
         }
 
+    def chart_by_account_id(self) -> dict[str, dict[str, Any]]:
+        """The dealership's chart of accounts, keyed by account_id.
+
+        Needed because a template line carries only `glAccountId`, and that id
+        is NOT the account number despite looking like one -- 1710_2246 is
+        account 2245. Without this the flow matches the clerk's handwriting
+        against accounts one digit off.
+        """
+        return {
+            str(a.get("account_id")): a
+            for a in self._je.gl_accounts()
+            if a.get("account_id")
+        }
+
     def fetch_templates(self) -> list[dict[str, Any]]:
         """Every auto-posting template configured at the current dealership."""
         res = self.client._req_json(
@@ -666,15 +680,19 @@ def create_vehicle_journal_entry(
     # The template's own lines. Printed because the captured template list was
     # truncated by the capture's body cap, so this is the only reliable view of
     # what a store actually has configured.
+    _chart = service.chart_by_account_id()
     for tp in tekion_template.get("postings") or []:
+        acc = _chart.get(str(tp.get("glAccountId"))) or {}
         print(
             f"[VMI]   template line {str(tp.get('glAccountId')):<14} "
+            f"-> GL {str(acc.get('account_number') or '?'):<7} "
             f"preset={float(tp.get('amount') or 0):>11,.2f}  "
-            f"{tp.get('refType')}  {tp.get('description')}"
+            f"{tp.get('refType'):<9} {acc.get('account_name') or tp.get('description')}"
         )
 
+    chart = service.chart_by_account_id()
     filled = vmi_template.fill(
-        tekion_template, facts.gl_annotations, facts.dealer_cost_total
+        tekion_template, facts.gl_annotations, facts.dealer_cost_total, chart
     )
 
     # An annotation with nowhere to go is the clearest possible signal that this

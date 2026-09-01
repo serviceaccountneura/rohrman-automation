@@ -51,10 +51,13 @@ ROLE_HOLDBACK = "holdback"
 ROLE_FLOOR_PLAN = "floor_plan"
 ROLE_INVOICE_PRICE = "invoice_price"
 
+# Matched against the template line's description AND the GL account's own name
+# from the chart. The names are what carry the meaning in practice:
+# "HOLDBACK RECEIVABLE-KIA", "N/P NEW VEHICLE & DEMOS", "NEW INV - KIA".
 _ROLE_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (ROLE_HOLDBACK, ("holdback", "holdbk")),
-    (ROLE_FLOOR_PLAN, ("floorplan", "floorplanamount", "notepayable", "npnewvehicle")),
-    (ROLE_INVOICE_PRICE, ("invoiceprice", "vehicleinvoiceprice", "newinv", "inventory")),
+    (ROLE_FLOOR_PLAN, ("floorplan", "notepayable", "npnewvehicle", "npnew")),
+    (ROLE_INVOICE_PRICE, ("invoiceprice", "newinv", "inventory")),
 )
 
 
@@ -62,20 +65,44 @@ def _normalise(text: Any) -> str:
     return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
 
 
-def role_of(description: Any) -> str:
-    flat = _normalise(description)
-    if not flat:
-        return ""
-    for role, hints in _ROLE_HINTS:
-        if any(hint in flat for hint in hints):
-            return role
+def role_of(*texts: Any) -> str:
+    """Which role a line plays, from any text that describes it.
+
+    Takes several candidates because a template's own `description` is usually
+    null -- Schaumburg Kia's BILL has none at all -- and the GL account NAME
+    from the chart is what actually says what the line is for:
+    "N/P NEW VEHICLE & DEMOS" is the floor plan, "NEW INV - KIA" the inventory.
+    """
+    for text in texts:
+        flat = _normalise(text)
+        if not flat:
+            continue
+        for role, hints in _ROLE_HINTS:
+            if any(hint in flat for hint in hints):
+                return role
     return ""
 
 
-def gl_number_of(gl_account_id: Any) -> str:
-    """"1707_2245" -> "2245". Tekion prefixes every account id with the dealer."""
-    text = str(gl_account_id or "")
-    return text.split("_", 1)[1] if "_" in text else text
+def gl_number_of(gl_account_id: Any, chart: dict[str, dict[str, Any]] | None = None) -> str:
+    """The ACCOUNT NUMBER for a template line's glAccountId.
+
+    Read this before changing it: glAccountId is NOT the account number, even
+    though it is built to look exactly like one. Schaumburg Kia's holdback line
+    comes back as "1710_2246" and the account it posts to is 2245 -- the id and
+    the number are simply different values that happen to share a shape.
+
+    Splitting the id was how this module started, and it silently mismatched
+    every annotation against an account one digit away from the right one. So
+    the chart of accounts is the only real answer; the split remains as a
+    fallback for callers with no chart, and is wrong often enough that it should
+    never be relied on for a posting decision.
+    """
+    key = str(gl_account_id or "")
+    if chart:
+        entry = chart.get(key)
+        if entry:
+            return str(entry.get("account_number") or "")
+    return key.split("_", 1)[1] if "_" in key else key
 
 
 # ── Result of filling one template ───────────────────────────────────────────
@@ -109,17 +136,21 @@ def fill(
     template: dict[str, Any],
     annotations: dict[str, float],
     dealer_cost_total: float,
+    chart: dict[str, dict[str, Any]] | None = None,
 ) -> FillResult:
     """Fill one Tekion template from one invoice's annotations.
 
     `template` is a raw template object from
     POST /api/accounting/u/v2/transaction/upc/templates.
     `annotations` maps a GL account number to the positive amount written
-    against it.
+    against it. `chart` maps glAccountId to the account's own record, and is
+    what turns a template line's opaque id into the number the clerk wrote.
     """
     result = FillResult()
     postings = template.get("postings") or []
     used: set[str] = set()
+    # Roles are one-shot: see the note where they are applied.
+    roles_filled: set[str] = set()
 
     # A template line's sign is carried by its preset amount where it has one,
     # and by its role otherwise. Mirror lines are matched by their partner's
@@ -128,14 +159,15 @@ def fill(
     for p in postings:
         by_description.setdefault(str(p.get("description") or ""), []).append(p)
 
-    holdback = annotations.get(_account_for_role(postings, ROLE_HOLDBACK), None)
+    holdback = annotations.get(_account_for_role(postings, ROLE_HOLDBACK, chart), None)
 
     for p in postings:
-        gl = gl_number_of(p.get("glAccountId"))
+        gl = gl_number_of(p.get("glAccountId"), chart)
         description = str(p.get("description") or "")
+        account_name = _account_name(p.get("glAccountId"), chart)
         preset = p.get("amount")
         preset = None if preset is None else round(float(preset), 2)
-        role = role_of(description)
+        role = role_of(description, account_name)
 
         amount: float | None = None
         source = ""
@@ -155,23 +187,33 @@ def fill(
         # 2. A mirror of a line that was annotated: "DMA_" follows "DMA".
         elif description.endswith("_") and description[:-1] in by_description:
             partner = by_description[description[:-1]][0]
-            partner_gl = gl_number_of(partner.get("glAccountId"))
+            partner_gl = gl_number_of(partner.get("glAccountId"), chart)
             if partner_gl in annotations:
                 # The mirror always opposes its partner, which is the whole
                 # point of the pair: DMA 150.00 against DMA_ -150.00.
                 amount = -abs(annotations[partner_gl]) * _sign_for(
-                    role_of(partner.get("description")), partner.get("amount")
+                    role_of(
+                        partner.get("description"),
+                        _account_name(partner.get("glAccountId"), chart),
+                    ),
+                    partner.get("amount"),
                 )
                 source = f"mirrors {partner_gl}"
 
         # 3. A role the template describes, computed from the invoice.
-        if amount is None and role and dealer_cost_total:
+        #
+        # Only the FIRST line playing a role takes it. BILL lists 2320 NEW INV
+        # twice -- once for the vehicle itself and once for the DOC fee -- and
+        # filling both from the same rule posted the price of the car twice.
+        if amount is None and role and dealer_cost_total and role not in roles_filled:
             if role == ROLE_FLOOR_PLAN:
                 amount = -dealer_cost_total
                 source = "dealer cost (credit)"
+                roles_filled.add(role)
             elif role == ROLE_INVOICE_PRICE and holdback is not None:
                 amount = round(dealer_cost_total - holdback, 2)
                 source = "dealer cost less holdback"
+                roles_filled.add(role)
 
         # 4. Whatever the store preset in the template.
         if amount is None and preset:
@@ -187,7 +229,7 @@ def fill(
                 gl_account_id=str(p.get("glAccountId") or ""),
                 amount=round(amount, 2),
                 ref_type=str(p.get("refType") or "CUSTOM"),
-                description=description,
+                description=description or account_name,
                 source=source,
                 control2_type=str(p.get("control2Type") or ""),
             )
@@ -223,9 +265,18 @@ def _sign_for(role: str, preset: float | None) -> float:
     return 1.0
 
 
-def _account_for_role(postings: list[dict[str, Any]], role: str) -> str:
+def _account_name(gl_account_id: Any, chart: dict[str, dict[str, Any]] | None) -> str:
+    if not chart:
+        return ""
+    entry = chart.get(str(gl_account_id or "")) or {}
+    return str(entry.get("account_name") or "")
+
+
+def _account_for_role(
+    postings: list[dict[str, Any]], role: str, chart: dict[str, dict[str, Any]] | None
+) -> str:
     """The GL number of the template line playing `role`, or "" if none does."""
     for p in postings:
-        if role_of(p.get("description")) == role:
-            return gl_number_of(p.get("glAccountId"))
+        if role_of(p.get("description"), _account_name(p.get("glAccountId"), chart)) == role:
+            return gl_number_of(p.get("glAccountId"), chart)
     return ""
