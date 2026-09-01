@@ -13,11 +13,6 @@ GUIDELINES:
 - EMPTY/MISSING: where the OCR shows a dash "-" or a blank for a value, use JSON null.
 - Split combined vendor codes: "1711_6028 NAPA AUTO PARTS" -> {"id": "1711_6028", "name": "NAPA AUTO PARTS"}.
 - Use ONLY information present in the OCR text. Do not invent values. The OCR marks handwriting with "(handwritten)" — keep the value but you may strip that marker.
-- HANDWRITTEN GL ANNOTATIONS (vehicle manufacturer invoices especially): staff write a GL ACCOUNT NUMBER (4-5 digits) on the page and draw an arrow to the AMOUNT that belongs in that account. Capture every one as a "gl_annotations" array of objects with keys "gl_account" (string of digits, as written), "amount" (JSON number), and "source" (the printed text the arrow points at, verbatim).
-  * The amount is often EMBEDDED in a printed reference code rather than shown as a dollar figure. In "1001948819-KAC0780KAC-KRS0290-FPA0156", "KAC0780KAC" carries 780.00 and "KRS0290" carries 290.00 — read the digit run next to the code letters and drop leading zeros. Set "source" to the code segment ("KAC0780KAC").
-  * The arrow may instead point at a labelled figure in a totals column (e.g. handwritten "3300" beside TOTAL 32,133.00 → {"gl_account": "3300", "amount": 32133.00, "source": "TOTAL"}).
-  * Report the amount as a POSITIVE number. Whether it is a debit or a credit is decided downstream, not here.
-  * Do NOT put stock numbers, VINs, dealer codes or key numbers in this array. Only 4-5 digit values that are clearly account numbers annotated onto the page belong here.
 - Return ONLY the JSON object. No commentary, no markdown fences.
 
 MULTI-PAGE DOCUMENTS (pages are delimited by lines like "===== PAGE n ====="):

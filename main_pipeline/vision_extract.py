@@ -114,6 +114,20 @@ GL ACCOUNTS & SPATIAL BINDING:
   - For fees, discounts, freight, or subtotals outside the main table that have an assigned GL
     code, populate `gl_mappings[]` with: `gl_account`, `amount`, and `mapped_description`
     (e.g. `{"gl_account": "7555", "amount": "15.12", "mapped_description": "Delivery Charge"}`).
+  - ALWAYS populate `gl_mappings[]` for a handwritten GL code that an arrow, line or bracket ties
+    to ANY value on the page -- not only for fees and charges. On a vehicle manufacturer invoice
+    this is the entire point of the annotation, and every handwritten code must appear there.
+  - AMOUNTS EMBEDDED IN REFERENCE CODES: the value an arrow points at is often INSIDE a printed
+    code rather than shown as a dollar figure. In `1001948819-KAC0780KAC-KRS0290-FPA0156`,
+    `KAC0780KAC` carries 780.00 and `KRS0290` carries 290.00: read the digit run beside the
+    letters and drop leading zeros. When a handwritten GL code points at such a segment, emit
+    `{"gl_account": "2245", "amount": "780.00", "mapped_description": "KAC0780KAC"}` -- put the
+    code segment verbatim in `mapped_description` so the reading can be checked.
+  - When a handwritten GL code points instead at a labelled figure in a totals column, use that
+    figure and name the label (e.g. `{"gl_account": "3300", "amount": "32133.00",
+    "mapped_description": "TOTAL dealer cost"}`).
+  - Report `amount` as a POSITIVE number in `gl_mappings[]`. Debit/credit direction is decided
+    downstream, never here.
 
 Return ONLY the JSON object described by the schema. No commentary, no markdown fences.
 """

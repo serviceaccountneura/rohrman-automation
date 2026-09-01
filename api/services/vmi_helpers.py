@@ -201,7 +201,12 @@ def get_gl_annotations(ocr: dict[str, Any]) -> dict[str, float]:
     template's business, not the annotation's.
     """
     found: dict[str, float] = {}
-    for entry in ocr.get("gl_annotations") or []:
+    # gl_mappings[] is the field the vision schema actually defines, and the
+    # prompt's arrow-anchoring rules already aim at it. gl_annotations is
+    # accepted as an alias so a future schema change does not silently return
+    # nothing here.
+    entries = list(ocr.get("gl_mappings") or []) + list(ocr.get("gl_annotations") or [])
+    for entry in entries:
         if not isinstance(entry, dict):
             continue
         account = re.sub(r"[^0-9A-Za-z]", "", str(entry.get("gl_account") or ""))

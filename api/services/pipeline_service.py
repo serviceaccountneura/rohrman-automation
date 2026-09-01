@@ -445,8 +445,13 @@ def _run_vehicle_journal_entry(
     print(
         f"[PIPE] {doc.id} vehicle invoice: {facts.manufacturer or '(unknown make)'} "
         f"stock={facts.stock_number or '-'} vin={facts.vin or '-'} "
-        f"cost={facts.dealer_cost_total:.2f} annotated={facts.annotated_amounts}"
+        f"cost={facts.dealer_cost_total:.2f} annotations={facts.gl_annotations}"
     )
+    # The raw OCR fields this flow depends on. Printed unconditionally because
+    # when nothing is annotated the only useful question is what the model
+    # actually saw, and the OCR result is not persisted anywhere to go back to.
+    print(f"[PIPE] {doc.id} ocr.gl_mappings={ocr.get('gl_mappings')}")
+    print(f"[PIPE] {doc.id} ocr.handwritten_notes={ocr.get('handwritten_notes')}")
 
     try:
         # Serialized: the flow switches dealership on the shared client.
