@@ -103,7 +103,11 @@ _TEMPLATES_PATH = "/api/accounting/u/v2/transaction/upc/templates"
 # identify one there, so name the intended template per dealer here. Without an
 # entry the flow refuses and lists the candidates rather than picking one.
 TEMPLATE_PREFERENCE: dict[str, str] = {
-    # "1707": "NEW VEHICLE",
+    # Bob Rohrman Schaumburg Kia. Its Tekion also carries a "2024 HONDA
+    # PROLOGUE" template on journal 70, which the store says is not theirs --
+    # a stray configuration, not a second real option. Named here so the flow
+    # stops asking.
+    "1707": "NEW VEHICLE",
 }
 
 _REF_TEXT_MAX = 50
@@ -638,6 +642,15 @@ def create_vehicle_journal_entry(
         f"(journal {tekion_template.get('journalId')}), "
         f"annotations {facts.gl_annotations}"
     )
+    # The template's own lines. Printed because the captured template list was
+    # truncated by the capture's body cap, so this is the only reliable view of
+    # what a store actually has configured.
+    for tp in tekion_template.get("postings") or []:
+        print(
+            f"[VMI]   template line {str(tp.get('glAccountId')):<14} "
+            f"preset={float(tp.get('amount') or 0):>11,.2f}  "
+            f"{tp.get('refType')}  {tp.get('description')}"
+        )
 
     filled = vmi_template.fill(
         tekion_template, facts.gl_annotations, facts.dealer_cost_total
