@@ -8,14 +8,37 @@ from sqlalchemy import UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 
+# Timestamps are stored NAIVE, and naive means UTC.
+#
+# That was already the assumption everywhere that reads one back
+# (`exp.replace(tzinfo=timezone.utc)`), but it was not true on write: handing an
+# aware datetime to a TIMESTAMP WITHOUT TIME ZONE column makes psycopg convert
+# it to the session's timezone first and store the local wall clock. On a
+# machine at UTC+5 an invite written to expire in 24 hours came back reading
+# five hours later than intended, and a password reset link that had expired
+# still validated as good.
+#
+# Stripping the offset here makes what is stored match what every reader
+# already believes. It also makes the behaviour identical wherever the app runs,
+# rather than silently depending on the server's timezone.
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _utcnow_plus_hours(hours: int) -> datetime:
     from datetime import timedelta
 
-    return datetime.now(timezone.utc) + timedelta(hours=hours)
+    return _utcnow() + timedelta(hours=hours)
+
+
+def as_utc(value: datetime) -> datetime:
+    """A stored timestamp as an aware UTC datetime."""
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+
+def is_expired(expires_at: datetime) -> bool:
+    """Whether a stored expiry has passed. The one place that decides."""
+    return as_utc(expires_at) < datetime.now(timezone.utc)
 
 
 class User(SQLModel, table=True):
@@ -250,6 +273,28 @@ class Notification(SQLModel, table=True):
     # Optional link to a document
     document_id: UUID | None = Field(default=None, foreign_key="documents.id")
     created_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
+class PasswordReset(SQLModel, table=True):
+    """A single-use link for resetting a forgotten password.
+
+    Its own table rather than columns on User: a reset token is a credential
+    with its own lifetime, and storing it beside the password hash makes it
+    easy to leak one while reading the other.
+
+    Rows are kept after use rather than deleted, so a second click on the same
+    link can be told it was already used instead of "invalid", which is what
+    sends people to support.
+    """
+
+    __tablename__ = "password_resets"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    token: str = Field(index=True, unique=True, max_length=64)
+    user_id: UUID = Field(foreign_key="users.id", index=True)
+    expires_at: datetime
+    used: bool = Field(default=False)
+    created_at: datetime = Field(default_factory=_utcnow)
 
 
 class InviteCode(SQLModel, table=True):

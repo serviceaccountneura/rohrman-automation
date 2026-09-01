@@ -20,7 +20,7 @@ from api.services import access, email_service
 from api.services.security import hash_password, verify_password
 from api.db import get_session
 from api.deps import CurrentUserDep
-from api.models.db import InviteCode, Notification, RefreshToken, User
+from api.models.db import InviteCode, Notification, RefreshToken, User, as_utc
 from api.models.schemas import (
     CurrentUserResponse,
     PendingInviteItem,
@@ -284,9 +284,7 @@ def list_pending_invites(
 
     items = []
     for invite in invites:
-        expires = invite.expires_at
-        if expires.tzinfo is None:
-            expires = expires.replace(tzinfo=timezone.utc)
+        expires = as_utc(invite.expires_at)
         items.append(
             PendingInviteItem(
                 id=invite.id,

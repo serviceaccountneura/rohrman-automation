@@ -5,10 +5,14 @@ POST   /api/auth/login    — authenticate, returns access + refresh tokens
 POST   /api/auth/refresh  — exchange a refresh token for a new token pair
 POST   /api/auth/logout   — revoke the supplied refresh token
 GET    /api/auth/me       — return the current authenticated user
+POST   /api/auth/password-reset/request  — email a reset link
+GET    /api/auth/password-reset/{token}  — is this link still good?
+POST   /api/auth/password-reset/confirm  — set a new password
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import secrets
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 import jwt
@@ -18,10 +22,20 @@ from sqlmodel import Session, select
 from api.config import settings
 from api.db import get_session
 from api.deps import CurrentUserDep
-from api.models.db import InviteCode, RefreshToken, User
+from api.models.db import (
+    InviteCode,
+    PasswordReset,
+    RefreshToken,
+    User,
+    _utcnow,
+    is_expired,
+)
 from api.models.schemas import (
     InviteValidateResponse,
     MessageResponse,
+    PasswordResetConfirm,
+    PasswordResetRequest,
+    PasswordResetValidateResponse,
     RefreshRequest,
     Token,
     UserCreate,
@@ -80,11 +94,7 @@ def signup(req: UserCreate, session: Annotated[Session, Depends(get_session)]) -
             raise HTTPException(status_code=400, detail="Invalid invite code")
         if invite.used:
             raise HTTPException(status_code=400, detail="Invite code already used")
-        now = datetime.now(timezone.utc)
-        exp = invite.expires_at
-        if exp.tzinfo is None:
-            exp = exp.replace(tzinfo=timezone.utc)
-        if exp < now:
+        if is_expired(invite.expires_at):
             raise HTTPException(status_code=400, detail="Invite code has expired")
         # The invite names who it is for. Without this check a forwarded link
         # would let anyone create an account under any address, which defeats
@@ -139,11 +149,7 @@ def validate_invite(
     if invite.used:
         return InviteValidateResponse(valid=False, reason="Invite code already used")
 
-    now = datetime.now(timezone.utc)
-    exp = invite.expires_at
-    if exp.tzinfo is None:
-        exp = exp.replace(tzinfo=timezone.utc)
-    if exp < now:
+    if is_expired(invite.expires_at):
         return InviteValidateResponse(valid=False, reason="Invite code has expired")
 
     return InviteValidateResponse(
@@ -255,3 +261,138 @@ def logout(
 @router.get("/me", response_model=UserRead)
 def me(current_user: CurrentUserDep) -> User:
     return current_user
+
+
+# ── Password reset ───────────────────────────────────────────────────────────
+#
+# One hour, not the invite's 24. An invite is expected to sit in an inbox until
+# someone gets round to it; a reset is requested by a person who is at their
+# keyboard right now, so a long window only widens the time a stolen link works.
+_RESET_TTL = timedelta(hours=1)
+
+
+def _reset_url(token: str) -> str:
+    return f"{settings.frontend_url.rstrip('/')}/reset-password?token={token}"
+
+
+@router.post("/password-reset/request", response_model=MessageResponse)
+def request_password_reset(
+    payload: PasswordResetRequest,
+    session: Annotated[Session, Depends(get_session)],
+) -> MessageResponse:
+    """Email a reset link, if that address has an account.
+
+    ALWAYS returns the same message, whether or not the account exists. The
+    difference between "sent" and "no such user" tells an attacker which of a
+    list of addresses are real, and this endpoint needs no authentication.
+
+    For the same reason a mail failure is not surfaced either; it is logged and
+    the caller still sees success.
+    """
+    same_answer = MessageResponse(
+        message="If that address has an account, a reset link is on its way."
+    )
+
+    email = payload.email.strip().lower()
+    user = session.exec(select(User).where(User.email == email)).first()
+    if not user or not user.is_active:
+        # Deliberately silent. An inactive account should not be resettable
+        # either -- that would be a way back in for someone who was switched off.
+        print(f"[AUTH] password reset requested for unknown/inactive {email!r}")
+        return same_answer
+
+    # Any outstanding links are burned first. Otherwise asking twice leaves two
+    # working tokens, and the older one usually ends up in the wrong hands.
+    for old in session.exec(
+        select(PasswordReset).where(
+            PasswordReset.user_id == user.id, PasswordReset.used == False  # noqa: E712
+        )
+    ).all():
+        old.used = True
+        session.add(old)
+
+    reset = PasswordReset(
+        token=secrets.token_urlsafe(32),
+        user_id=user.id,
+        expires_at=_utcnow() + _RESET_TTL,
+    )
+    session.add(reset)
+    session.commit()
+
+    from api.services import email_service
+
+    if email_service.is_configured():
+        result = email_service.send_password_reset(user.email, _reset_url(reset.token))
+        if not result.sent:
+            print(f"[AUTH] reset email to {user.email} failed: {result.error}")
+    else:
+        # Development: no SMTP configured, so put the link where the developer
+        # can see it. Never happens in production, where SMTP is required.
+        print(f"[AUTH] SMTP not configured — reset link: {_reset_url(reset.token)}")
+
+    return same_answer
+
+
+def _load_reset(session: Session, token: str) -> tuple[PasswordReset | None, str]:
+    """The reset row for a token, plus why it cannot be used if it cannot."""
+    reset = session.exec(select(PasswordReset).where(PasswordReset.token == token)).first()
+    if not reset:
+        return None, "This link is not valid."
+    if reset.used:
+        return None, "This link has already been used."
+    if is_expired(reset.expires_at):
+        return None, "This link has expired. Ask for a new one."
+    return reset, ""
+
+
+@router.get("/password-reset/{token}", response_model=PasswordResetValidateResponse)
+def validate_password_reset(
+    token: str,
+    session: Annotated[Session, Depends(get_session)],
+) -> PasswordResetValidateResponse:
+    """Check a link before showing the form behind it.
+
+    Unlike the request endpoint this does distinguish outcomes -- holding a
+    token is already evidence, and "expired" and "invalid" need different
+    responses from the person reading them.
+    """
+    reset, reason = _load_reset(session, token)
+    if not reset:
+        return PasswordResetValidateResponse(valid=False, reason=reason)
+    user = session.get(User, reset.user_id)
+    if not user or not user.is_active:
+        return PasswordResetValidateResponse(valid=False, reason="This link is not valid.")
+    return PasswordResetValidateResponse(valid=True, email=user.email)
+
+
+@router.post("/password-reset/confirm", response_model=MessageResponse)
+def confirm_password_reset(
+    payload: PasswordResetConfirm,
+    session: Annotated[Session, Depends(get_session)],
+) -> MessageResponse:
+    """Set the new password and burn the link."""
+    reset, reason = _load_reset(session, payload.token)
+    if not reset:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=reason)
+
+    user = session.get(User, reset.user_id)
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="This link is not valid."
+        )
+
+    user.hashed_password = hash_password(payload.password)
+    reset.used = True
+    session.add(user)
+    session.add(reset)
+
+    # Every existing session goes. Someone resetting a password may be doing it
+    # because someone else has one, and leaving those alive defeats the point.
+    for token_row in session.exec(
+        select(RefreshToken).where(RefreshToken.user_id == user.id)
+    ).all():
+        session.delete(token_row)
+
+    session.commit()
+    print(f"[AUTH] password reset completed for {user.email}")
+    return MessageResponse(message="Your password has been changed. You can sign in now.")

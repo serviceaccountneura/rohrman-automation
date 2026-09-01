@@ -159,3 +159,60 @@ def send_invite(to_email: str, invite_url: str, role_label: str, invited_by: str
 </html>"""
 
     return _send(to_email, subject, text_body, html_body)
+
+
+def send_password_reset(to_email: str, reset_url: str) -> SendResult:
+    """A link to choose a new password.
+
+    Says explicitly that ignoring the mail leaves the password unchanged. People
+    who did not ask for this need to know that doing nothing is safe -- without
+    that line the message reads like a breach notification.
+
+    The link is shown as text as well as a button, for the same reason as the
+    invite: forwarded mail and locked-down clients strip styling.
+    """
+    subject = "Reset your Rohrman Invoice Automation password"
+
+    text_body = (
+        "Someone asked to reset the password for this account.\n\n"
+        f"Choose a new password here:\n\n{reset_url}\n\n"
+        "This link works once and expires in one hour.\n\n"
+        "If you did not ask for this, ignore this email -- your password will "
+        "not change.\n"
+    )
+
+    html_body = f"""\
+<!doctype html>
+<html>
+  <body style="margin:0;padding:24px;background:#f5f7fa;
+               font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+               color:#16202b;line-height:1.6;">
+    <div style="max-width:520px;margin:0 auto;background:#ffffff;border:1px solid #d5dce5;
+                border-radius:8px;padding:32px;">
+      <h1 style="margin:0 0 16px;font-size:20px;font-weight:600;">
+        Reset your password
+      </h1>
+      <p style="margin:0 0 24px;">
+        Someone asked to reset the password for this account.
+      </p>
+      <p style="margin:0 0 24px;">
+        <a href="{reset_url}"
+           style="display:inline-block;background:#2b5c8a;color:#ffffff;
+                  text-decoration:none;padding:12px 22px;border-radius:6px;
+                  font-weight:600;">Choose a new password</a>
+      </p>
+      <p style="margin:0 0 8px;font-size:13px;color:#4a5765;">
+        Or paste this link into your browser:
+      </p>
+      <p style="margin:0 0 24px;font-size:13px;word-break:break-all;">
+        <a href="{reset_url}" style="color:#2b5c8a;">{reset_url}</a>
+      </p>
+      <p style="margin:0;font-size:13px;color:#4a5765;">
+        This link works once and expires in one hour. If you did not ask for
+        this, ignore this email &mdash; your password will not change.
+      </p>
+    </div>
+  </body>
+</html>
+"""
+    return _send(to_email, subject, text_body, html_body)

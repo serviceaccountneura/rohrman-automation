@@ -240,6 +240,28 @@ class CurrentUserResponse(BaseModel):
     all_dealerships: bool = True
 
 
+class PasswordResetRequest(BaseModel):
+    """Ask for a reset link."""
+
+    email: EmailStr
+
+
+class PasswordResetConfirm(BaseModel):
+    """Redeem a reset link."""
+
+    token: str
+    # Same floor as signup. Anything shorter is not worth the round trip.
+    password: str = Field(min_length=8, max_length=128)
+
+
+class PasswordResetValidateResponse(BaseModel):
+    """Whether a reset link is still good, for the page behind it."""
+
+    valid: bool
+    email: str = ""
+    reason: str = ""
+
+
 class InviteValidateResponse(BaseModel):
     valid: bool
     # Shown on the signup page and used as the account's address, so the person
