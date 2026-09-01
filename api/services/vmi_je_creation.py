@@ -33,14 +33,21 @@ WHAT COMES FROM WHERE
     invoice and the AI reads it" rather than on parsing every manufacturer's
     layout.
 
-WHAT IS DELIBERATELY NOT HERE
-    Only the Kia template is specified, because Kia is the one manufacturer we
-    have both a real invoice and the matching finished journal entry for. Ford,
-    Honda and Toyota are registered but refuse: a template guessed from a
-    meeting summary would post real money to real accounts.
+THE ACCOUNTS ARE NOT OURS TO CHOOSE
+    An earlier version of this module carried a hardcoded set of GL accounts per
+    manufacturer. That was backwards, and it is gone.
 
-    Refusing is the same choice `je_creation.py` makes when the parts do not sum
-    to the invoice total. A wrong journal entry is worse than no journal entry,
+    Each dealership's own journal-70 auto-posting template already lists the
+    accounts that store posts to. The clerk annotating the invoice writes those
+    same account numbers on the page, with an arrow to the amount each one
+    takes: "2245" against KAC0780KAC means 780.00 belongs in holdback
+    receivable. So building the entry is a JOIN between the template and the
+    handwriting -- see api/services/vmi_template.py -- and the same code serves
+    Kia, Ford, Honda and Toyota without a per-make table.
+
+    What still refuses: an annotation naming an account the template has no line
+    for, and an entry that does not balance. Both mean money would land
+    somewhere nobody asked for, and a wrong journal entry is worse than none,
     because nobody goes looking for one that already exists.
 
 THE WRITE PATH, FROM THE CAPTURE
@@ -64,6 +71,7 @@ from api.services.je_creation import (
     JournalEntryService,
     _parse_date,
 )
+from api.services import vmi_template
 from api.services.tekion_client import TekionApiClient
 
 # ── Tekion coordinates for this flow ─────────────────────────────────────────
@@ -157,6 +165,9 @@ class VehicleInvoiceFacts:
     annotated_amounts: dict[str, float] = field(default_factory=dict)
     # GL account numbers written on the invoice, in the order they were found.
     annotated_gl_accounts: list[str] = field(default_factory=list)
+    # The real input: {GL account -> the amount the clerk pointed it at}.
+    # "2245" against KAC0780KAC means 780.00 belongs in holdback receivable.
+    gl_annotations: dict[str, float] = field(default_factory=dict)
 
     def amount(self, key: str) -> float | None:
         value = self.annotated_amounts.get(key)
@@ -309,6 +320,8 @@ class VehicleEntryResult:
     # Which of the dealership's auto-posting templates matched journal 70.
     # Recorded for the audit trail: the name differs at every store.
     tekion_template_name: str = ""
+    # {GL account -> amount} as read off the invoice's handwriting.
+    gl_annotations: dict[str, float] = field(default_factory=dict)
     postings: list[dict[str, Any]] = field(default_factory=list)
     credit_total: float = 0.0
     debit_total: float = 0.0
@@ -417,6 +430,77 @@ class VehicleJournalEntryService:
             order += 1
         return postings
 
+    # Tekion's own Control 2 vocabulary, from the journal entry screen. The
+    # captured template left control2Type null, so this only takes effect on
+    # templates where a store has set it; everything else keys off the stock
+    # number, which is what the majority of lines use.
+    _CONTROL2 = {
+        "LASTSIXOFVIN": Control.LAST_SIX_VIN,
+        "LASTSIXVIN": Control.LAST_SIX_VIN,
+        "LASTEIGHTOFVIN": Control.LAST_EIGHT_VIN,
+        "LASTEIGHTVIN": Control.LAST_EIGHT_VIN,
+        "FULLVIN": Control.FULL_VIN,
+        "VIN": Control.FULL_VIN,
+        "STK": Control.STOCK,
+        "STKNUMBER": Control.STOCK,
+        "STOCKNUMBER": Control.STOCK,
+    }
+
+    @classmethod
+    def _control_for(cls, line: Any, facts: VehicleInvoiceFacts) -> str:
+        """The control value for one filled line.
+
+        Tekion carries this per line as `control2Type` -- the Control 2 column
+        reads "LAST SIX OF VIN", "FULL VIN" or "STK #" on the journal entry
+        screen. Where a store has set it we follow it. Where it is null we use
+        the stock number, which is what most lines use and what the transaction
+        itself is referenced by.
+        """
+        raw = re.sub(r"[^A-Z]", "", str(getattr(line, "control2_type", "") or "").upper())
+        kind = cls._CONTROL2.get(raw, Control.STOCK)
+        control = resolve_control(kind, facts)
+        # A VIN-keyed line on an invoice with no readable VIN falls back rather
+        # than posting an empty control, which reconciles to nothing.
+        return control or facts.stock_number
+
+    @classmethod
+    def build_postings_from_template(
+        cls,
+        filled: "vmi_template.FillResult",
+        facts: VehicleInvoiceFacts,
+        dealer_id: str,
+    ) -> list[dict[str, Any]]:
+        """Turn filled template lines into the captured wire format.
+
+        Amounts are DOLLARS -- the journal-entry API is the one Tekion endpoint
+        that does not use cents. Sign carries the direction and `amountCredited`
+        stays False on every line, matching the captured payload.
+        """
+        postings: list[dict[str, Any]] = []
+        for order, line in enumerate(filled.lines):
+            control = cls._control_for(line, facts)
+            postings.append(
+                {
+                    "dealerId": dealer_id,
+                    # Straight from the template: no chart lookup needed, and no
+                    # chance of resolving to a different account than the store
+                    # configured.
+                    "glAccountId": line.gl_account_id,
+                    "amount": line.amount,
+                    "refId": control,
+                    "description": line.description or None,
+                    "refType": line.ref_type,
+                    "countAdjusted": False,
+                    "postingOrder": order,
+                    "amountCredited": False,
+                    # Not sent -- kept so the printed trace is readable.
+                    "_glAccountNumber": line.gl_number,
+                    "_control": control,
+                    "_source": line.source,
+                }
+            )
+        return postings
+
     @staticmethod
     def build_payload(
         facts: VehicleInvoiceFacts,
@@ -519,56 +603,31 @@ def create_vehicle_journal_entry(
     *,
     dry_run: bool = True,
 ) -> VehicleEntryResult:
-    """Build the entry, check it, and (unless dry_run) save it as a draft.
+    """Build the entry from the dealership's own template, and save it as a draft.
 
-    Refuses -- rather than posting something approximate -- when the
-    manufacturer has no template, when a required handwritten amount is
-    missing, when the stock number or VIN needed for a control is absent, or
-    when the lines do not balance to zero.
+    Refuses -- rather than posting something approximate -- when the store has
+    no journal-70 template or more than one, when nothing was annotated on the
+    invoice, when an annotation names an account the template has no line for,
+    or when the finished lines do not balance to zero.
     """
     result = VehicleEntryResult(manufacturer=facts.manufacturer)
+    result.gl_annotations = dict(facts.gl_annotations)
 
-    template = TEMPLATES.get(facts.manufacturer)
-    if template is None:
-        result.refusal = (
-            f"no posting template for manufacturer {facts.manufacturer or '(not identified)'}"
-        )
-        return result
-    if template.unspecified_reason:
-        result.refusal = f"{facts.manufacturer}: {template.unspecified_reason}"
-        return result
-
-    # Controls are not decoration -- a line with no control cannot be reconciled
-    # against the vehicle later, so a missing one is a refusal, not a warning.
     if not facts.stock_number:
         result.refusal = "no stock number on the invoice (write it on before uploading)"
         return result
-    needs_vin = any(line.control != Control.STOCK for line in template.lines)
-    if needs_vin and len(facts.vin) < 6:
-        result.refusal = "the template keys lines off the VIN, and no usable VIN was read"
-        return result
-
-    missing = [key for key in template.requires if facts.amount(key) is None]
-    if missing:
+    if not facts.gl_annotations:
         result.refusal = (
-            f"{facts.manufacturer} needs {', '.join(missing)} written on the invoice; "
-            "not found"
+            "no GL accounts were read off the invoice. The clerk writes an account "
+            "number beside each amount it takes (2245 -> 780.00); without those "
+            "there is nothing to post"
         )
-        return result
-
-    if not facts.dealer_cost_total:
-        result.refusal = "no dealer cost total read from the invoice"
         return result
 
     dealer_id = client.current_dealer_id
     result.dealer_id = dealer_id
-
     service = VehicleJournalEntryService(client)
 
-    # The dealership must actually have a journal-70 template. We do not send it
-    # -- the saved transaction carries templateId: null -- but its absence means
-    # this store is not set up for the flow, and a draft posted into a journal
-    # nobody configured is a draft nobody will look for.
     tekion_template, template_problem = service.find_template(dealer_id)
     if template_problem:
         result.refusal = template_problem
@@ -576,38 +635,54 @@ def create_vehicle_journal_entry(
     result.tekion_template_name = str(tekion_template.get("templateName") or "")
     print(
         f"[VMI] template {result.tekion_template_name!r} "
-        f"(journal {tekion_template.get('journalId')})"
+        f"(journal {tekion_template.get('journalId')}), "
+        f"annotations {facts.gl_annotations}"
     )
 
-    resolved, problems = service.resolve_gl_accounts(template)
-    result.problems = problems
-    if problems:
+    filled = vmi_template.fill(
+        tekion_template, facts.gl_annotations, facts.dealer_cost_total
+    )
+
+    # An annotation with nowhere to go is the clearest possible signal that this
+    # invoice and this template disagree. Posting the rest would quietly drop
+    # money a person explicitly placed.
+    if filled.unmatched_annotations:
+        pairs = ", ".join(
+            f"{gl}={amount:,.2f}" for gl, amount in filled.unmatched_annotations.items()
+        )
+        result.refusal = (
+            f"the invoice annotates {pairs}, but template "
+            f"{result.tekion_template_name!r} has no line for "
+            f"{'those accounts' if len(filled.unmatched_annotations) > 1 else 'that account'}"
+        )
         return result
 
-    postings = service.build_postings(template, facts, resolved, dealer_id)
-    result.postings = postings
-    if not postings:
+    if not filled.lines:
         result.refusal = "the template produced no posting lines for this invoice"
         return result
+
+    postings = service.build_postings_from_template(filled, facts, dealer_id)
+    result.postings = postings
 
     credit, debit, balance = JournalEntryService.check_balance(postings)
     result.credit_total, result.debit_total, result.balance = credit, debit, balance
     result.balanced = abs(balance) < 0.005
 
     print(
-        f"[VMI] {facts.manufacturer} {facts.stock_number}: {len(postings)} lines, "
-        f"credit {credit:.2f} / debit {debit:.2f}, balance {balance:.2f}"
+        f"[VMI] {facts.manufacturer or 'vehicle'} {facts.stock_number}: "
+        f"{len(postings)} lines, credit {credit:,.2f} / debit {debit:,.2f}, "
+        f"balance {balance:.2f}"
     )
     for p in postings:
         print(
-            f"[VMI]   {p['_glAccountNumber']:>6}  {p['amount']:>12,.2f}  "
-            f"{p['_control']:<20} {p['_glAccountName']}"
+            f"[VMI]   {p['_glAccountNumber']:>6}  {p['amount']:>13,.2f}  "
+            f"{p['_control']:<20} {p['_source']}"
         )
 
     if not result.balanced:
         result.refusal = (
-            f"the entry does not balance: credit {credit:.2f} against debit {debit:.2f} "
-            f"(off by {balance:.2f})"
+            f"the entry does not balance: credit {credit:,.2f} against debit "
+            f"{debit:,.2f} (off by {balance:.2f})"
         )
         return result
 

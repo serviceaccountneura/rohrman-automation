@@ -111,10 +111,35 @@ _STOCK_PATTERN = re.compile(r"\b([A-Z]{1,3}\d{3,6})\b")
 _STOCK_LABEL_HINTS = ("stocknumber", "stockno", "stock", "stk")
 
 
+# Labels that carry a dealer cost but not the FINAL one. A Kia memorandum
+# invoice prints SUBTOTAL 30,638.00 above TOTAL 32,133.00, the difference being
+# inland freight -- and taking the first match found the subtotal, which would
+# have understated inventory by the freight on every car.
+_NOT_A_FINAL_COST = ("sub", "base", "unit", "option", "freight", "handling")
+
+
 def get_dealer_cost_total(ocr: dict[str, Any]) -> float:
-    amount = _find_amount(ocr, _DEALER_COST_HINTS)
-    if amount is not None:
-        return amount
+    """The FINAL dealer cost -- what the dealership owes for the car.
+
+    Every candidate is collected rather than taking the first, because these
+    invoices print the dealer-cost column several times down the page (base,
+    subtotal, total) and first-match lands on whichever the OCR happened to
+    emit first. Subtotal-ish labels are dropped, and the largest of what
+    remains wins: the total always exceeds its own subtotal.
+    """
+    candidates: list[float] = []
+    for label, value in _pairs(ocr):
+        flat = _normalise(label)
+        if not any(hint in flat for hint in _DEALER_COST_HINTS):
+            continue
+        if any(bad in flat for bad in _NOT_A_FINAL_COST):
+            continue
+        amount = _amount(value)
+        if amount is not None and amount > 0:
+            candidates.append(abs(amount))
+    if candidates:
+        return max(candidates)
+
     # Fall back to the document total. On a memorandum invoice the printed
     # TOTAL is the dealer cost -- the MSRP sits in its own labelled column.
     return ocr_helpers.get_total_amount(ocr)
@@ -164,6 +189,31 @@ def get_annotated_amounts(ocr: dict[str, Any]) -> dict[str, float]:
     return found
 
 
+def get_gl_annotations(ocr: dict[str, Any]) -> dict[str, float]:
+    """Handwritten GL account -> the amount the clerk pointed it at.
+
+    This is the heart of the vehicle flow. Staff write an account number on the
+    invoice and draw an arrow to the figure that belongs in it: "2245" against
+    KAC0780KAC means 780.00 goes to holdback receivable. The OCR prompt asks for
+    these as a `gl_annotations` array; this reads it back.
+
+    Amounts come back positive. Whether a line is a debit or a credit is the
+    template's business, not the annotation's.
+    """
+    found: dict[str, float] = {}
+    for entry in ocr.get("gl_annotations") or []:
+        if not isinstance(entry, dict):
+            continue
+        account = re.sub(r"[^0-9A-Za-z]", "", str(entry.get("gl_account") or ""))
+        amount = _amount(entry.get("amount"))
+        # A 4-5 digit account is the shape every Rohrman GL uses; anything else
+        # is a stock number or a dealer code that drifted into the array.
+        if not re.fullmatch(r"\d{4,5}[A-Za-z]?", account) or amount is None:
+            continue
+        found[account] = abs(amount)
+    return found
+
+
 def get_annotated_gl_accounts(ocr: dict[str, Any]) -> list[str]:
     """GL account numbers written on the invoice, in reading order.
 
@@ -202,4 +252,5 @@ def build_facts(ocr: dict[str, Any], dealership_name: str = "") -> VehicleInvoic
         msrp_total=get_msrp_total(ocr),
         annotated_amounts=get_annotated_amounts(ocr),
         annotated_gl_accounts=get_annotated_gl_accounts(ocr),
+        gl_annotations=get_gl_annotations(ocr),
     )
