@@ -54,6 +54,12 @@ ROLE_INVOICE_PRICE = "invoice_price"
 # Matched against the template line's description AND the GL account's own name
 # from the chart. The names are what carry the meaning in practice:
 # "HOLDBACK RECEIVABLE-KIA", "N/P NEW VEHICLE & DEMOS", "NEW INV - KIA".
+# The internal DOC fee is a pair: the inventory account is debited and the DOC
+# fee payable credited for the same figure. It is not on the invoice and not
+# preset in every store's template, so it arrives as a per-dealership constant
+# and is anchored on the payable account, which is the half that names itself.
+_DOC_FEE_PAYABLE_HINTS = ("docfeepayable", "internaldocfee", "docfee")
+
 _ROLE_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (ROLE_HOLDBACK, ("holdback", "holdbk")),
     (ROLE_FLOOR_PLAN, ("floorplan", "notepayable", "npnewvehicle", "npnew")),
@@ -137,6 +143,7 @@ def fill(
     annotations: dict[str, float],
     dealer_cost_total: float,
     chart: dict[str, dict[str, Any]] | None = None,
+    doc_fee: float | None = None,
 ) -> FillResult:
     """Fill one Tekion template from one invoice's annotations.
 
@@ -145,6 +152,7 @@ def fill(
     `annotations` maps a GL account number to the positive amount written
     against it. `chart` maps glAccountId to the account's own record, and is
     what turns a template line's opaque id into the number the clerk wrote.
+    `doc_fee` is the store's internal DOC fee, which appears on no invoice.
     """
     result = FillResult()
     postings = template.get("postings") or []
@@ -161,7 +169,25 @@ def fill(
 
     holdback = annotations.get(_account_for_role(postings, ROLE_HOLDBACK, chart), None)
 
-    for p in postings:
+    # The DOC fee pair, resolved by index before the main pass. The payable
+    # account names itself ("Internal DOC fee payable"); the line immediately
+    # above it is the inventory side that carries the matching debit.
+    doc_fee_by_index: dict[int, float] = {}
+    if doc_fee:
+        for i, p in enumerate(postings):
+            name = _account_name(p.get("glAccountId"), chart) or str(p.get("description") or "")
+            if any(hint in _normalise(name) for hint in _DOC_FEE_PAYABLE_HINTS):
+                doc_fee_by_index[i] = -abs(doc_fee)
+                if i > 0:
+                    doc_fee_by_index[i - 1] = abs(doc_fee)
+                break
+
+    # Which lines took their amount straight from the handwriting. A mirror
+    # follows an ANNOTATED line only -- never a line that was itself mirrored,
+    # or the whole tail of a template would fill itself in alternating signs.
+    annotated_index: set[int] = set()
+
+    for index, p in enumerate(postings):
         gl = gl_number_of(p.get("glAccountId"), chart)
         description = str(p.get("description") or "")
         account_name = _account_name(p.get("glAccountId"), chart)
@@ -183,8 +209,56 @@ def fill(
             amount = abs(annotations[gl]) * _sign_for(role, preset)
             source = f"annotated {gl}"
             used.add(gl)
+            annotated_index.add(index)
 
-        # 2. A mirror of a line that was annotated: "DMA_" follows "DMA".
+        # 2. The store's DOC fee pair, placed by index above.
+        elif index in doc_fee_by_index:
+            amount = doc_fee_by_index[index]
+            source = "store DOC fee"
+
+        # 2b. A role the template describes, computed from the invoice. Ahead of
+        # the mirror rule because an inventory line that happens to sit under an
+        # annotated one is still inventory: at Schaumburg Kia, NEW INV follows
+        # N/P NEW VEHICLE, and mirroring it posted the full dealer cost instead
+        # of cost less holdback.
+        #
+        # Only the FIRST line playing a role takes it. BILL lists 2320 NEW INV
+        # twice -- once for the vehicle, once for the DOC fee -- and filling
+        # both from the same rule posted the price of the car twice.
+        elif role and role not in roles_filled and dealer_cost_total:
+            if role == ROLE_FLOOR_PLAN:
+                amount = -dealer_cost_total
+                source = "dealer cost (credit)"
+                roles_filled.add(role)
+            elif role == ROLE_INVOICE_PRICE and holdback is not None:
+                amount = round(dealer_cost_total - holdback, 2)
+                source = "dealer cost less holdback"
+                roles_filled.add(role)
+
+        # 2c. The line immediately after an annotated one mirrors it. Templates
+        # pair a receivable with the income account that offsets it -- KRS
+        # RECEIVABLE then KIA RETAIL SUPPORT INCOME -- and only the receivable
+        # is ever written on the invoice, because writing the same number twice
+        # is what the pairing exists to avoid.
+        #
+        # Restricted to following an ANNOTATED line on purpose. Allowing a
+        # mirror to follow a mirror would walk the rest of the template filling
+        # in alternating signs: at Schaumburg Kia that would have put +290 into
+        # CUSTOMER WE OWE, which has nothing to do with this invoice.
+        elif (index - 1) in annotated_index:
+            partner = postings[index - 1]
+            partner_gl = gl_number_of(partner.get("glAccountId"), chart)
+            if partner_gl in annotations:
+                amount = -abs(annotations[partner_gl]) * _sign_for(
+                    role_of(
+                        partner.get("description"),
+                        _account_name(partner.get("glAccountId"), chart),
+                    ),
+                    partner.get("amount"),
+                )
+                source = f"mirrors {partner_gl}"
+
+        # 2d. The older named-pair convention: "DMA_" follows "DMA".
         elif description.endswith("_") and description[:-1] in by_description:
             partner = by_description[description[:-1]][0]
             partner_gl = gl_number_of(partner.get("glAccountId"), chart)
@@ -200,22 +274,7 @@ def fill(
                 )
                 source = f"mirrors {partner_gl}"
 
-        # 3. A role the template describes, computed from the invoice.
-        #
-        # Only the FIRST line playing a role takes it. BILL lists 2320 NEW INV
-        # twice -- once for the vehicle itself and once for the DOC fee -- and
-        # filling both from the same rule posted the price of the car twice.
-        if amount is None and role and dealer_cost_total and role not in roles_filled:
-            if role == ROLE_FLOOR_PLAN:
-                amount = -dealer_cost_total
-                source = "dealer cost (credit)"
-                roles_filled.add(role)
-            elif role == ROLE_INVOICE_PRICE and holdback is not None:
-                amount = round(dealer_cost_total - holdback, 2)
-                source = "dealer cost less holdback"
-                roles_filled.add(role)
-
-        # 4. Whatever the store preset in the template.
+        # 3. Whatever the store preset in the template.
         if amount is None and preset:
             amount = preset
             source = "template preset"

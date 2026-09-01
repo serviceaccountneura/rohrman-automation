@@ -109,6 +109,19 @@ _TEMPLATES_PATH = "/api/accounting/u/v2/transaction/upc/templates"
 # one journal-70 template, "BILL".
 TEMPLATE_PREFERENCE: dict[str, str] = {}
 
+# The internal DOC fee, per dealership. It is not printed on the invoice, not
+# annotated, and not preset in every store's template -- Schaumburg Honda has it
+# in the template at 380.00, Schaumburg Kia leaves the line at zero -- so the
+# figure has to live somewhere, and a named constant beats a number appearing
+# inside the posting logic.
+#
+# Confirmed for 1710 only. A store that is not listed simply gets no DOC fee
+# lines, which is the right default: inventing one would post money nobody
+# asked for.
+STORE_DOC_FEE: dict[str, float] = {
+    "1710": 380.00,  # Bob Rohrman Schaumburg Kia
+}
+
 _REF_TEXT_MAX = 50
 
 
@@ -692,7 +705,11 @@ def create_vehicle_journal_entry(
 
     chart = service.chart_by_account_id()
     filled = vmi_template.fill(
-        tekion_template, facts.gl_annotations, facts.dealer_cost_total, chart
+        tekion_template,
+        facts.gl_annotations,
+        facts.dealer_cost_total,
+        chart,
+        doc_fee=STORE_DOC_FEE.get(dealer_id),
     )
 
     # An annotation with nowhere to go is the clearest possible signal that this
