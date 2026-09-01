@@ -43,14 +43,15 @@ WHAT IS DELIBERATELY NOT HERE
     to the invoice total. A wrong journal entry is worse than no journal entry,
     because nobody goes looking for one that already exists.
 
-UNVERIFIED -- READ BEFORE TRUSTING THE WRITE PATH
-    `save_draft` posts to the same endpoint the manual JE flow uses, with
-    journal 70 and document type 8 substituted. That is an INFERENCE. The Auto
-    Posting screen may issue a different request, and both listing the
-    dealership's templates and applying one need endpoints we have never
-    captured -- `find_template` below is a placeholder for the first.
+THE WRITE PATH, FROM THE CAPTURE
+    Templates   POST /api/accounting/u/v2/transaction/upc/templates
+                {"templateTypes": ["DEFAULT"]}
+    Save draft  POST /api/accounting/u/v2/transaction/dealer/{id}/draft
 
-    Capture with `npm run pw:capture:vmi`. Until then, run with dry_run=True.
+    Applying a template turned out to be client-side pre-fill only: the saved
+    transaction comes back with `templateId: null`. So the template decides
+    which lines exist, and the save is the same plain draft call the manual
+    journal entry already uses. There is no third call to make.
 """
 from __future__ import annotations
 
@@ -73,12 +74,29 @@ from api.services.tekion_client import TekionApiClient
 # the one this flow wants. Matching on a name would work at one store and
 # silently pick the wrong template, or none, at the other eighteen.
 JOURNAL_NUMBER = "70"  # VEHICLE PURCHASES
-JOURNAL_NAME_HINT = "vehicle purchase"
 DOCUMENT_TYPE_SUFFIX = "document_type_8"  # Vehicle Purchase Invoice
-REFERENCE_TYPE = "STOCK_NUMBER"
+
+# From the capture, not a guess. The transaction's own refType is CUSTOM; the
+# per-line refType comes from the template and is VEHICLE on the vehicle
+# accounts, CUSTOM elsewhere. An earlier version sent "STOCK_NUMBER" for both,
+# which Tekion does not use anywhere in this flow.
+TRANSACTION_REF_TYPE = "CUSTOM"
+LINE_REF_TYPE_VEHICLE = "VEHICLE"
+LINE_REF_TYPE_CUSTOM = "CUSTOM"
 
 _SAVE_DRAFT_METHOD = "POST"
 _SAVE_DRAFT_PATH = "/api/accounting/u/v2/transaction/dealer/{dealer_id}/draft"
+
+# The dealership's auto-posting templates. Body {"templateTypes": ["DEFAULT"]}.
+_TEMPLATES_PATH = "/api/accounting/u/v2/transaction/upc/templates"
+
+# Some dealerships keep more than one template on journal 70 -- 1707 has both
+# "NEW VEHICLE" and "2024 HONDA PROLOGUE". Journal number alone does not
+# identify one there, so name the intended template per dealer here. Without an
+# entry the flow refuses and lists the candidates rather than picking one.
+TEMPLATE_PREFERENCE: dict[str, str] = {
+    # "1707": "NEW VEHICLE",
+}
 
 _REF_TEXT_MAX = 50
 
@@ -163,6 +181,9 @@ class TemplateLine:
     control: str
     amount: Callable[[VehicleInvoiceFacts], float | None]
     description: str
+    # VEHICLE on the vehicle accounts (inventory, floor plan), CUSTOM on the
+    # rest. Tekion's own templates set this per line, so we do too.
+    ref_type: str = LINE_REF_TYPE_CUSTOM
 
 
 @dataclass
@@ -221,14 +242,15 @@ def _kia_lines() -> tuple[TemplateLine, ...]:
         value = f.amount("doc_fee")
         return None if value is None else -value
 
+    V, C = LINE_REF_TYPE_VEHICLE, LINE_REF_TYPE_CUSTOM
     return (
-        TemplateLine("2245", Control.LAST_SIX_VIN, holdback, "Holdback receivable"),
-        TemplateLine("3300", Control.STOCK, note_payable, "N/P new vehicle"),
-        TemplateLine("2320", Control.STOCK, inventory, "New inventory"),
-        TemplateLine("2102", Control.FULL_VIN, krs, "KRS receivable"),
-        TemplateLine("8011", Control.STOCK, krs_income, "Retail support income"),
-        TemplateLine("2320", Control.STOCK, doc_fee, "New inventory - DOC fee"),
-        TemplateLine("30000", Control.STOCK, doc_fee_payable, "Internal DOC fee payable"),
+        TemplateLine("2245", Control.LAST_SIX_VIN, holdback, "Holdback receivable", C),
+        TemplateLine("3300", Control.STOCK, note_payable, "N/P new vehicle", V),
+        TemplateLine("2320", Control.STOCK, inventory, "New inventory", V),
+        TemplateLine("2102", Control.FULL_VIN, krs, "KRS receivable", C),
+        TemplateLine("8011", Control.STOCK, krs_income, "Retail support income", C),
+        TemplateLine("2320", Control.STOCK, doc_fee, "New inventory - DOC fee", V),
+        TemplateLine("30000", Control.STOCK, doc_fee_payable, "Internal DOC fee payable", C),
     )
 
 
@@ -284,6 +306,9 @@ def detect_manufacturer(vendor_name: str, dealership_name: str = "") -> str:
 class VehicleEntryResult:
     dealer_id: str = ""
     manufacturer: str = ""
+    # Which of the dealership's auto-posting templates matched journal 70.
+    # Recorded for the audit trail: the name differs at every store.
+    tekion_template_name: str = ""
     postings: list[dict[str, Any]] = field(default_factory=list)
     credit_total: float = 0.0
     debit_total: float = 0.0
@@ -366,9 +391,20 @@ class VehicleJournalEntryService:
                     "dealerId": dealer_id,
                     "glAccountId": acc.get("account_id"),
                     "amount": round(value, 2),
+                    # CONTROLS ARE THE ONE UNVERIFIED PART. The captured draft
+                    # was a minimal test with no control values filled, so it
+                    # shows no refId -- while the finished Kia entry clearly
+                    # carries one per line (043152, SK6459, the full VIN).
+                    # refId is what the manual journal entry uses and is
+                    # accepted there, so it is what we send. The template
+                    # response also carries `controlNumberList` and
+                    # `control2Type`, which may be the real mechanism here.
+                    # Re-capture with the controls filled in to settle it.
                     "refId": control,
-                    "refText": (line.description or control)[:_REF_TEXT_MAX],
-                    "refType": REFERENCE_TYPE,
+                    # Tekion's own payload puts the line label in `description`
+                    # and leaves refText off the posting entirely.
+                    "description": (line.description or None),
+                    "refType": line.ref_type,
                     "countAdjusted": False,
                     "postingOrder": order,
                     "amountCredited": False,
@@ -400,41 +436,72 @@ class VehicleJournalEntryService:
             # are captured; the journal id below already selects journal 70.
             "metadata": {},
             "refId": facts.stock_number,
-            "refType": REFERENCE_TYPE,
+            "refType": TRANSACTION_REF_TYPE,
             "refText": facts.stock_number,
             "documentTypeId": f"{dealer_id}_{DOCUMENT_TYPE_SUFFIX}",
             "franchiseId": dealer_id,
             "scheduledTime": str(accounting_date_ms),
-            "assetAttachmentDto": {},
+            # Captured as {"attachments": []}, not {}.
+            "assetAttachmentDto": {"attachments": []},
         }
 
-    def find_template(self, dealer_id: str) -> dict[str, Any] | None:
+    def fetch_templates(self) -> list[dict[str, Any]]:
+        """Every auto-posting template configured at the current dealership."""
+        res = self.client._req_json(
+            _TEMPLATES_PATH, method="POST", body={"templateTypes": ["DEFAULT"]}
+        )
+        return (res.get("data") or {}).get("templateList") or []
+
+    def find_template(self, dealer_id: str) -> tuple[dict[str, Any] | None, str]:
         """The dealership's auto-posting template for journal 70.
 
-        NOT IMPLEMENTED -- the endpoint that lists templates has never been
-        captured, so there is nothing to call yet. Raising beats returning None:
-        None would read as "this dealership has no journal-70 template", which
-        is a real and different condition, and the two must not be confused once
-        this is wired up.
+        Returns (template, problem). Selected by journal, never by name: each
+        store names its own -- 1714 calls it "VEHICLE INVOICES", 1707 calls it
+        "NEW VEHICLE" -- so matching on a name works at one store and quietly
+        fails at the rest.
 
-        When the capture lands, this should fetch the dealership's templates and
-        return the one whose journal number is JOURNAL_NUMBER -- matching on the
-        number, with JOURNAL_NAME_HINT only as a tiebreaker if a store somehow
-        has two.
+        Journal number is not always unique either. 1707 keeps two templates on
+        journal 70, "NEW VEHICLE" and "2024 HONDA PROLOGUE", and taking the
+        first would post a Kia against a Honda-specific template. When more than
+        one matches this refuses and names them, unless TEMPLATE_PREFERENCE says
+        which one that dealer means.
         """
-        raise NotImplementedError(
-            "Listing auto-posting templates has not been captured yet. "
-            "Run `npm run pw:capture:vmi`, walk the Auto Posting screen, then "
-            "`npm run pw:analyze:vmi`."
+        wanted = f"{dealer_id}_{JOURNAL_NUMBER}"
+        matches = [t for t in self.fetch_templates() if t.get("journalId") == wanted]
+
+        if not matches:
+            return None, (
+                f"dealer {dealer_id} has no auto-posting template on journal "
+                f"{JOURNAL_NUMBER} (Vehicle Purchases)"
+            )
+        if len(matches) == 1:
+            return matches[0], ""
+
+        preferred = TEMPLATE_PREFERENCE.get(dealer_id)
+        if preferred:
+            for t in matches:
+                if str(t.get("templateName") or "").strip() == preferred:
+                    return t, ""
+            return None, (
+                f"TEMPLATE_PREFERENCE names {preferred!r} for dealer {dealer_id}, "
+                f"but no template on journal {JOURNAL_NUMBER} has that name"
+            )
+
+        names = ", ".join(repr(t.get("templateName")) for t in matches)
+        return None, (
+            f"dealer {dealer_id} has {len(matches)} templates on journal "
+            f"{JOURNAL_NUMBER} ({names}); add the intended one to "
+            "TEMPLATE_PREFERENCE in vmi_je_creation.py"
         )
 
     def save_draft(self, payload: dict[str, Any], dealer_id: str) -> dict[str, Any]:
         """Persist as a draft.
 
-        UNVERIFIED. This reuses the manual journal-entry draft endpoint with the
-        vehicle journal and document type substituted, because the Auto Posting
-        screen has never been captured. It may be the same request; it may not.
-        Capture before relying on it.
+        Captured, not inferred: the Auto Posting screen posts to the same
+        endpoint the manual journal entry uses, with journal 70 and document
+        type 8. Applying a template is purely client-side pre-fill -- the saved
+        transaction comes back with `templateId: null` -- so the template is how
+        the lines are CHOSEN, never part of how they are SAVED.
         """
         path = _SAVE_DRAFT_PATH.format(dealer_id=dealer_id)
         print(f"[VMI] Save as Draft: {_SAVE_DRAFT_METHOD} {path}")
@@ -497,6 +564,21 @@ def create_vehicle_journal_entry(
     result.dealer_id = dealer_id
 
     service = VehicleJournalEntryService(client)
+
+    # The dealership must actually have a journal-70 template. We do not send it
+    # -- the saved transaction carries templateId: null -- but its absence means
+    # this store is not set up for the flow, and a draft posted into a journal
+    # nobody configured is a draft nobody will look for.
+    tekion_template, template_problem = service.find_template(dealer_id)
+    if template_problem:
+        result.refusal = template_problem
+        return result
+    result.tekion_template_name = str(tekion_template.get("templateName") or "")
+    print(
+        f"[VMI] template {result.tekion_template_name!r} "
+        f"(journal {tekion_template.get('journalId')})"
+    )
+
     resolved, problems = service.resolve_gl_accounts(template)
     result.problems = problems
     if problems:
