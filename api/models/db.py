@@ -114,9 +114,13 @@ class Document(SQLModel, table=True):
     vin: str = Field(default="", max_length=20)
     ro_number: str = Field(default="", max_length=100)
     po_number: str = Field(default="", max_length=100)
-    # SUBLET, MISCELLANEOUS, STOCK, OEM. Set from the upload folder, which is
-    # authoritative: it selects the pipeline even when OCR disagrees.
-    po_type: str = Field(default="", max_length=20, index=True)
+    # SUBLET, MISCELLANEOUS, STOCK, OEM, VEHICLE_MANUFACTURING. Set from the
+    # upload folder, which is authoritative: it selects the pipeline even when
+    # OCR disagrees.
+    #
+    # 40, not 20: VEHICLE_MANUFACTURING is 21 characters and broke every upload
+    # into that folder with a 500 at the INSERT. Room for the next folder name.
+    po_type: str = Field(default="", max_length=40, index=True)
     # AP_INVOICE, PO, PARTS_TICKET, JOURNAL, GL_REPORT, STATEMENT, REPAIR_ORDER, MANUFACTURER_INVOICE
     document_type: str = Field(default="", max_length=30, index=True)
     # What OCR actually detected. Kept alongside po_type so a folder/OCR
