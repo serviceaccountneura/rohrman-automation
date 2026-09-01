@@ -17,7 +17,9 @@ HOW THIS DIFFERS FROM THE OEM FLOW
         journal 70          VEHICLE PURCHASES
         document type 8     Vehicle Purchase Invoice
         reference type      Stock Number
-        template            ai-automation-vehicle-manufacturing
+        template            whichever auto-posting template at THAT dealership
+                            posts to journal 70 -- found by journal, not by
+                            name, because every store names its own
 
 WHAT COMES FROM WHERE
     Printed on the invoice   VIN, dealer cost total, MSRP, options, freight
@@ -44,9 +46,11 @@ WHAT IS DELIBERATELY NOT HERE
 UNVERIFIED -- READ BEFORE TRUSTING THE WRITE PATH
     `save_draft` posts to the same endpoint the manual JE flow uses, with
     journal 70 and document type 8 substituted. That is an INFERENCE. The Auto
-    Posting screen may issue a different request, and applying a named template
-    almost certainly needs an endpoint we have never captured. Until someone
-    captures the Auto Posting screen, run this with dry_run=True.
+    Posting screen may issue a different request, and both listing the
+    dealership's templates and applying one need endpoints we have never
+    captured -- `find_template` below is a placeholder for the first.
+
+    Capture with `npm run pw:capture:vmi`. Until then, run with dry_run=True.
 """
 from __future__ import annotations
 
@@ -63,10 +67,13 @@ from api.services.tekion_client import TekionApiClient
 
 # ── Tekion coordinates for this flow ─────────────────────────────────────────
 
-# The saved Auto Posting template. Named by the business, not by us.
-TEMPLATE_NAME = "ai-automation-vehicle-manufacturing"
-
+# The auto-posting template is found by its JOURNAL, never by its name. Every
+# dealership maintains its own templates with its own naming, so there is no one
+# name to look for -- but exactly one of them posts to journal 70, and that is
+# the one this flow wants. Matching on a name would work at one store and
+# silently pick the wrong template, or none, at the other eighteen.
 JOURNAL_NUMBER = "70"  # VEHICLE PURCHASES
+JOURNAL_NAME_HINT = "vehicle purchase"
 DOCUMENT_TYPE_SUFFIX = "document_type_8"  # Vehicle Purchase Invoice
 REFERENCE_TYPE = "STOCK_NUMBER"
 
@@ -389,7 +396,9 @@ class VehicleJournalEntryService:
             "transactionAmount": transaction_amount,
             "journalId": f"{dealer_id}_{JOURNAL_NUMBER}",
             "description": f"{facts.manufacturer} {facts.stock_number}".strip(),
-            "metadata": {"template": TEMPLATE_NAME},
+            # Filled from the resolved template once the Auto Posting calls
+            # are captured; the journal id below already selects journal 70.
+            "metadata": {},
             "refId": facts.stock_number,
             "refType": REFERENCE_TYPE,
             "refText": facts.stock_number,
@@ -398,6 +407,26 @@ class VehicleJournalEntryService:
             "scheduledTime": str(accounting_date_ms),
             "assetAttachmentDto": {},
         }
+
+    def find_template(self, dealer_id: str) -> dict[str, Any] | None:
+        """The dealership's auto-posting template for journal 70.
+
+        NOT IMPLEMENTED -- the endpoint that lists templates has never been
+        captured, so there is nothing to call yet. Raising beats returning None:
+        None would read as "this dealership has no journal-70 template", which
+        is a real and different condition, and the two must not be confused once
+        this is wired up.
+
+        When the capture lands, this should fetch the dealership's templates and
+        return the one whose journal number is JOURNAL_NUMBER -- matching on the
+        number, with JOURNAL_NAME_HINT only as a tiebreaker if a store somehow
+        has two.
+        """
+        raise NotImplementedError(
+            "Listing auto-posting templates has not been captured yet. "
+            "Run `npm run pw:capture:vmi`, walk the Auto Posting screen, then "
+            "`npm run pw:analyze:vmi`."
+        )
 
     def save_draft(self, payload: dict[str, Any], dealer_id: str) -> dict[str, Any]:
         """Persist as a draft.
