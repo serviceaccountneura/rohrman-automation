@@ -513,7 +513,20 @@ class VehicleJournalEntryService:
                     # configured.
                     "glAccountId": line.gl_account_id,
                     "amount": line.amount,
+                    # refId AND refText both carry the control value. The
+                    # manual journal entry capture is explicit about this: the
+                    # line that showed a control in Tekion sent
+                    # {"refId": "0526", "refText": "0526"}, and the line that
+                    # sent neither showed an empty Control box.
+                    #
+                    # Sending refId alone -- which is what the first vehicle
+                    # draft did -- posts an entry whose amounts are all correct
+                    # and whose Control column is blank on every line.
                     "refId": control,
+                    "refText": control,
+                    # Separate field, separate column: this fills Description,
+                    # which is why that column looked right while Control did
+                    # not.
                     "description": line.description or None,
                     "refType": line.ref_type,
                     "countAdjusted": False,
