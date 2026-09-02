@@ -50,6 +50,24 @@ def _pairs(node: Any, key: str = "") -> Iterator[tuple[str, Any]]:
             yield from _pairs(item, key)
 
 
+def _rows(node: Any) -> Iterator[dict[str, Any]]:
+    """Every dict in the OCR document, at any depth.
+
+    `_pairs` flattens the tree and loses which row a value belonged to, which is
+    fine for "find the holdback" and useless for "read across this row to its
+    dealer column". Totals on a vehicle invoice are a grid, and the answer
+    depends on the intersection.
+    """
+    if isinstance(node, dict):
+        yield node
+        for value in node.values():
+            if isinstance(value, (dict, list)):
+                yield from _rows(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _rows(item)
+
+
 def _normalise(text: Any) -> str:
     """Lowercase, punctuation-free, space-free — for substring matching."""
     return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
@@ -104,10 +122,23 @@ _ANNOTATED_AMOUNT_HINTS: dict[str, tuple[str, ...]] = {
     "floorplan": ("floorplan", "floorplancredit", "flooring"),
 }
 
-# A stock number as the stores write it: two or three letters then digits
-# ("SK6459"), or a bare digit run. Anchored so it does not match a fragment of
+# A stock number as the stores write it by hand: a short letter prefix then
+# digits. Kia writes "SK6459"; Oakbrook Toyota writes "OBT 7992" with a space,
+# and requiring the two halves to touch meant that one was read off the page
+# correctly by OCR and then thrown away here.
+#
+# The separator is optional and dropped from the result, so both forms come out
+# as a single token. Anchored at both ends so it cannot bite a fragment out of
 # the VIN, which is 17 characters of exactly this alphabet.
-_STOCK_PATTERN = re.compile(r"\b([A-Z]{1,3}\d{3,6})\b")
+_STOCK_PATTERN = re.compile(r"\b([A-Z]{1,3})[\s-]?(\d{3,6})\b")
+
+
+def _stock_from(text: Any) -> str:
+    """The stock number in some text, with any separator removed."""
+    match = _STOCK_PATTERN.search(str(text or "").upper())
+    return f"{match.group(1)}{match.group(2)}" if match else ""
+
+
 _STOCK_LABEL_HINTS = ("stocknumber", "stockno", "stock", "stk")
 
 
@@ -117,16 +148,39 @@ _STOCK_LABEL_HINTS = ("stocknumber", "stockno", "stock", "stk")
 # have understated inventory by the freight on every car.
 _NOT_A_FINAL_COST = ("sub", "base", "unit", "option", "freight", "handling")
 
+# Row labels that mean "this is the bottom line". Checked before anything is
+# inferred from magnitudes.
+_FINAL_TOTAL_LABELS = ("totalinvoice", "invoicetotal", "totaldue", "grandtotal")
+
 
 def get_dealer_cost_total(ocr: dict[str, Any]) -> float:
     """The FINAL dealer cost -- what the dealership owes for the car.
 
-    Every candidate is collected rather than taking the first, because these
-    invoices print the dealer-cost column several times down the page (base,
-    subtotal, total) and first-match lands on whichever the OCR happened to
-    emit first. Subtotal-ish labels are dropped, and the largest of what
-    remains wins: the total always exceeds its own subtotal.
+    Never the first dealer figure on the page. These invoices print that column
+    several times going down -- base, options, subtotals, total -- and taking
+    whichever the OCR emitted first read Toyota's TOTAL F.I.E. of 5,094.00 as
+    the price of a 38,189.40 car.
     """
+    # 1. A row that names itself the final total, read across to its dealer
+    #    column. This is the only reading that is certain rather than inferred,
+    #    so it is tried first. Toyota prints four dealer figures down the page
+    #    -- TOTAL F.I.E., TOTAL MODEL AND F.I.E., SUB TOTAL, TOTAL INVOICE --
+    #    and only the last is what the dealership owes.
+    for row in _rows(ocr):
+        label = _normalise(
+            row.get("label") or row.get("description") or row.get("name") or ""
+        )
+        if not any(hint in label for hint in _FINAL_TOTAL_LABELS):
+            continue
+        for key, value in row.items():
+            if any(hint in _normalise(key) for hint in _DEALER_COST_HINTS):
+                amount = _amount(value)
+                if amount:
+                    return abs(amount)
+
+    # 2. Otherwise collect every dealer-column figure and take the largest.
+    #    A total always exceeds its own subtotals, and taking the first match
+    #    landed on whichever the OCR happened to emit first.
     candidates: list[float] = []
     for label, value in _pairs(ocr):
         flat = _normalise(label)
@@ -158,17 +212,17 @@ def get_stock_number(ocr: dict[str, Any]) -> str:
     """
     for label, value in _pairs(ocr):
         if any(hint in _normalise(label) for hint in _STOCK_LABEL_HINTS):
-            match = _STOCK_PATTERN.search(str(value or "").upper())
-            if match:
-                return match.group(1)
+            found = _stock_from(value)
+            if found:
+                return found
             text = re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
             if text and len(text) <= 10:
                 return text
 
     for note in ocr.get("handwritten_notes") or []:
-        match = _STOCK_PATTERN.search(str(note or "").upper())
-        if match:
-            return match.group(1)
+        found = _stock_from(note)
+        if found:
+            return found
 
     return ""
 

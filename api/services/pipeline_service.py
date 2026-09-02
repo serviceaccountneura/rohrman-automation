@@ -31,6 +31,8 @@ CONCURRENCY
 """
 from __future__ import annotations
 
+import json
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -449,9 +451,23 @@ def _run_vehicle_journal_entry(
     )
     # The raw OCR fields this flow depends on. Printed unconditionally because
     # when nothing is annotated the only useful question is what the model
-    # actually saw, and the OCR result is not persisted anywhere to go back to.
+    # actually saw.
     print(f"[PIPE] {doc.id} ocr.gl_mappings={ocr.get('gl_mappings')}")
     print(f"[PIPE] {doc.id} ocr.handwritten_notes={ocr.get('handwritten_notes')}")
+
+    # And the whole result to disk. Every extraction bug in this flow so far has
+    # come from guessing at a structure Gemini chose rather than reading it, and
+    # the temp upload is gone by the time anyone asks. One file per document,
+    # under the uploads directory, so it travels with the rest of the run.
+    try:
+        dump_dir = Path(tempfile.gettempdir()) / "rohrman" / "ocr"
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        dump = dump_dir / f"{doc.id}.json"
+        dump.write_text(json.dumps(ocr, indent=2, default=str), encoding="utf-8")
+        print(f"[PIPE] {doc.id} ocr dumped to {dump}")
+    except Exception as e:  # noqa: BLE001
+        # Diagnostics must never be the reason a document fails to process.
+        print(f"[PIPE] {doc.id} could not dump OCR: {e}")
 
     try:
         # dealer_scope, not tekion_scope: it switches dealership INSIDE the lock,
