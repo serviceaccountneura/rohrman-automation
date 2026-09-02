@@ -477,12 +477,21 @@ class DashboardSummary(BaseModel):
 
 
 class DocumentsByType(BaseModel):
+    """Document counts per intake folder.
+
+    One field per value of PipelineFolder. A folder missing here is counted by
+    the database and then dropped on the way out -- which is what happened to
+    VEHICLE_MANUFACTURING, whose card on Document Intake read zero while its
+    own page listed the documents. Add the field whenever a folder is added.
+    """
+
     SUBLET: int = 0
     MISCELLANEOUS: int = 0
     STOCK: int = 0
     # OEM documents become journal entries rather than POs, but they are counted
     # here too so the dashboard shows every folder.
     OEM: int = 0
+    VEHICLE_MANUFACTURING: int = 0
 
 
 class ExceptionItem(BaseModel):

@@ -94,6 +94,15 @@ def get_dashboard(
     for po_type, count in rows:
         if hasattr(by_type, po_type):
             setattr(by_type, po_type, count)
+        else:
+            # A folder the response model has no field for. Silently dropping it
+            # is how VEHICLE_MANUFACTURING showed zero on Document Intake while
+            # its own page listed the documents, so say so rather than swallow
+            # the next one.
+            print(
+                f"[DASH] {count} document(s) in folder {po_type!r} are not "
+                "counted: DocumentsByType has no field for it"
+            )
 
     # Latest 3 exceptions.
     recent = session.exec(
