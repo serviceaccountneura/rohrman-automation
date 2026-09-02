@@ -422,6 +422,9 @@ class PipelineStatusResponse(BaseModel):
     manual_fields: dict[str, Any] = Field(default_factory=dict, alias="manualFields")
     # What the vehicle flow read, matched and built. Present on refusals too.
     vehicle_details: dict[str, Any] = Field(default_factory=dict, alias="vehicleDetails")
+    # Exactly which fields would fix this document, named by the code that
+    # refused it. The correction form renders these and nothing else.
+    needs_fields: list[str] = Field(default_factory=list, alias="needsFields")
     # Set when this document was cut out of a batch scan: the batch it came
     # from, and which of its pages this is ("1-2", "3").
     split_from: UUID | None = Field(default=None, alias="splitFrom")

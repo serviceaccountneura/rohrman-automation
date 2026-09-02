@@ -338,6 +338,18 @@ class VehicleEntryResult:
     tekion_template_name: str = ""
     # {GL account -> amount} as read off the invoice's handwriting.
     gl_annotations: dict[str, float] = field(default_factory=dict)
+    # Which fields a person could supply to make this document work, set
+    # alongside every refusal.
+    #
+    # The refusal text is for reading; this is for acting on. The correction
+    # form used to guess at which inputs to show by searching the message for
+    # phrases like "stock number", which meant a reworded message silently
+    # started offering the wrong boxes. The code that decides to refuse is the
+    # only thing that actually knows.
+    #
+    # Empty means nothing a person can type will help -- a dealership with no
+    # journal-70 template needs configuring in Tekion, not a form.
+    needs: list[str] = field(default_factory=list)
     postings: list[dict[str, Any]] = field(default_factory=list)
     credit_total: float = 0.0
     debit_total: float = 0.0
@@ -668,6 +680,7 @@ def create_vehicle_journal_entry(
 
     if not facts.stock_number:
         result.refusal = "no stock number on the invoice (write it on before uploading)"
+        result.needs = ["stock_number"]
         return result
     if not facts.gl_annotations:
         result.refusal = (
@@ -675,6 +688,7 @@ def create_vehicle_journal_entry(
             "number beside each amount it takes (2245 -> 780.00); without those "
             "there is nothing to post"
         )
+        result.needs = ["gl_annotations"]
         return result
 
     # ── Dealer context ───────────────────────────────────────────────────────
@@ -695,6 +709,7 @@ def create_vehicle_journal_entry(
             result.refusal = (
                 f"could not match dealership {facts.dealership_name!r} in Tekion"
             )
+            result.needs = ["dealership_name"]
             return result
         client.switch_dealer(dealer_id)
 
@@ -705,6 +720,8 @@ def create_vehicle_journal_entry(
 
     tekion_template, template_problem = service.find_template(dealer_id)
     if template_problem:
+        # Nothing a person can type fixes this: the store either has no
+        # journal-70 template or has two, and both are Tekion configuration.
         result.refusal = template_problem
         return result
     result.tekion_template_name = str(tekion_template.get("templateName") or "")
@@ -747,10 +764,12 @@ def create_vehicle_journal_entry(
             f"{result.tekion_template_name!r} has no line for "
             f"{'those accounts' if len(filled.unmatched_annotations) > 1 else 'that account'}"
         )
+        result.needs = ["gl_annotations"]
         return result
 
     if not filled.lines:
         result.refusal = "the template produced no posting lines for this invoice"
+        result.needs = ["gl_annotations"]
         return result
 
     postings = service.build_postings_from_template(filled, facts, dealer_id)
@@ -776,6 +795,9 @@ def create_vehicle_journal_entry(
             f"the entry does not balance: credit {credit:,.2f} against debit "
             f"{debit:,.2f} (off by {balance:.2f})"
         )
+        # An imbalance is almost always a misread amount. Both the annotated
+        # figures and the invoice total can move it, so offer both.
+        result.needs = ["gl_annotations", "dealer_cost_total"]
         return result
 
     if dry_run:

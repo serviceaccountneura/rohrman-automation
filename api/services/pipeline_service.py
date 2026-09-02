@@ -507,6 +507,10 @@ def _run_vehicle_journal_entry(
     # number that does not exist rejected a document the flow could process
     # perfectly well. The stock number is checked later, where it is used.
     if not facts.invoice_date:
+        # Recorded the same way a flow refusal is, so the correction form knows
+        # to ask for a date even though this never reached the vehicle flow.
+        doc.vehicle_details = json.dumps({"needs": ["invoice_date"]})
+        session.add(doc)
         _fail(session, doc, EX_MISSING_FIELD, error="missing: invoice_date")
         return
 
@@ -553,6 +557,9 @@ def _run_vehicle_journal_entry(
             "debitTotal": result.debit_total,
             "balance": result.balance,
             "refusal": result.refusal,
+            # Which fields would fix it. Empty means nothing a person can type
+            # will -- the problem is Tekion configuration.
+            "needs": result.needs,
             "postings": [
                 {
                     "glAccount": p.get("_glAccountNumber"),

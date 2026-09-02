@@ -304,6 +304,9 @@ def _to_status(
         duplicate_of=doc.duplicate_of,
         manual_fields=_as_json_object(doc.manual_fields),
         vehicle_details=_as_json_object(doc.vehicle_details),
+        needs_fields=[
+            str(f) for f in (_as_json_object(doc.vehicle_details).get("needs") or [])
+        ],
         split_from=doc.split_from,
         page_range=doc.page_range,
         children=children or [],
