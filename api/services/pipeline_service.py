@@ -448,16 +448,16 @@ def _run_vehicle_journal_entry(
 
     facts = vmi_helpers.build_facts(ocr, doc.dealership_name)
 
-    missing = [
-        name
-        for name, value in (
-            ("invoice_number", facts.invoice_number),
-            ("invoice_date", facts.invoice_date),
-        )
-        if not value
-    ]
-    if missing:
-        _fail(session, doc, EX_MISSING_FIELD, error=f"missing: {', '.join(missing)}")
+    # Only the accounting date is genuinely required. A vehicle entry is keyed on
+    # the STOCK NUMBER -- that is what goes in refId, refText and the
+    # description -- and invoice_number is not used to build it at all.
+    #
+    # Ford proves the point: its invoices carry no invoice number. The field is
+    # "Invoice & Unit Identification NO." and its value is the VIN. Demanding a
+    # number that does not exist rejected a document the flow could process
+    # perfectly well. The stock number is checked later, where it is used.
+    if not facts.invoice_date:
+        _fail(session, doc, EX_MISSING_FIELD, error="missing: invoice_date")
         return
 
     print(

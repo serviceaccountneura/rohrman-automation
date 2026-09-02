@@ -300,8 +300,14 @@ def build_facts(ocr: dict[str, Any], dealership_name: str = "") -> VehicleInvoic
     vendor_name = ocr_helpers.get_vendor_name(ocr)
     dealership = dealership_name or ocr_helpers.get_dealership_name(ocr)
 
+    # Ford's invoices have no invoice number: the field is "Invoice & Unit
+    # Identification NO." and holds the VIN. Falling back to it keeps the
+    # document row identifiable and keeps the duplicate check meaningful --
+    # one VIN is one car is one invoice.
+    invoice_number = ocr_helpers.get_invoice_number(ocr) or ocr_helpers.get_vin(ocr)
+
     return VehicleInvoiceFacts(
-        invoice_number=ocr_helpers.get_invoice_number(ocr),
+        invoice_number=invoice_number,
         invoice_date=ocr_helpers.get_invoice_date(ocr),
         dealership_name=dealership,
         manufacturer=detect_manufacturer(vendor_name, dealership),
