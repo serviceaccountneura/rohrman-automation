@@ -242,10 +242,28 @@ def _split_batch(doc: Document, source: str, session: Session) -> bool:
         return False
 
     for index, (seg, path, digest) in enumerate(written, start=1):
+        child_name = document_splitter.child_file_name(doc.file_name, seg, index)
+
+        # Each child gets its OWN archived copy. Inheriting the parent's key
+        # was wrong in a way that only shows up when someone opens one: the
+        # preview served the whole batch, so a document covering page 3 looked
+        # like it contained every invoice in the scan.
+        #
+        # A failure here is not fatal. The child still has its own file on
+        # local disk, which is what processing uses; only the preview is lost.
+        child_key = ""
+        if s3_service.is_configured():
+            try:
+                child_key = s3_service.build_s3_key(child_name, doc.dealership_name)
+                s3_service.upload_file(path, child_key)
+            except Exception as e:  # noqa: BLE001
+                print(f"[SPLIT] {doc.id} could not archive {child_name}: {e}")
+                child_key = ""
+
         session.add(
             Document(
-                file_name=document_splitter.child_file_name(doc.file_name, seg, index),
-                s3_key=doc.s3_key,
+                file_name=child_name,
+                s3_key=child_key,
                 source_path=path,
                 file_hash=digest,
                 dealership_name=doc.dealership_name,
