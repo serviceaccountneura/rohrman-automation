@@ -295,6 +295,20 @@ def _normalize_date(raw: Any) -> str:
             return datetime.strptime(text, fmt).strftime("%m/%d/%Y")
         except ValueError:
             continue
+    # Ford prints "Date Inv. Prepared" as three separate boxes, which OCR reads
+    # back as "08 05 26". Matched as a WHOLE string rather than searched for, so
+    # that three unrelated numbers sitting near each other in some other field
+    # cannot be mistaken for a date.
+    m = re.fullmatch(r"\s*(\d{1,2})[\s.](\d{1,2})[\s.](\d{2,4})\s*", text)
+    if m:
+        month, day, year = m.groups()
+        if len(year) == 2:
+            year = f"20{year}"
+        try:
+            return datetime(int(year), int(month), int(day)).strftime("%m/%d/%Y")
+        except ValueError:
+            return ""
+
     # Last resort: pull an M/D/Y out of a longer string ("Invoice Date 05/12/2026").
     m = re.search(r"(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})", text)
     if m:
