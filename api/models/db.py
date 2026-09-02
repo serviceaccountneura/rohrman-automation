@@ -204,6 +204,15 @@ class Document(SQLModel, table=True):
     # Several invoices scanned into one file are split into one document each.
     # The parent keeps the original file and the SPLIT status; each child points
     # back here and owns the pages it was cut from. A child is never re-split.
+    # What a person typed in after a refusal, as JSON. Overlaid on the OCR
+    # result when the document runs again. Separate from the OCR-derived fields
+    # on purpose: "the invoice says this" and "a person asserted this" are
+    # different claims and the difference is worth keeping.
+    manual_fields: str = Field(default="", max_length=4000)
+    # What the vehicle flow read, matched and built, as JSON. Written on every
+    # attempt including refusals -- those are the ones somebody needs to look
+    # at, and nothing else here records why an entry came out as it did.
+    vehicle_details: str = Field(default="", max_length=8000)
     split_from: UUID | None = Field(default=None, foreign_key="documents.id")
     # Which pages of the parent this document is, e.g. "1-2" or "3". Empty for
     # anything that was not split out of a batch.

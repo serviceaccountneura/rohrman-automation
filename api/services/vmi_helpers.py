@@ -328,3 +328,82 @@ def build_facts(ocr: dict[str, Any], dealership_name: str = "") -> VehicleInvoic
         annotated_gl_accounts=get_annotated_gl_accounts(ocr),
         gl_annotations=get_gl_annotations(ocr),
     )
+
+
+# ── Human corrections ────────────────────────────────────────────────────────
+
+# What a person is allowed to supply after a refusal, and how it is read. Each
+# key matches a field on VehicleInvoiceFacts.
+#
+# Deliberately a fixed list rather than "set whatever attribute is named". A
+# form posts whatever the browser sends, and letting it write arbitrary
+# attributes on the object that decides a journal entry is not a risk worth
+# taking to save a few lines.
+OVERRIDE_FIELDS: dict[str, str] = {
+    # Uppercased: Tekion holds both this way, and a control typed as "sf2979"
+    # would not reconcile against the stock number on the vehicle record.
+    "stock_number": "upper",
+    "vin": "upper",
+    "invoice_number": "text",
+    "invoice_date": "date",
+    "dealership_name": "text",
+    "manufacturer": "upper",
+    "dealer_cost_total": "amount",
+    "gl_annotations": "gl_map",
+}
+
+
+def apply_overrides(facts: VehicleInvoiceFacts, overrides: dict[str, Any]) -> list[str]:
+    """Overlay a person's corrections onto what OCR read. Returns what changed.
+
+    A person correcting a refused document outranks OCR unconditionally -- they
+    are looking at the piece of paper. Blank values are ignored rather than
+    treated as "clear this", so submitting a form with three of eight boxes
+    filled corrects three fields instead of wiping five.
+
+    GL annotations MERGE into what was read rather than replacing it: the usual
+    correction is one account OCR missed, and replacing would silently drop the
+    ones it got right.
+    """
+    changed: list[str] = []
+    for key, kind in OVERRIDE_FIELDS.items():
+        if key not in overrides:
+            continue
+        raw = overrides[key]
+
+        if kind == "gl_map":
+            merged = dict(facts.gl_annotations)
+            for account, value in (raw or {}).items():
+                account = re.sub(r"[^0-9A-Za-z]", "", str(account))
+                amount = _amount(value)
+                if account and amount is not None:
+                    merged[account] = abs(amount)
+            if merged != facts.gl_annotations:
+                facts.gl_annotations = merged
+                changed.append(key)
+            continue
+
+        if raw is None or str(raw).strip() == "":
+            continue
+
+        if kind == "amount":
+            amount = _amount(raw)
+            if amount is None:
+                continue
+            value: Any = abs(amount)
+        elif kind == "date":
+            value = ocr_helpers._normalize_date(raw)
+            if not value:
+                continue
+        elif kind == "upper":
+            value = str(raw).strip().upper()
+        else:
+            value = str(raw).strip()
+
+        if getattr(facts, key) != value:
+            setattr(facts, key, value)
+            changed.append(key)
+
+    if changed:
+        print(f"[VMI] manual overrides applied: {', '.join(changed)}")
+    return changed

@@ -225,6 +225,33 @@ def confirm_duplicate(session: Session, doc: Document) -> Document:
     return original
 
 
+def requeue_for_rerun(session: Session, doc: Document) -> Document:
+    """Put a failed document back on the queue after a person corrected it.
+
+    The attempt counter is reset. Retries exist to ride out a flaky Tekion, and
+    this is not a retry -- the inputs changed, so the previous failures say
+    nothing about whether this run will work, and letting them count would
+    exhaust the budget on a document that is now correct.
+
+    The previous error is cleared for the same reason: leaving it visible next
+    to a QUEUED row reads as a fresh failure.
+    """
+    doc.status = STATUS_QUEUED
+    doc.exception_type = None
+    doc.severity = None
+    doc.last_error = ""
+    doc.attempts = 0
+    doc.next_attempt_at = None
+    doc.locked_at = None
+    doc.locked_by = ""
+    doc.processed_at = None
+    session.add(doc)
+    session.commit()
+    session.refresh(doc)
+    print(f"[QUEUE] {doc.id} -> QUEUED (re-run with corrections)")
+    return doc
+
+
 def requeue_stale(session: Session) -> int:
     """Return abandoned PROCESSING rows to the queue.
 

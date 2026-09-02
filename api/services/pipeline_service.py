@@ -273,27 +273,91 @@ def _split_batch(doc: Document, source: str, session: Session) -> bool:
     return True
 
 
+# ── OCR cache ────────────────────────────────────────────────────────────────
+#
+# The OCR result is written to disk for every document. Two reasons, and the
+# second is why it is a cache and not just a log:
+#
+#   * every extraction bug in the vehicle flow has come from guessing at a
+#     structure Gemini chose rather than reading it, and
+#   * a document re-run with corrected fields does not need reading again. The
+#     invoice has not changed, the upload's temp file is usually gone by then,
+#     and a second Gemini pass costs money to return the same answer.
+
+
+def _ocr_cache_path(doc: Document) -> Path:
+    return Path(tempfile.gettempdir()) / "rohrman" / "ocr" / f"{doc.id}.json"
+
+
+def _cache_ocr(doc: Document, ocr: dict[str, Any]) -> None:
+    try:
+        path = _ocr_cache_path(doc)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(ocr, indent=2, default=str), encoding="utf-8")
+        print(f"[PIPE] {doc.id} ocr cached at {path}")
+    except Exception as e:  # noqa: BLE001
+        # Never the reason a document fails: this is diagnostics and a
+        # convenience, and the document can always be read again.
+        print(f"[PIPE] {doc.id} could not cache OCR: {e}")
+
+
+def _load_cached_ocr(doc: Document) -> dict[str, Any] | None:
+    try:
+        path = _ocr_cache_path(doc)
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        print(f"[PIPE] {doc.id} could not read cached OCR: {e}")
+        return None
+
+
+def manual_overrides(doc: Document) -> dict[str, Any]:
+    """What a person typed in for this document, or {}."""
+    if not doc.manual_fields:
+        return {}
+    try:
+        parsed = json.loads(doc.manual_fields)
+        return parsed if isinstance(parsed, dict) else {}
+    except ValueError:
+        print(f"[PIPE] {doc.id} manual_fields is not valid JSON; ignoring")
+        return {}
+
+
 def _run(doc: Document, session: Session) -> None:
+    # A re-run with corrected fields reuses the OCR from the first attempt. The
+    # invoice has not changed, and by this point the uploaded temp file has
+    # usually been cleaned up -- so insisting on reading it again would make
+    # "fix the stock number and try again" impossible for exactly the documents
+    # that need it.
+    overrides = manual_overrides(doc)
+    cached = _load_cached_ocr(doc) if overrides else None
+
     # ── 1. Locate the file ───────────────────────────────────────────────────
     source = _resolve_source(doc)
-    if not source:
+    if not source and cached is None:
         _fail(session, doc, EX_FILE_MISSING, error=f"no readable source for {doc.file_name!r}")
         return
 
     # ── 1b. Split a batch scan before OCR ────────────────────────────────────
     # OCR describes one document, so several invoices in one file have to become
     # several documents first. Children are never re-segmented.
-    if not doc.split_from and _split_batch(doc, source, session):
+    if cached is None and not doc.split_from and _split_batch(doc, source, session):
         return
 
     # ── 2. OCR ───────────────────────────────────────────────────────────────
-    print(f"[PIPE] {doc.id} OCR starting ({doc.po_type} folder)")
-    try:
-        ocr = extract_document(source)
-    except Exception as e:  # noqa: BLE001
-        print(f"[PIPE] OCR failed: {e}")
-        _fail(session, doc, EX_OCR_FAILED, error=str(e))
-        return
+    if cached is not None:
+        print(f"[PIPE] {doc.id} re-run: reusing cached OCR, overrides={overrides}")
+        ocr = cached
+    else:
+        print(f"[PIPE] {doc.id} OCR starting ({doc.po_type} folder)")
+        try:
+            ocr = extract_document(source)
+        except Exception as e:  # noqa: BLE001
+            print(f"[PIPE] OCR failed: {e}")
+            _fail(session, doc, EX_OCR_FAILED, error=str(e))
+            return
+        _cache_ocr(doc, ocr)
 
     # ── 3. Record what OCR found ─────────────────────────────────────────────
     doc.ocr_document_type = ocr_helpers.get_document_type(ocr)
@@ -430,23 +494,9 @@ def _run_vehicle_journal_entry(
     from api.services import vmi_helpers
     from api.services.vmi_je_creation import create_vehicle_journal_entry
 
-    # The whole OCR result to disk, FIRST -- before any check that can bail out.
-    # Every extraction bug in this flow has come from guessing at a structure
-    # Gemini chose rather than reading it, the uploaded file is deleted by the
-    # time anyone asks, and a document that fails early is exactly the one worth
-    # looking at. Dumping after the first `return` produced nothing for the Ford
-    # invoice that had no readable date.
-    try:
-        dump_dir = Path(tempfile.gettempdir()) / "rohrman" / "ocr"
-        dump_dir.mkdir(parents=True, exist_ok=True)
-        dump = dump_dir / f"{doc.id}.json"
-        dump.write_text(json.dumps(ocr, indent=2, default=str), encoding="utf-8")
-        print(f"[PIPE] {doc.id} ocr dumped to {dump}")
-    except Exception as e:  # noqa: BLE001
-        # Diagnostics must never be the reason a document fails to process.
-        print(f"[PIPE] {doc.id} could not dump OCR: {e}")
 
     facts = vmi_helpers.build_facts(ocr, doc.dealership_name)
+    vmi_helpers.apply_overrides(facts, manual_overrides(doc))
 
     # Only the accounting date is genuinely required. A vehicle entry is keyed on
     # the STOCK NUMBER -- that is what goes in refId, refText and the
@@ -485,6 +535,39 @@ def _run_vehicle_journal_entry(
         reset_client()
         _fail(session, doc, EX_TEKION_ERROR, error=str(e))
         return
+
+    # Recorded on EVERY outcome, before any of the branches below return. A
+    # refused document is the one someone opens, and until now the detail page
+    # had nothing to show them beyond the error string.
+    doc.vehicle_details = json.dumps(
+        {
+            "manufacturer": facts.manufacturer,
+            "stockNumber": facts.stock_number,
+            "vin": facts.vin,
+            "invoiceDate": facts.invoice_date,
+            "dealerCostTotal": facts.dealer_cost_total,
+            "msrpTotal": facts.msrp_total,
+            "glAnnotations": facts.gl_annotations,
+            "templateName": result.tekion_template_name,
+            "creditTotal": result.credit_total,
+            "debitTotal": result.debit_total,
+            "balance": result.balance,
+            "refusal": result.refusal,
+            "postings": [
+                {
+                    "glAccount": p.get("_glAccountNumber"),
+                    "glName": p.get("description"),
+                    "amount": p.get("amount"),
+                    "control": p.get("_control"),
+                    "source": p.get("_source"),
+                }
+                for p in result.postings
+            ],
+        },
+        default=str,
+    )[:8000]
+    session.add(doc)
+    session.commit()
 
     # Checked before the balance: a refused entry never reached the balance
     # check, so reporting "balance $0.00" would be misleading.

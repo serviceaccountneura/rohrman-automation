@@ -18,6 +18,7 @@ than opening ten Tekion sessions at once.
 from __future__ import annotations
 
 import hashlib
+import json
 import tempfile
 from pathlib import Path
 from typing import Annotated
@@ -33,8 +34,9 @@ from api.models.schemas import (
     MessageResponse,
     PipelineAcceptedResponse,
     PipelineStatusResponse,
+    RerunRequest,
 )
-from api.services import job_queue, s3_service
+from api.services import job_queue, pipeline_service, s3_service
 from api.services.pipeline_service import VALID_FOLDERS, normalize_folder
 
 router = APIRouter(prefix="/api/pipeline", tags=["pipeline"])
@@ -183,6 +185,57 @@ def discard_duplicate(
     return MessageResponse(message="Duplicate discarded")
 
 
+@router.post("/jobs/{document_id}/rerun", response_model=PipelineStatusResponse)
+def rerun_document(
+    document_id: UUID,
+    payload: RerunRequest,
+    session: Annotated[Session, Depends(get_session)],
+) -> PipelineStatusResponse:
+    """Run a refused document again, with fields a person supplied.
+
+    The invoice is not read again. OCR from the first attempt is cached, the
+    corrections are overlaid on it, and the document goes back on the queue --
+    so a missing stock number is fixed in seconds without another Gemini pass,
+    and without needing the uploaded file, which is usually gone by now.
+
+    Only a document in EXCEPTION can be re-run. A PROCESSED one has already
+    posted to Tekion, and running it again would create a second record there;
+    that path is `confirm-duplicate`, which says what it does.
+    """
+    doc = session.get(Document, document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if doc.status != job_queue.STATUS_EXCEPTION:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Document is {doc.status}; only a failed document can be re-run",
+        )
+
+    # Merged with anything supplied on an earlier re-run, so a second correction
+    # does not discard the first.
+    fields = pipeline_service.manual_overrides(doc)
+    supplied = payload.model_dump(exclude_defaults=True, by_alias=False)
+    for key, value in supplied.items():
+        if key == "gl_annotations":
+            merged = dict(fields.get("gl_annotations") or {})
+            merged.update({k: v for k, v in (value or {}).items() if str(v).strip()})
+            if merged:
+                fields["gl_annotations"] = merged
+        elif str(value).strip():
+            fields[key] = value
+
+    if not fields:
+        raise HTTPException(
+            status_code=400,
+            detail="No corrections supplied. Fill in at least one field before re-running.",
+        )
+
+    doc.manual_fields = json.dumps(fields)[:4000]
+    job_queue.requeue_for_rerun(session, doc)
+    print(f"[PIPE] {doc.id} re-run requested with {fields}")
+    return _to_status(doc, session=session)
+
+
 @router.get("/jobs/{document_id}", response_model=PipelineStatusResponse)
 def get_job(
     document_id: UUID,
@@ -205,6 +258,22 @@ def get_job(
         )
 
     return _to_status(doc, children, session=session)
+
+
+def _as_json_object(raw: str) -> dict:
+    """A stored JSON column as a dict, or {} for anything unreadable.
+
+    These columns are written by this application and never by a user, so bad
+    JSON means a bug rather than an attack -- but a detail page should still
+    render without it rather than 500 on a row somebody truncated.
+    """
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _to_status(
@@ -233,6 +302,8 @@ def _to_status(
         journal_id=doc.journal_id,
         ocr_document_type=doc.ocr_document_type,
         duplicate_of=doc.duplicate_of,
+        manual_fields=_as_json_object(doc.manual_fields),
+        vehicle_details=_as_json_object(doc.vehicle_details),
         split_from=doc.split_from,
         page_range=doc.page_range,
         children=children or [],

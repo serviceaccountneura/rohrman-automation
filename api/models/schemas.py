@@ -365,6 +365,27 @@ class PipelineFolder(str, Enum):
     VEHICLE_MANUFACTURING = "VEHICLE_MANUFACTURING"
 
 
+class RerunRequest(BaseModel):
+    """Corrections to apply before running a refused document again.
+
+    Everything is optional and blank values are ignored, so a form with three
+    of eight boxes filled corrects three fields rather than clearing five.
+    """
+
+    stock_number: str = Field(default="", alias="stockNumber")
+    vin: str = ""
+    invoice_number: str = Field(default="", alias="invoiceNumber")
+    invoice_date: str = Field(default="", alias="invoiceDate")
+    dealership_name: str = Field(default="", alias="dealershipName")
+    manufacturer: str = ""
+    dealer_cost_total: str = Field(default="", alias="dealerCostTotal")
+    # {"2245": "904.00"} -- the GL account a clerk wrote, and the amount it
+    # points at. Merged into what OCR read rather than replacing it.
+    gl_annotations: dict[str, str] = Field(default_factory=dict, alias="glAnnotations")
+
+    model_config = {"populate_by_name": True}
+
+
 class PipelineAcceptedResponse(BaseModel):
     """Returned immediately on upload, before OCR runs."""
 
@@ -396,6 +417,11 @@ class PipelineStatusResponse(BaseModel):
     ocr_document_type: str = Field(default="", alias="ocrDocumentType")
     # Set when status is DUPLICATE: the already-processed document this repeats.
     duplicate_of: UUID | None = Field(default=None, alias="duplicateOf")
+    # What a person typed in on a previous re-run, so the form comes back filled
+    # rather than blank on the second correction.
+    manual_fields: dict[str, Any] = Field(default_factory=dict, alias="manualFields")
+    # What the vehicle flow read, matched and built. Present on refusals too.
+    vehicle_details: dict[str, Any] = Field(default_factory=dict, alias="vehicleDetails")
     # Set when this document was cut out of a batch scan: the batch it came
     # from, and which of its pages this is ("1-2", "3").
     split_from: UUID | None = Field(default=None, alias="splitFrom")
