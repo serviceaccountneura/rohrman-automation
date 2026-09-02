@@ -203,6 +203,23 @@ def fill(
 
     holdback = annotations.get(_account_for_role(postings, ROLE_HOLDBACK, chart), None)
 
+    # What the vehicle was financed for. The clerk's annotation on the floor
+    # plan account wins over anything parsed off the page.
+    #
+    # This is what makes the entry balance by construction. Floor plan is
+    # credited X, inventory debited X minus holdback, holdback debited holdback
+    # -- three lines that net to zero for ANY X. Taking X from the annotation
+    # for one line and from a parsed total for another is how Ford came out
+    # 1,727.30 apart: the annotation said 45,267.70 and the totals block was
+    # read as 46,995.00, the MSRP on the same row.
+    #
+    # dealer_cost_total remains the fallback for an invoice whose floor plan
+    # line carries no annotation.
+    financed = annotations.get(_account_for_role(postings, ROLE_FLOOR_PLAN, chart))
+    if financed is None:
+        financed = dealer_cost_total
+    financed = abs(financed) if financed else 0.0
+
     # The DOC fee pair, resolved by index before the main pass. The payable
     # account names itself ("Internal DOC fee payable"); the line immediately
     # above it is the inventory side that carries the matching debit.
@@ -254,14 +271,14 @@ def fill(
         # Only the FIRST line playing a role takes it. Both stores list their
         # inventory account twice -- once for the vehicle, once for the DOC fee
         # -- and filling both from this rule posted the price of the car twice.
-        elif role and role not in roles_filled and dealer_cost_total:
+        elif role and role not in roles_filled and financed:
             if role == ROLE_FLOOR_PLAN:
-                amount = -dealer_cost_total
-                source = "dealer cost (credit)"
+                amount = -financed
+                source = "amount financed (credit)"
                 roles_filled.add(role)
             elif role == ROLE_INVOICE_PRICE and holdback is not None:
-                amount = round(dealer_cost_total - holdback, 2)
-                source = "dealer cost less holdback"
+                amount = round(financed - holdback, 2)
+                source = "financed less holdback"
                 roles_filled.add(role)
 
         # 3. A figure the store configured into the template. Schaumburg Ford

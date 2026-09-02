@@ -172,11 +172,20 @@ def get_dealer_cost_total(ocr: dict[str, Any]) -> float:
         )
         if not any(hint in label for hint in _FINAL_TOTAL_LABELS):
             continue
+        # A dealer-specific column if the row has one (Toyota prints MSRP and
+        # DEALER INVOICE side by side)...
         for key, value in row.items():
             if any(hint in _normalise(key) for hint in _DEALER_COST_HINTS):
                 amount = _amount(value)
                 if amount:
                     return abs(amount)
+        # ...otherwise the row's own value. Ford's totals come back as plain
+        # label/value pairs -- "Invoice Total" -> "45267.70" -- with no column
+        # to choose between, and requiring a dealer-named key meant skipping
+        # the one row that was already the right answer.
+        amount = _amount(row.get("value") if "value" in row else row.get("amount"))
+        if amount:
+            return abs(amount)
 
     # 2. Otherwise collect every dealer-column figure and take the largest.
     #    A total always exceeds its own subtotals, and taking the first match
