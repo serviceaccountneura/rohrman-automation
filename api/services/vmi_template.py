@@ -83,14 +83,36 @@ def _normalise(text: Any) -> str:
     return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
 
 
-def role_of(*texts: Any) -> str:
-    """Which role a line plays, from any text that describes it.
+# THE ACCOUNT NUMBER DECIDES THE ROLE. Rohrman runs one chart of accounts
+# across its stores, so the same number means the same thing everywhere:
+#
+#     2245   holdback receivable        Kia and Ford both
+#     3300   notes payable / floor plan Kia and Ford both
+#     2320   new vehicle inventory      Kia and Ford both
+#
+# Only the NAMES differ -- Kia writes "N/P NEW VEHICLE & DEMOS" where Ford
+# writes "NOTES PAY - NEW VEHICLES" -- and matching on those meant Ford's floor
+# plan went unrecognised and posted as a debit. The number was sitting right
+# there the whole time.
+_ROLE_BY_ACCOUNT = {
+    "2245": ROLE_HOLDBACK,
+    "3300": ROLE_FLOOR_PLAN,
+    "2320": ROLE_INVOICE_PRICE,
+}
 
-    Takes several candidates because a template's own `description` is usually
-    null -- Schaumburg Kia's BILL has none at all -- and the GL account NAME
-    from the chart is what actually says what the line is for:
-    "N/P NEW VEHICLE & DEMOS" is the floor plan, "NEW INV - KIA" the inventory.
+
+def role_of(*texts: Any, gl_number: str = "") -> str:
+    """Which role a line plays.
+
+    The account number first, since it is the same at every store. Names are
+    kept as a fallback for an account this map does not know, and because a
+    store could one day use a different number for the same idea -- but they are
+    no longer what the common cases depend on.
     """
+    role = _ROLE_BY_ACCOUNT.get(str(gl_number or "").strip().upper())
+    if role:
+        return role
+
     for text in texts:
         flat = _normalise(text)
         if not flat:
@@ -205,7 +227,7 @@ def fill(
         account_name = _account_name(p.get("glAccountId"), chart)
         preset = p.get("amount")
         preset = None if preset is None else round(float(preset), 2)
-        role = role_of(description, account_name)
+        role = role_of(description, account_name, gl_number=gl)
 
         amount: float | None = None
         source = ""
@@ -276,6 +298,7 @@ def fill(
                     role_of(
                         partner.get("description"),
                         _account_name(partner.get("glAccountId"), chart),
+                        gl_number=partner_gl,
                     ),
                     partner.get("amount"),
                 )
@@ -292,6 +315,7 @@ def fill(
                     role_of(
                         partner.get("description"),
                         _account_name(partner.get("glAccountId"), chart),
+                        gl_number=partner_gl,
                     ),
                     partner.get("amount"),
                 )
@@ -354,6 +378,11 @@ def _account_for_role(
 ) -> str:
     """The GL number of the template line playing `role`, or "" if none does."""
     for p in postings:
-        if role_of(p.get("description"), _account_name(p.get("glAccountId"), chart)) == role:
-            return gl_number_of(p.get("glAccountId"), chart)
+        number = gl_number_of(p.get("glAccountId"), chart)
+        if role_of(
+            p.get("description"),
+            _account_name(p.get("glAccountId"), chart),
+            gl_number=number,
+        ) == role:
+            return number
     return ""
