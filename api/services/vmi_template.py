@@ -60,10 +60,22 @@ ROLE_INVOICE_PRICE = "invoice_price"
 # and is anchored on the payable account, which is the half that names itself.
 _DOC_FEE_PAYABLE_HINTS = ("docfeepayable", "internaldocfee", "docfee")
 
+# Every store names these accounts differently, and the names are all we have.
+# Kia: "N/P NEW VEHICLE & DEMOS" and "NEW INV - KIA".
+# Ford: "NOTES PAY - NEW VEHICLES" and "INV-NEW CAR".
+# The first set matched and the second did not, so Ford's floor plan posted as
+# a debit and its inventory line mirrored the account above it. Both spellings
+# of each idea are listed rather than trying to be clever about word order.
 _ROLE_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (ROLE_HOLDBACK, ("holdback", "holdbk")),
-    (ROLE_FLOOR_PLAN, ("floorplan", "notepayable", "npnewvehicle", "npnew")),
-    (ROLE_INVOICE_PRICE, ("invoiceprice", "newinv", "inventory")),
+    (
+        ROLE_FLOOR_PLAN,
+        ("floorplan", "notepay", "notespay", "notepayable", "npnew"),
+    ),
+    (
+        ROLE_INVOICE_PRICE,
+        ("invoiceprice", "newinv", "invnew", "inventory"),
+    ),
 )
 
 
@@ -211,20 +223,15 @@ def fill(
             used.add(gl)
             annotated_index.add(index)
 
-        # 2. The store's DOC fee pair, placed by index above.
-        elif index in doc_fee_by_index:
-            amount = doc_fee_by_index[index]
-            source = "store DOC fee"
-
-        # 2b. A role the template describes, computed from the invoice. Ahead of
+        # 2. A role the template describes, computed from the invoice. Ahead of
         # the mirror rule because an inventory line that happens to sit under an
         # annotated one is still inventory: at Schaumburg Kia, NEW INV follows
         # N/P NEW VEHICLE, and mirroring it posted the full dealer cost instead
         # of cost less holdback.
         #
-        # Only the FIRST line playing a role takes it. BILL lists 2320 NEW INV
-        # twice -- once for the vehicle, once for the DOC fee -- and filling
-        # both from the same rule posted the price of the car twice.
+        # Only the FIRST line playing a role takes it. Both stores list their
+        # inventory account twice -- once for the vehicle, once for the DOC fee
+        # -- and filling both from this rule posted the price of the car twice.
         elif role and role not in roles_filled and dealer_cost_total:
             if role == ROLE_FLOOR_PLAN:
                 amount = -dealer_cost_total
@@ -235,7 +242,23 @@ def fill(
                 source = "dealer cost less holdback"
                 roles_filled.add(role)
 
-        # 2c. The line immediately after an annotated one mirrors it. Templates
+        # 3. A figure the store configured into the template. Schaumburg Ford
+        # keeps its DOC fee here as 380.00 / -380.00; Schaumburg Kia leaves the
+        # same lines at zero and the figure comes from STORE_DOC_FEE instead.
+        #
+        # Ahead of both mirror rules: a number a person typed into the template
+        # is a decision, and inferring over the top of it is how Ford's DOC fee
+        # line became a -904.00 mirror of the holdback above it.
+        elif preset:
+            amount = preset
+            source = "template preset"
+
+        # 4. The store's DOC fee, for templates that leave the line at zero.
+        elif index in doc_fee_by_index:
+            amount = doc_fee_by_index[index]
+            source = "store DOC fee"
+
+        # 5. The line immediately after an annotated one mirrors it. Templates
         # pair a receivable with the income account that offsets it -- KRS
         # RECEIVABLE then KIA RETAIL SUPPORT INCOME -- and only the receivable
         # is ever written on the invoice, because writing the same number twice
@@ -258,7 +281,7 @@ def fill(
                 )
                 source = f"mirrors {partner_gl}"
 
-        # 2d. The older named-pair convention: "DMA_" follows "DMA".
+        # 6. The older named-pair convention: "DMA_" follows "DMA".
         elif description.endswith("_") and description[:-1] in by_description:
             partner = by_description[description[:-1]][0]
             partner_gl = gl_number_of(partner.get("glAccountId"), chart)
@@ -273,11 +296,6 @@ def fill(
                     partner.get("amount"),
                 )
                 source = f"mirrors {partner_gl}"
-
-        # 3. Whatever the store preset in the template.
-        if amount is None and preset:
-            amount = preset
-            source = "template preset"
 
         if amount is None or round(amount, 2) == 0.0:
             continue
