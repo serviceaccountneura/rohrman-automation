@@ -247,6 +247,19 @@ def get_document_gl_account(ocr: dict[str, Any]) -> str:
     if len(per_line) == 1:
         return per_line.pop()
 
+    return _written_on_the_document(ocr)
+
+
+def _written_on_the_document(ocr: dict[str, Any]) -> str:
+    """A GL account written for the DOCUMENT, ignoring the line items.
+
+    Split out from `get_document_gl_account` because its first rule -- an
+    account every line agrees on -- must not be used when filling in blank
+    lines. One line carrying 7550 while another carries nothing is not
+    agreement; treating it as such copies one row's account onto rows the clerk
+    never marked, which is exactly the kind of quiet mistake that puts money in
+    the wrong account.
+    """
     for mapping in ocr.get("gl_mappings") or []:
         account = _first_gl(mapping.get("gl_account"))
         if account:
@@ -476,4 +489,24 @@ def get_raw_line_items(ocr: dict[str, Any]) -> list[dict[str, Any]]:
                 "glAccount": item.get("gl_account") or "",
             }
         )
+
+    # A GL written once for the whole document applies to every line on it.
+    #
+    # Clerks write "GL 6173" in the margin beside the charge, or across the top,
+    # and OCR reports that as a document-level account rather than a per-line
+    # one -- there is nothing pointing at an individual row to attach it to.
+    # Without this the account was read successfully and then used by nobody:
+    # the PO flows only look at line_items[].gl_account, so an invoice with a
+    # margin GL fell through to the Gemini classifier as though nothing had been
+    # written on it at all.
+    #
+    # Only fills a blank. A line with its own account keeps it, because a
+    # document-level note is the default for the page, not an override of a
+    # specific row.
+    if any(not row["glAccount"] for row in result):
+        document_gl = _written_on_the_document(ocr)
+        if document_gl:
+            for row in result:
+                if not row["glAccount"]:
+                    row["glAccount"] = document_gl
     return result
