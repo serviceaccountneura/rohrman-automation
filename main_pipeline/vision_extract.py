@@ -123,14 +123,19 @@ GL ACCOUNTS & SPATIAL BINDING:
   - For fees, discounts, freight, or subtotals outside the main table that have an assigned GL
     code, populate `gl_mappings[]` with: `gl_account`, `amount`, and `mapped_description`
     (e.g. `{"gl_account": "7555", "amount": "15.12", "mapped_description": "Delivery Charge"}`).
-  - GL CODES WRITTEN WITH THEIR OWN AMOUNTS: a handwritten block, often circled, listing accounts
-    against dollar figures is the clerk stating how the invoice divides. Capture EVERY line of it
-    in `gl_mappings[]`, one entry each, with the amount exactly as written:
+  - GL CODES WRITTEN WITH THEIR OWN AMOUNTS: wherever an account appears with a dollar figure
+    beside it, that is the clerk stating how the invoice divides. It may be circled, boxed, in a
+    margin, at the foot of the page, or just written plainly with nothing around it -- the layout
+    does not matter and there is no need for it to look like a block. What identifies it is an
+    account number followed by an amount. Capture EVERY such pair in `gl_mappings[]`, one entry
+    each, with the amount exactly as written:
 
         GL# 7193   $2,378.11        -> {"gl_account": "7193", "amount": "2378.11", ...}
         GL# 3142   $202.12          -> {"gl_account": "3142", "amount": "202.12", ...}
 
-    These do NOT belong to any single row and must not be copied into `line_items[].gl_account`.
+    Accounts written this way do NOT belong to any single row and must not be copied into
+    `line_items[].gl_account`. This is now the usual way GL accounts are marked: expect the
+    accounts to be written once for the invoice with their amounts, NOT beside individual rows.
     They typically split the invoice total -- commonly goods against sales tax -- so the amounts
     are expected to sum to it. Read the account from the "GL#"/"GL" label and the amount from the
     figure beside it; a superscript or raised cent figure ($202^12) is 202.12.

@@ -70,6 +70,11 @@ class ExpectedStockInvoice:
     # The GL account written on the invoice, usually by hand in the margin.
     # Consulted only when Tekion has no account of its own for these parts.
     gl_account: str = ""
+    # Accounts and amounts written on the invoice, e.g. "GL 7193 2378.11".
+    # When present these ARE the split, exactly as on a misc invoice: the clerk
+    # has said how the invoice divides, and nothing in the parts table
+    # reproduces that.
+    gl_splits: list[dict] = field(default_factory=list)
     # Dollar tolerance when comparing the invoice against the PO.
     amount_tolerance: float = 0.005
 
@@ -196,6 +201,25 @@ class VsoPreInvoiceService:
                     "if Tekion returns no postings of its own"
                 )
 
+            # A written block outranks even Tekion's own postings. Tekion's are
+            # derived from how the parts were set up; the block is a person
+            # looking at this invoice and saying where it goes, including for
+            # amounts the parts lines do not carry, like sales tax.
+            written_splits = [
+                {
+                    "gl_account_id": f"{dealer_id}_{sp['gl_account']}",
+                    "amount": sp["amount"],
+                    "description": sp.get("description"),
+                }
+                for sp in (expected.gl_splits or [])
+            ]
+            if written_splits:
+                total = sum(sp["amount"] for sp in written_splits)
+                print(
+                    f"[VSO] invoice carries {len(written_splits)} written GL split(s) "
+                    f"totalling {total:,.2f}; using them instead of Tekion's postings"
+                )
+
             universal_id = po.get("universalId") or f"PARTS%{po.get('id')}"
         # The universalId carries the PO type Tekion expects back, e.g.
         # "MISCELLANEOUS%10366" -> "MISCELLANEOUS".
@@ -216,13 +240,16 @@ class VsoPreInvoiceService:
             # Tekion returns one posting per part. This is only consulted when
             # that call comes back empty.
             gl_account_id=fallback_gl,
+            gl_splits=written_splits or None,
             ap_gl_account_id=f"{dealer_id}_{_AP_GL_SUFFIX}",
             ref_text=expected.po_number,
             po_type=po_type,
             sales_tax=expected.sales_tax,
             invoice_date=expected.invoice_date,
             attachment_media_ids=[media_id] if media_id else None,
-            use_returned_postings=True,
+            # Tekion's own postings are used only when the invoice does not
+            # say otherwise.
+            use_returned_postings=not written_splits,
         )
 
 

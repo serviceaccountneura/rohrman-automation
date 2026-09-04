@@ -458,6 +458,9 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         line_items=ocr_helpers.get_raw_line_items(ocr),
         # A GL account written on the invoice outranks anything we infer.
         invoice_gl_account=ocr_helpers.get_document_gl_account(ocr),
+        # Accounts with their own amounts. One debit line each, exactly as
+        # written -- see build_postings.
+        gl_splits=ocr_helpers.get_gl_amount_splits(ocr),
     )
 
     try:
@@ -675,6 +678,8 @@ def _run_stock_pre_invoice(
         invoice_file_name=doc.file_name or None,
         # Only consulted if Tekion has no GL accounts of its own for these parts.
         gl_account=ocr_helpers.get_document_gl_account(ocr),
+        # Accounts with their own amounts. These outrank Tekion's postings.
+        gl_splits=ocr_helpers.get_gl_amount_splits(ocr),
     )
 
     try:

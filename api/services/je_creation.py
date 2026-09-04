@@ -110,6 +110,12 @@ class ExpectedJournalEntry:
     # The GL account written on the invoice, usually by hand. When present it
     # wins: it is the parts department saying where this belongs.
     invoice_gl_account: str = ""
+    # Accounts AND amounts written on the invoice, e.g. "GL 7193 2378.11".
+    # These take precedence over everything: one debit line per account, for
+    # exactly the amount written. A journal entry can carry as many debit lines
+    # as it needs, so unlike the single-account fields above there is nothing
+    # to collapse -- the block maps straight onto the postings.
+    gl_splits: list[dict] = field(default_factory=list)
     # Dealership used to turn a classified category into an account number.
     # Defaults to dealership_name; only needed when the two differ.
     gl_dealership_name: str = ""
@@ -335,9 +341,26 @@ class JournalEntryService:
     def resolve_accounts(
         self, expected: ExpectedJournalEntry
     ) -> tuple[dict[str, dict[str, Any]], list[Discrepancy]]:
-        """Resolve both SOP account numbers against the live chart of accounts."""
+        """Resolve the SOP account numbers against the live chart of accounts.
+
+        Also resolves every account a written block names, stashing the result
+        on the split itself so `build_postings` does not need the chart.
+        """
         resolved: dict[str, dict[str, Any]] = {}
         problems: list[Discrepancy] = []
+
+        for split in expected.gl_splits or []:
+            number = str(split.get("gl_account") or "")
+            acc = self.find_gl_account(number)
+            if acc is None:
+                problems.append(
+                    Discrepancy(
+                        f"gl_{number}", number, "not in this dealership's chart"
+                    )
+                )
+                continue
+            split["resolved"] = acc
+            print(f"[JE] written GL {number} -> {acc['account_id']}  {acc['account_name']}")
 
         for role, number in (
             ("credit", expected.credit_gl_number),
@@ -437,6 +460,30 @@ class JournalEntryService:
                 # The part name, so the line says what it is on the JE screen.
                 row["refText"] = description[:_REF_TEXT_MAX]
             return row
+
+        # A written block replaces the per-part debit entirely: it names the
+        # accounts as well as the amounts, so each line goes to its OWN account
+        # rather than all of them to one. This is the same instruction a misc
+        # invoice carries, and it means the same thing here.
+        if expected.gl_splits:
+            for order, split in enumerate(expected.gl_splits, start=1):
+                account = split.get("resolved") or {}
+                row = {
+                    "dealerId": dealer_id,
+                    "glAccountId": account.get("account_id"),
+                    "amount": round(float(split["amount"]), 2),
+                    "refType": "CUSTOM",
+                    "countAdjusted": False,
+                    "postingOrder": order,
+                    "amountCredited": False,
+                    "_glAccountNumber": split["gl_account"],
+                    "_glAccountName": account.get("account_name"),
+                }
+                description = split.get("description")
+                if description:
+                    row["refText"] = str(description)[:_REF_TEXT_MAX]
+                postings.append(row)
+            return postings
 
         parts = _debit_lines(expected)
         if parts:
@@ -544,7 +591,13 @@ def create_journal_entry(
         expected.debit_gl_number = debit_number
     result.debit_gl_source = debit_source
 
-    parts_total, mismatch = check_line_items(expected)
+    # The parts must reconcile ONLY when the parts are what is being posted. A
+    # written block names its own accounts and amounts, so the debit side comes
+    # from it and whether the parts happen to sum to the total is irrelevant --
+    # a block that includes sales tax will not match the parts by design.
+    parts_total, mismatch = (
+        (0.0, None) if expected.gl_splits else check_line_items(expected)
+    )
     result.line_items_total = parts_total
     if mismatch:
         result.line_items_mismatch = True
