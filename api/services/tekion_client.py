@@ -1186,15 +1186,38 @@ class TekionApiClient:
                 print("[API] Pre-invoice: Tekion returned no postings; falling back")
 
         if accounting_details is None:
-            accounting_details = [
-                {
-                    "description": None,
-                    "glAccountId": gl_account_id,
-                    "postingAmount": {"amount": subtotal_cents, "currency": "USD"},
-                    "controlNumberList": None,
-                    "refText": ref_text,
-                }
-            ]
+            # Tekion had nothing, so fall back to what the invoice says. The
+            # written splits come first: they name several accounts with their
+            # own amounts, and collapsing that into one account -- which is what
+            # gl_account_id does -- would throw the division away.
+            if gl_splits:
+                accounting_details = [
+                    {
+                        "description": s.get("description"),
+                        "glAccountId": s["gl_account_id"],
+                        "postingAmount": {
+                            "amount": round(s["amount"] * 100),
+                            "currency": "USD",
+                        },
+                        "controlNumberList": None,
+                        "refText": ref_text,
+                    }
+                    for s in gl_splits
+                ]
+                print(
+                    f"[API] Pre-invoice: using {len(gl_splits)} GL split(s) "
+                    "written on the invoice"
+                )
+            else:
+                accounting_details = [
+                    {
+                        "description": None,
+                        "glAccountId": gl_account_id,
+                        "postingAmount": {"amount": subtotal_cents, "currency": "USD"},
+                        "controlNumberList": None,
+                        "refText": ref_text,
+                    }
+                ]
 
         # Step 4: Post pre-invoice
         print("[API] Pre-invoice: post...")

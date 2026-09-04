@@ -201,10 +201,13 @@ class VsoPreInvoiceService:
                     "if Tekion returns no postings of its own"
                 )
 
-            # A written block outranks even Tekion's own postings. Tekion's are
-            # derived from how the parts were set up; the block is a person
-            # looking at this invoice and saying where it goes, including for
-            # amounts the parts lines do not carry, like sales tax.
+            # Tekion's own postings come FIRST on a stock order, and the
+            # written accounts are the fallback. This is the opposite of misc,
+            # and deliberately: a stock order's parts are already configured
+            # with their inventory accounts in Tekion, and that setup is the
+            # parts department's own record of where these items belong. The
+            # writing on the invoice is only needed when Tekion has nothing to
+            # say -- see use_returned_postings below.
             written_splits = [
                 {
                     "gl_account_id": f"{dealer_id}_{sp['gl_account']}",
@@ -217,7 +220,7 @@ class VsoPreInvoiceService:
                 total = sum(sp["amount"] for sp in written_splits)
                 print(
                     f"[VSO] invoice carries {len(written_splits)} written GL split(s) "
-                    f"totalling {total:,.2f}; using them instead of Tekion's postings"
+                    f"totalling {total:,.2f}; used only if Tekion returns no postings"
                 )
 
             universal_id = po.get("universalId") or f"PARTS%{po.get('id')}"
@@ -247,9 +250,9 @@ class VsoPreInvoiceService:
             sales_tax=expected.sales_tax,
             invoice_date=expected.invoice_date,
             attachment_media_ids=[media_id] if media_id else None,
-            # Tekion's own postings are used only when the invoice does not
-            # say otherwise.
-            use_returned_postings=not written_splits,
+            # Always prefer what Tekion returns. `gl_splits` above is consulted
+            # only when that comes back empty.
+            use_returned_postings=True,
         )
 
 
