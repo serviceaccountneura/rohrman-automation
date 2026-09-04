@@ -96,21 +96,30 @@ GL ACCOUNTS & SPATIAL BINDING:
 - BIND GL CODES TO CHARGES (LAYOUT-AGNOSTIC SPATIAL RULES):
   Use the visual layout and handwritten annotations to map each detected GL code to its
   corresponding line item, charge, or fee:
-  1. Horizontal Row Alignment: If a GL code shares the same horizontal row/band as a line item,
-     assign it directly to that line item's description and amount.
+  1. Horizontal Row Alignment (HIGHEST PRIORITY, CHECK THIS FIRST): If a GL code sits on the same
+     horizontal band as a line item -- including in the LEFT OR RIGHT MARGIN, outside the table
+     border, level with that row -- it belongs to THAT line item and no other. Being in the margin
+     does not make it a document-wide default; only being level with no row does. A code written
+     level with the first of ten rows applies to that row alone.
+     Different rows routinely carry different codes: read each one independently and give every
+     row its own `gl_account`.
   2. Vector / Arrow Anchoring: If a line or arrow points from a GL code to a specific cell, part
      description, or amount, bind the GL code to that target item regardless of where it appears.
   3. Enclosure & Contour Grouping: If a dollar amount, line item, fee, discount, or tax line is
      circled, boxed, or underlined, and a GL code is written inside or adjacent to that boundary,
      bind the GL code exclusively to that enclosed item and amount.
-  4. Unanchored / Global Fallback: If a GL code is written in a header, margin, or blank area
-     without arrows or enclosures targeting a specific row, treat it as the default GL code for
-     all unmapped items/charges on the document.
+  4. Unanchored / Global Fallback (LAST RESORT): Only when a GL code lines up with no row at all
+     -- in a page header, footer, or a blank area well away from the table -- treat it as the
+     default for items that got no code from rules 1-3. Never apply this to a code that is level
+     with a row; that is rule 1.
   5. Multi-GL Split Handling: If an invoice contains multiple GL codes, resolve each code's
      spatial target independently to ensure every line item, subtotal, discount, or extra fee is
      assigned its correct GL code and corresponding dollar amount.
 - POPULATE OUTPUT:
-  - For items in `line_items[]`, populate the string field `gl_account` (e.g. `gl_account: "2410"`).
+  - For items in `line_items[]`, populate the string field `gl_account` (e.g. `gl_account: "2410"`)
+    on EVERY row that has one. This is per-row: three rows with three different handwritten codes
+    must come back as three different `gl_account` values, not one repeated or one at document
+    level. Leave it empty only for a row with no code of its own.
   - For fees, discounts, freight, or subtotals outside the main table that have an assigned GL
     code, populate `gl_mappings[]` with: `gl_account`, `amount`, and `mapped_description`
     (e.g. `{"gl_account": "7555", "amount": "15.12", "mapped_description": "Delivery Charge"}`).
