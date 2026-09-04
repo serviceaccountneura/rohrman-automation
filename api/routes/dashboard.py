@@ -467,6 +467,10 @@ def document_trends(
     session: Annotated[Session, Depends(get_session)],
     months: int = Query(default=6, ge=1, le=24, description="How many months back."),
     dealership_name: str | None = DealershipQuery,
+    date_from: str | None = DateFromQuery,
+    date_to: str | None = DateToQuery,
+    vendor: str | None = VendorQuery,
+    exception_type: str | None = ExceptionTypeQuery,
 ) -> TrendsResponse:
     """Documents per month, split by how they ended up.
 
@@ -488,11 +492,15 @@ def document_trends(
     window_start = datetime(year, month, 1, tzinfo=timezone.utc)
 
     rows = session.exec(
-        _for_dealership(
+        _filtered(
             select(Document.created_at, Document.status).where(
                 Document.created_at >= window_start
             ),
             dealership_name,
+            date_from=date_from,
+            date_to=date_to,
+            vendor=vendor,
+            exception_type=exception_type,
         )
     ).all()
 
