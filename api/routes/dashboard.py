@@ -7,7 +7,7 @@ GET /api/dashboard/documents — paginated list of documents, filterable by po_t
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
@@ -58,25 +58,101 @@ def _for_dealership(query, dealership):
     )
 
 
+# The rest of the dashboard filters, in one place for the same reason as the
+# dealership one: a summary and its own breakdown must never be counting
+# different sets of documents.
+DateFromQuery = Query(default=None, description="Documents uploaded on or after this date.")
+DateToQuery = Query(default=None, description="Documents uploaded on or before this date.")
+VendorQuery = Query(default=None, description="Only documents from this vendor.")
+ExceptionTypeQuery = Query(default=None, description="Only documents with this exception type.")
+
+
+def _parse_day(value: str | None) -> datetime | None:
+    """A YYYY-MM-DD (or ISO) date, or None. Bad input is ignored, not fatal.
+
+    A filter is a view, not an instruction: a malformed date should show the
+    unfiltered dashboard rather than 422 a page the person is just looking at.
+    """
+    if not value:
+        return None
+    text = value.strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        print(f"[DASH] ignoring unparseable date {value!r}")
+        return None
+
+
+def _filtered(
+    query,
+    dealership: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    vendor: str | None = None,
+    exception_type: str | None = None,
+):
+    """Apply every dashboard filter that was supplied.
+
+    `date_to` is inclusive of the whole day. Someone picking "today" for both
+    ends means today, not the instant of midnight -- comparing against the bare
+    date would return nothing, which reads as broken rather than as empty.
+    """
+    query = _for_dealership(query, dealership)
+
+    start = _parse_day(date_from)
+    if start:
+        query = query.where(Document.created_at >= start)
+
+    end = _parse_day(date_to)
+    if end:
+        query = query.where(Document.created_at < end + timedelta(days=1))
+
+    if vendor:
+        query = query.where(func.lower(Document.vendor_name) == vendor.strip().lower())
+
+    if exception_type:
+        query = query.where(Document.exception_type == exception_type.strip())
+
+    return query
+
+
 @router.get("", response_model=DashboardResponse)
 def get_dashboard(
     session: Annotated[Session, Depends(get_session)],
     dealership_name: str | None = DealershipQuery,
+    date_from: str | None = DateFromQuery,
+    date_to: str | None = DateToQuery,
+    vendor: str | None = VendorQuery,
+    exception_type: str | None = ExceptionTypeQuery,
 ) -> DashboardResponse:
+    def _scope(query):
+        return _filtered(
+            query,
+            dealership_name,
+            date_from=date_from,
+            date_to=date_to,
+            vendor=vendor,
+            exception_type=exception_type,
+        )
+
     # Summary counts — single query per status.
     def _count(status: str) -> int:
         return session.exec(
-            _for_dealership(
+            _scope(
                 select(func.count())
                 .select_from(Document)
-                .where(Document.status == status),
-                dealership_name,
+                .where(Document.status == status)
             )
         ).one()
 
     summary = DashboardSummary(
         total=session.exec(
-            _for_dealership(select(func.count()).select_from(Document), dealership_name)
+            _scope(select(func.count()).select_from(Document))
         ).one(),
         processed=_count("PROCESSED"),
         exceptions=_count("EXCEPTION"),
@@ -85,9 +161,8 @@ def get_dashboard(
 
     # Documents by PO type.
     rows = session.exec(
-        _for_dealership(
-            select(Document.po_type, func.count()).where(Document.po_type != ""),
-            dealership_name,
+        _scope(
+            select(Document.po_type, func.count()).where(Document.po_type != "")
         ).group_by(Document.po_type)
     ).all()
     by_type = DocumentsByType()
@@ -106,9 +181,7 @@ def get_dashboard(
 
     # Latest 3 exceptions.
     recent = session.exec(
-        _for_dealership(
-            select(Document).where(Document.status == "EXCEPTION"), dealership_name
-        )
+        _scope(select(Document).where(Document.status == "EXCEPTION"))
         .order_by(Document.created_at.desc())  # type: ignore[union-attr]
         .limit(3)
     ).all()
@@ -128,6 +201,45 @@ def get_dashboard(
         by_type=by_type,
         recent_exceptions=recent_exceptions,
     )
+
+
+@router.get("/filter-options")
+def filter_options(
+    session: Annotated[Session, Depends(get_session)],
+    dealership_name: str | None = DealershipQuery,
+) -> dict[str, list[str]]:
+    """The values actually worth filtering by, from the data itself.
+
+    The filter panel shipped with invented options -- "NAPA", "Bosch", "Denso"
+    -- none of which any document carries, so every choice returned nothing.
+    Reading the distinct values means the list can only ever offer filters that
+    match something.
+
+    Scoped to the selected dealership for the same reason the counts are: a
+    vendor list from another store is a list of dead ends.
+    """
+    vendors = session.exec(
+        _for_dealership(
+            select(Document.vendor_name)
+            .where(Document.vendor_name != "")
+            .distinct(),
+            dealership_name,
+        ).order_by(Document.vendor_name)
+    ).all()
+
+    exception_types = session.exec(
+        _for_dealership(
+            select(Document.exception_type)
+            .where(Document.exception_type.is_not(None))
+            .distinct(),
+            dealership_name,
+        ).order_by(Document.exception_type)
+    ).all()
+
+    return {
+        "vendors": [v for v in vendors if v],
+        "exceptionTypes": [e for e in exception_types if e],
+    }
 
 
 @router.get("/documents", response_model=DocumentListResponse)
