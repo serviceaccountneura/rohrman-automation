@@ -123,6 +123,19 @@ GL ACCOUNTS & SPATIAL BINDING:
   - For fees, discounts, freight, or subtotals outside the main table that have an assigned GL
     code, populate `gl_mappings[]` with: `gl_account`, `amount`, and `mapped_description`
     (e.g. `{"gl_account": "7555", "amount": "15.12", "mapped_description": "Delivery Charge"}`).
+  - GL CODES WRITTEN WITH THEIR OWN AMOUNTS: a handwritten block, often circled, listing accounts
+    against dollar figures is the clerk stating how the invoice divides. Capture EVERY line of it
+    in `gl_mappings[]`, one entry each, with the amount exactly as written:
+
+        GL# 7193   $2,378.11        -> {"gl_account": "7193", "amount": "2378.11", ...}
+        GL# 3142   $202.12          -> {"gl_account": "3142", "amount": "202.12", ...}
+
+    These do NOT belong to any single row and must not be copied into `line_items[].gl_account`.
+    They typically split the invoice total -- commonly goods against sales tax -- so the amounts
+    are expected to sum to it. Read the account from the "GL#"/"GL" label and the amount from the
+    figure beside it; a superscript or raised cent figure ($202^12) is 202.12.
+  - A code in that block that appears WITHOUT an amount is the older per-row style: leave it out of
+    the block and bind it to its row under the spatial rules above.
   - ALWAYS populate `gl_mappings[]` for a handwritten GL code that an arrow, line or bracket ties
     to ANY value on the page -- not only for fees and charges. On a vehicle manufacturer invoice
     this is the entire point of the annotation, and every handwritten code must appear there.

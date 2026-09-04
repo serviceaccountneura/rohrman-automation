@@ -125,9 +125,25 @@ class CreateSubletPoRequest(_CreatePoBase):
     line_items: list[SubletLineItem] = Field(default_factory=list, alias="lineItems")
 
 
+class GlSplitInput(BaseModel):
+    """One GL account and the share of the invoice it takes."""
+
+    gl_account: str = Field(alias="glAccount")
+    amount: float
+    description: str | None = None
+
+    model_config = {"populate_by_name": True}
+
+
 class CreateMiscPoRequest(_CreatePoBase):
     po_type: Literal["MISCELLANEOUS"] = "MISCELLANEOUS"
     line_items: list[MiscLineItem] = Field(default_factory=list, alias="lineItems")
+    # Accounts and amounts written on the invoice as a block, e.g.
+    # "GL# 7193 $2,378.11 / GL# 3142 $202.12". When present these ARE the
+    # posting split -- they say how the invoice divides, which the line items
+    # cannot: nothing in a parts table says which account the sales tax
+    # belongs in.
+    gl_splits: list[GlSplitInput] = Field(default_factory=list, alias="glSplits")
 
 
 class CreateStockPoRequest(_CreatePoBase):

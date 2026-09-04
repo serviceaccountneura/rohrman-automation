@@ -732,6 +732,7 @@ def _run_purchase_order(
 
     from api.models.schemas import (
         CreateMiscPoRequest,
+        GlSplitInput,
         CreateStockPoRequest,
         CreateSubletPoRequest,
         MiscLineItem,
@@ -869,7 +870,20 @@ def _run_purchase_order(
                     unit_price=expected_po_total,
                 )
             ]
-            req = CreateMiscPoRequest(**common, line_items=misc_items)
+            # Accounts and amounts written as a block outrank anything derived
+            # from the rows -- see get_gl_amount_splits.
+            req = CreateMiscPoRequest(
+                **common,
+                line_items=misc_items,
+                gl_splits=[
+                    GlSplitInput(
+                        gl_account=sp["gl_account"],
+                        amount=sp["amount"],
+                        description=sp["description"],
+                    )
+                    for sp in ocr_helpers.get_gl_amount_splits(ocr)
+                ],
+            )
             with tekion_scope():
                 response = _create_misc_po(req, session)
 

@@ -336,7 +336,34 @@ def _create_misc_po(
         # Check if line items have GL accounts from OCR.
         ocr_gl_items = [li for li in req.line_items if li.gl_account]
 
-        if ocr_gl_items:
+        if req.gl_splits:
+            # Written on the invoice as accounts AND amounts. This is the whole
+            # instruction, so it is used as given -- no grouping, no deriving
+            # from the rows. A clerk splitting 2,580.23 into 2,378.11 of goods
+            # and 202.12 of tax has already done the arithmetic, and the parts
+            # table contains nothing that would reproduce it.
+            gl_splits = [
+                {
+                    "gl_account_id": f"{dealer_id}_{sp.gl_account}",
+                    "amount": sp.amount,
+                    "description": sp.description,
+                }
+                for sp in req.gl_splits
+            ]
+            written = sum(sp.amount for sp in req.gl_splits)
+            print(
+                f"[Misc] Using {len(gl_splits)} GL split(s) written on the invoice, "
+                f"totalling {written:,.2f} against an invoice of {req.invoice_amount:,.2f}"
+            )
+            if abs(written - req.invoice_amount) > 0.01:
+                # Not fatal: Tekion takes the postings as given, and a clerk may
+                # deliberately split only part of an invoice. Worth saying
+                # loudly, because the usual cause is a misread amount.
+                print(
+                    f"[Misc] WARNING: splits differ from the invoice total by "
+                    f"{written - req.invoice_amount:,.2f}"
+                )
+        elif ocr_gl_items:
             # Build gl_splits from OCR-extracted GL accounts.
             # Group by GL account number, summing amounts per account.
             gl_totals: dict[str, float] = {}

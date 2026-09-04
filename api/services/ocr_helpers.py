@@ -510,3 +510,40 @@ def get_raw_line_items(ocr: dict[str, Any]) -> list[dict[str, Any]]:
                 if not row["glAccount"]:
                     row["glAccount"] = document_gl
     return result
+
+
+def get_gl_amount_splits(ocr: dict[str, Any]) -> list[dict[str, Any]]:
+    """GL accounts written on the invoice WITH the amount each one takes.
+
+    The newer annotation style. Instead of marking each row, the clerk writes a
+    block naming the accounts and how the invoice divides between them:
+
+        GL# 7193   $2,378.11
+        GL# 3142   $202.12
+
+    That is a complete instruction on its own -- the accounts and the split --
+    so it does not need line items to be attached to, and there is no rule that
+    could derive it from them. The two amounts above are the goods and the sales
+    tax; nothing about the parts table says which account tax belongs in.
+
+    Returns [] when the invoice carries no amounts against its accounts, which
+    is the older style where a code sits beside a row and the split has to be
+    worked out from the rows themselves.
+    """
+    splits: list[dict[str, Any]] = []
+    for mapping in ocr.get("gl_mappings") or []:
+        if not isinstance(mapping, dict):
+            continue
+        account = _first_gl(mapping.get("gl_account"))
+        amount = _parse_amount(mapping.get("amount"))
+        # An account with no amount is the older style and belongs to the
+        # per-line path; taking it here would post a zero split.
+        if account and amount:
+            splits.append(
+                {
+                    "gl_account": account,
+                    "amount": round(amount, 2),
+                    "description": str(mapping.get("mapped_description") or "") or None,
+                }
+            )
+    return splits
