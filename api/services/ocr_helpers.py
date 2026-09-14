@@ -569,6 +569,22 @@ def get_raw_line_items(ocr: dict[str, Any]) -> list[dict[str, Any]]:
             qty = 1.0
         unit_price = _parse_amount(item.get("unit_price") or item.get("unitPrice"))
         total_price = _parse_amount(item.get("total_price") or item.get("totalPrice"))
+
+        # A row priced ONLY as an extended total.
+        #
+        # Plenty of invoices have one price column and no quantity at all -- a
+        # body shop billing "rear hatch scratches ... 85.00" is not selling 85
+        # of anything. OCR reports that as total_price with unit_price empty,
+        # and everything downstream values the row at qty x unitPrice, which is
+        # zero. On a G.A.R.I. sublet invoice that made all eight rows worth
+        # nothing, so they failed to reconcile against the 760.00 total and were
+        # thrown away -- taking the repair order numbers on them with it.
+        #
+        # Only fills a blank. A row that states its own unit price keeps it,
+        # even where the two disagree, because that disagreement is the
+        # invoice's and not ours to reconcile.
+        if not unit_price and total_price:
+            unit_price = round(total_price / qty, 2) if qty else total_price
         result.append(
             {
                 "description": item.get("description") or "",

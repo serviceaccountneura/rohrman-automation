@@ -990,6 +990,13 @@ def _run_purchase_order(
     # to a single line for the correct amount — less itemised, but truthful
     # about what is owed, and it matches what the existing flow already does
     # when OCR finds no line items at all.
+    # The rows AS READ, before the reconciliation below is allowed to discard
+    # them. A sublet invoice's repair order numbers live on these rows, and
+    # collapsing to a single line -- which is the right answer for the PO total
+    # -- would throw them away and leave the document reporting that it has no
+    # repair orders, when it plainly has eight written on it.
+    rows_as_read = list(line_items)
+
     expected_po_total = round(total - sales_tax, 2)
     line_total = round(sum(i["qty"] * i["unitPrice"] for i in line_items), 2)
     if line_items and abs(line_total - expected_po_total) > 0.01:
@@ -1050,13 +1057,16 @@ def _run_purchase_order(
             # on, rather than us inferring it from the most recent open RO on a
             # vehicle -- and a page listing eight cars has no single VIN for the
             # search to start from at all.
-            written_ros = [str(item.get("roNumber") or "") for item in line_items]
-            if line_items and all(written_ros):
+            # From the rows as read: see rows_as_read. A sublet invoice whose
+            # prices failed to reconcile still names its repair orders, and the
+            # orders are what this path needs.
+            written_ros = [str(item.get("roNumber") or "") for item in rows_as_read]
+            if rows_as_read and all(written_ros):
                 with tekion_scope():
                     client = get_client(session)
                     _resolve_dealer(client, doc.dealership_name)
                     items, problem = _sublet_items_from_written_ros(
-                        client, line_items, written_ros
+                        client, rows_as_read, written_ros
                     )
                 if problem:
                     _fail(session, doc, EX_TEKION_REJECTED, error=problem)
