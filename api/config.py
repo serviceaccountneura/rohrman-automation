@@ -34,6 +34,13 @@ class Settings(BaseSettings):
     # is obvious rather than silently degraded.
     s3_bucket: str = ""
     s3_presign_expiry: int = 300  # seconds (5 min)
+    # Point S3 somewhere other than AWS -- MinIO on the staging box, say.
+    # Empty means real S3, which is what production uses, so nothing changes
+    # there. Any S3-compatible server also needs path-style addressing:
+    # bucket.host virtual-hosting only resolves for AWS, so another endpoint
+    # has to be addressed as host/bucket instead.
+    s3_endpoint_url: str = ""
+    s3_force_path_style: bool = False
 
     # ── Frontend ──────────────────────────────────────────────────────────────
     frontend_url: str = "http://localhost:3000"

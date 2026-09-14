@@ -62,11 +62,23 @@ def _get_s3_client():
     The arguments are built rather than always passed: handing botocore an
     explicit None is not the same as omitting the key, and suppresses the
     fallback chain entirely.
+
+    `s3_endpoint_url` points the client at an S3-compatible server instead of
+    AWS -- MinIO, on staging. It is empty in production, so nothing below
+    changes there.
     """
+    boto_config: dict = {"signature_version": "s3v4"}
+    if settings.s3_endpoint_url or settings.s3_force_path_style:
+        # bucket.host virtual-hosting resolves only for AWS; anything else has
+        # to be addressed as host/bucket.
+        boto_config["s3"] = {"addressing_style": "path"}
+
     kwargs: dict = {
         "region_name": settings.aws_region,
-        "config": BotoConfig(signature_version="s3v4"),
+        "config": BotoConfig(**boto_config),
     }
+    if settings.s3_endpoint_url:
+        kwargs["endpoint_url"] = settings.s3_endpoint_url
     if settings.aws_access_key_id and settings.aws_secret_access_key:
         kwargs["aws_access_key_id"] = settings.aws_access_key_id
         kwargs["aws_secret_access_key"] = settings.aws_secret_access_key
