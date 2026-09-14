@@ -576,6 +576,11 @@ def get_raw_line_items(ocr: dict[str, Any]) -> list[dict[str, Any]]:
                 "unitPrice": unit_price,
                 "totalPrice": total_price,
                 "glAccount": item.get("gl_account") or "",
+                # The repair order this row's work was done on. A sublet invoice
+                # that bills several vehicles names one per row; without it the
+                # flow has to guess the RO from the VIN, and a page listing eight
+                # cars has no single VIN to guess from.
+                "roNumber": _clean_ro_number(item.get("ro_number") or ""),
             }
         )
 

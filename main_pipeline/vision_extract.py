@@ -190,6 +190,17 @@ GL ACCOUNTS & SPATIAL BINDING:
     letters and drop leading zeros. When a handwritten GL code points at such a segment, emit
     `{"gl_account": "2245", "amount": "780.00", "mapped_description": "KAC0780KAC"}` -- put the
     code segment verbatim in `mapped_description` so the reading can be checked.
+  - A REPAIR ORDER NUMBER WRITTEN ON A ROW: a sublet invoice often bills several vehicles at
+    once, one per row, with that vehicle's repair order number written beside it -- frequently by
+    hand, in a different colour from the printed text, and often with a stock number on the same
+    row. Put it in that row's `ro_number`, per row, exactly as the per-row `gl_account` works:
+    eight rows with eight different numbers must come back as eight different `ro_number` values,
+    not one repeated and not one at document level.
+
+    An RO number is 5-8 digits and carries NO letters. Do not put a stock number there -- those
+    look like "SH3626P" or "SH10649A", letters and digits together -- and do not put a part
+    number, a VIN fragment, a date or a price there. A row with no such number gets an empty
+    `ro_number`; leave it out rather than reusing the row above.
   - A PURCHASE ORDER NUMBER WRITTEN ON BY HAND: staff often write the PO number the invoice
     should be billed against in a margin or at the top of the page -- "PO 35096", "P.O. #35096",
     or just "35096" beside the word PO. Put it in `identifiers[]` as
@@ -262,6 +273,7 @@ def build_response_schema() -> types.Schema:
             "unit_price": _str(),
             "total_price": _str(),
             "gl_account": _str(),
+            "ro_number": _str(),
         })),
         "tables": _arr(_obj({
             "title": _str(),

@@ -1037,8 +1037,48 @@ def _run_purchase_order(
                 _finish_purchase_order(doc, response, session)
                 return
 
+            # THE INVOICE NAMES ITS OWN REPAIR ORDERS.
+            #
+            # The VIN search below exists because a sublet invoice usually bills
+            # one car and does not say which repair order it was, so the RO has
+            # to be found from the vehicle. Some vendors do say: a body shop
+            # billing eight cars at once writes the RO beside each row, because
+            # the invoice would be unreadable otherwise.
+            #
+            # When they are there, use them. They are better evidence than the
+            # VIN search is -- the clerk wrote down the RO this work was done
+            # on, rather than us inferring it from the most recent open RO on a
+            # vehicle -- and a page listing eight cars has no single VIN for the
+            # search to start from at all.
+            written_ros = [str(item.get("roNumber") or "") for item in line_items]
+            if line_items and all(written_ros):
+                with tekion_scope():
+                    client = get_client(session)
+                    _resolve_dealer(client, doc.dealership_name)
+                    items, problem = _sublet_items_from_written_ros(
+                        client, line_items, written_ros
+                    )
+                if problem:
+                    _fail(session, doc, EX_TEKION_REJECTED, error=problem)
+                    return
+
+                req = CreateSubletPoRequest(**common, line_items=items)
+                with tekion_scope():
+                    response = _create_sublet_po(req, session)
+                _finish_purchase_order(doc, response, session)
+                return
+
             if not doc.vin:
-                _fail(session, doc, EX_MISSING_FIELD, error="sublet with no VIN")
+                _fail(
+                    session,
+                    doc,
+                    EX_MISSING_FIELD,
+                    error=(
+                        "this sublet invoice has no VIN and no repair order "
+                        "number on its rows, so there is nothing to attach the "
+                        "work to"
+                    ),
+                )
                 return
 
             with tekion_scope():
@@ -1153,6 +1193,66 @@ def _run_purchase_order(
         return
 
     _finish_purchase_order(doc, response, session)
+
+
+def _sublet_items_from_written_ros(
+    client: Any,
+    line_items: list[dict[str, Any]],
+    written_ros: list[str],
+) -> tuple[list[Any], str]:
+    """Build sublet PO lines from the repair orders written on the invoice.
+
+    Returns (items, problem). A non-empty problem means stop -- every line has
+    to land on a real job, because a PO short one line bills the vendor for work
+    that is recorded against nothing.
+
+    Each row keeps its OWN repair order. A Tekion sublet line names a job, and
+    one invoice can span eight vehicles and eight orders; they are not
+    interchangeable and nothing here falls back to the first one.
+    """
+    from fastapi import HTTPException  # noqa: F401  (kept for symmetry)
+
+    from api.models.schemas import SubletLineItem
+    from api.services.job_matching import match_line_items_to_jobs
+
+    items: list[Any] = []
+    for item, ro_number in zip(line_items, written_ros):
+        found = client.search_ro(ro_number)
+        if not found:
+            # search_ro deliberately hides anything INVOICED, CLOSED or VOIDED,
+            # so say which it is rather than "no such RO" for one that plainly
+            # exists. A closed order is a decision for a person, not a lookup
+            # failure to retry.
+            return [], (
+                f"repair order {ro_number} is not open at this dealership -- it "
+                f"is closed, invoiced or does not exist, so this sublet cost "
+                f"cannot be added to it"
+            )
+
+        ro = found[0]
+        jobs = client.get_ro_jobs(ro["id"])
+        if not jobs:
+            return [], f"repair order {ro_number} has no jobs to bill this against"
+
+        description = item.get("description") or "Sublet repair"
+        if len(jobs) == 1:
+            job_number = jobs[0]["jobNumber"]
+        else:
+            # Several jobs on one order: the same LLM match the VIN path uses,
+            # asked about this row alone.
+            job_number = match_line_items_to_jobs([description], jobs)[0]
+
+        items.append(
+            SubletLineItem(
+                ro_number=ro["roNumber"] or ro_number,
+                job_number=job_number,
+                description=description,
+                labor_amount=0.0,
+                parts_amount=item.get("totalPrice") or item.get("unitPrice") or 0.0,
+            )
+        )
+
+    return items, ""
 
 
 def _finish_purchase_order(doc: Document, response: Any, session: Session) -> None:
