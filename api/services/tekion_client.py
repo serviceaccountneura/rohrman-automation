@@ -789,16 +789,37 @@ class TekionApiClient:
         # The search is fuzzy; only an exact number is safe to act on.
         return None
 
-    def search_ro(self, ro_number: str) -> list[dict[str, str]]:
+    def search_ro(self, ro_number: str, include_closed: bool = False) -> list[dict[str, str]]:
+        """Find a repair order by its number.
+
+        Open orders only by default, which is right when the RO is being
+        DISCOVERED -- work still in progress is what a sublet invoice normally
+        refers to.
+
+        `include_closed` is for the case where the invoice NAMES the order. A
+        vendor who bills weeks later is writing down an order that has long
+        since closed, and refusing to look at it turns a known number into "no
+        such RO". What to do with a closed one is the caller's decision; this
+        only stops hiding it.
+        """
+        filters: list[dict[str, Any]] = [
+            {"field": "siteId", "operator": "IN", "values": [self.site_id]},
+        ]
+        if not include_closed:
+            filters.insert(
+                0,
+                {
+                    "field": "status",
+                    "operator": "NIN",
+                    "values": ["INVOICED", "CLOSED", "VOIDED"],
+                },
+            )
         res = self._req_json(
             "/api/lookup/search",
             method="POST",
             body={
                 "REPAIR_ORDER_ASSET": {
-                    "filters": [
-                        {"field": "status", "operator": "NIN", "values": ["INVOICED", "CLOSED", "VOIDED"]},
-                        {"field": "siteId", "operator": "IN", "values": [self.site_id]},
-                    ],
+                    "filters": filters,
                     "searchText": ro_number,
                     "pageInfo": {"start": 0, "rows": 20},
                     "sort": [],

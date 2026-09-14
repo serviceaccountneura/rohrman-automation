@@ -1217,30 +1217,42 @@ def _sublet_items_from_written_ros(
 
     items: list[Any] = []
     for item, ro_number in zip(line_items, written_ros):
-        found = client.search_ro(ro_number)
+        # Open orders first; then, failing that, any order at all.
+        #
+        # A vendor who bills weeks after the work writes down an order that has
+        # long since closed -- every one of the eight on the G.A.R.I. invoice
+        # had. Refusing to look turns a number the clerk wrote down into "no
+        # such RO", which is simply untrue.
+        found = client.search_ro(ro_number) or client.search_ro(
+            ro_number, include_closed=True
+        )
         if not found:
-            # search_ro deliberately hides anything INVOICED, CLOSED or VOIDED,
-            # so say which it is rather than "no such RO" for one that plainly
-            # exists. A closed order is a decision for a person, not a lookup
-            # failure to retry.
             return [], (
-                f"repair order {ro_number} is not open at this dealership -- it "
-                f"is closed, invoiced or does not exist, so this sublet cost "
-                f"cannot be added to it"
+                f"there is no repair order {ro_number} at this dealership"
             )
 
-        ro = found[0]
+        # An exact match, not merely the first hit: the lookup is a text search
+        # and "1581221" also matches "15812210".
+        ro = next(
+            (r for r in found if str(r.get("roNumber")) == str(ro_number)), found[0]
+        )
         jobs = client.get_ro_jobs(ro["id"])
         if not jobs:
             return [], f"repair order {ro_number} has no jobs to bill this against"
 
         description = item.get("description") or "Sublet repair"
         if len(jobs) == 1:
+            # Nothing to choose between. Every order on the invoice that
+            # prompted this had exactly one job, which is the usual shape when
+            # a body shop is billing one repair per car.
             job_number = jobs[0]["jobNumber"]
         else:
-            # Several jobs on one order: the same LLM match the VIN path uses,
-            # asked about this row alone.
-            job_number = match_line_items_to_jobs([description], jobs)[0]
+            # Several jobs on one order, so the row has to say which. The same
+            # LLM match the VIN path uses -- and it needs get_ro_job_details,
+            # not get_ro_jobs: the latter returns no concern or story text at
+            # all, so matching against it would be matching against nothing.
+            detailed = client.get_ro_job_details(ro["id"]) or jobs
+            job_number = match_line_items_to_jobs([description], detailed)[0]
 
         items.append(
             SubletLineItem(

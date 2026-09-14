@@ -260,13 +260,21 @@ def _create_sublet_po(
         # flow and has nothing to say about a PO somebody else raised.
         items: list[dict] = []
         for li in req.line_items if not existing_po else []:
-            ros = client.search_ro(li.ro_number)
+            # The same two-step as the pipeline: an open order if there is
+            # one, otherwise whatever the number names. The VIN path always
+            # finds an open order first, so its behaviour does not change.
+            ros = client.search_ro(li.ro_number) or client.search_ro(
+                li.ro_number, include_closed=True
+            )
             if not ros:
                 raise HTTPException(
                     status_code=404,
                     detail=f"No RO found for '{li.ro_number}'",
                 )
-            ro = ros[0]
+            ro = next(
+                (r for r in ros if str(r.get("roNumber")) == str(li.ro_number)),
+                ros[0],
+            )
 
             jobs = client.get_ro_jobs(ro["id"])
             if not jobs:
