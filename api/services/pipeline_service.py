@@ -1226,6 +1226,7 @@ def _sublet_items_from_written_ros(
     from api.services.job_matching import match_line_items_to_jobs
 
     items: list[Any] = []
+    closed: list[str] = []
     for item, ro_number in zip(line_items, written_ros):
         # Open orders first; then, failing that, any order at all.
         #
@@ -1246,6 +1247,17 @@ def _sublet_items_from_written_ros(
         ro = next(
             (r for r in found if str(r.get("roNumber")) == str(ro_number)), found[0]
         )
+        # TEKION WILL NOT TAKE IT. Asked to submit a sublet against a closed
+        # order it answers "Can not Submit Sublet" with RO_CLOSED against every
+        # job id -- so this is its rule, not a policy invented here.
+        #
+        # Checked before anything is built, and every offending order is
+        # collected rather than stopping at the first: a page billing eight cars
+        # is worth being told about all eight at once.
+        if str(ro.get("status") or "").upper() in client.CLOSED_RO_STATUSES:
+            closed.append(f"{ro_number} ({str(ro.get('status')).lower()})")
+            continue
+
         jobs = client.get_ro_jobs(ro["id"])
         if not jobs:
             return [], f"repair order {ro_number} has no jobs to bill this against"
@@ -1272,6 +1284,14 @@ def _sublet_items_from_written_ros(
                 labor_amount=0.0,
                 parts_amount=item.get("totalPrice") or item.get("unitPrice") or 0.0,
             )
+        )
+
+    if closed:
+        return [], (
+            "Tekion will not accept a sublet against a closed repair order. "
+            + ("These are closed: " if len(closed) > 1 else "This one is closed: ")
+            + ", ".join(closed)
+            + ". Reopen them in Tekion and run this again, or enter the invoice by hand."
         )
 
     return items, ""
