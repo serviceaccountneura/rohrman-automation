@@ -51,7 +51,25 @@ def _content_type_for(key: str) -> str:
     return _CONTENT_TYPES.get(ext) or mimetypes.guess_type(key)[0] or "application/octet-stream"
 
 
-def _get_s3_client():
+def _get_presign_client():
+    """A client used ONLY to sign URLs someone else will fetch.
+
+    Signing is local arithmetic -- botocore builds the signature and returns,
+    it never calls the endpoint -- so this client may point at an address this
+    process cannot reach. That is the whole point: with MinIO beside us, the
+    api talks to http://minio:9000 while the browser needs a public address,
+    and a SigV4 signature covers the host, so the URL has to be signed for the
+    host that will actually be requested.
+
+    Falls back to the normal client when no separate public address is set,
+    which is every deployment on real S3.
+    """
+    if not settings.s3_public_endpoint_url:
+        return _get_s3_client()
+    return _get_s3_client(endpoint_override=settings.s3_public_endpoint_url)
+
+
+def _get_s3_client(endpoint_override: str | None = None):
     """An S3 client, however this environment supplies credentials.
 
     Explicit keys win when set, which keeps local development working from a
@@ -67,8 +85,10 @@ def _get_s3_client():
     AWS -- MinIO, on staging. It is empty in production, so nothing below
     changes there.
     """
+    endpoint = endpoint_override or settings.s3_endpoint_url
+
     boto_config: dict = {"signature_version": "s3v4"}
-    if settings.s3_endpoint_url or settings.s3_force_path_style:
+    if endpoint or settings.s3_force_path_style:
         # bucket.host virtual-hosting resolves only for AWS; anything else has
         # to be addressed as host/bucket.
         boto_config["s3"] = {"addressing_style": "path"}
@@ -77,8 +97,8 @@ def _get_s3_client():
         "region_name": settings.aws_region,
         "config": BotoConfig(**boto_config),
     }
-    if settings.s3_endpoint_url:
-        kwargs["endpoint_url"] = settings.s3_endpoint_url
+    if endpoint:
+        kwargs["endpoint_url"] = endpoint
     if settings.aws_access_key_id and settings.aws_secret_access_key:
         kwargs["aws_access_key_id"] = settings.aws_access_key_id
         kwargs["aws_secret_access_key"] = settings.aws_secret_access_key
@@ -108,7 +128,9 @@ def generate_upload_url(
     unique_id = uuid.uuid4().hex[:12]
     s3_key = f"invoices/{folder}/{date_str}/{unique_id}{ext}"
 
-    client = _get_s3_client()
+    # Signed for the address the BROWSER will PUT to, which is not necessarily
+    # the one this process talks to -- see _get_presign_client.
+    client = _get_presign_client()
     upload_url = client.generate_presigned_url(
         "put_object",
         Params={
@@ -183,7 +205,9 @@ def generate_download_url(s3_key: str) -> str:
     for objects that were stored as octet-stream, so the detail-page viewer
     renders the invoice instead of the browser saving it.
     """
-    client = _get_s3_client()
+    # Signed for the address the BROWSER will fetch from -- see
+    # _get_presign_client.
+    client = _get_presign_client()
     return client.generate_presigned_url(
         "get_object",
         Params={

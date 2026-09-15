@@ -41,6 +41,16 @@ class Settings(BaseSettings):
     # has to be addressed as host/bucket instead.
     s3_endpoint_url: str = ""
     s3_force_path_style: bool = False
+    # The address a BROWSER can fetch a presigned URL from, when that differs
+    # from the address this process talks to. With MinIO on the same box the
+    # api reaches it at http://minio:9000, which resolves for nobody outside
+    # Docker -- so an invoice preview signed for that host never loads.
+    #
+    # Signing is pure local computation, no request, so the two can differ:
+    # uploads and downloads keep using s3_endpoint_url, and only the signature
+    # is computed against this one. Empty means "same as s3_endpoint_url",
+    # which is the case on real S3 and therefore in production.
+    s3_public_endpoint_url: str = ""
 
     # ── Frontend ──────────────────────────────────────────────────────────────
     frontend_url: str = "http://localhost:3000"
