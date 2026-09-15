@@ -53,3 +53,4 @@ architecture_decision.txt
 .env
 .env.*
 !.env.example
+!.env.staging.example

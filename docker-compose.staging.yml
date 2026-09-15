@@ -1,0 +1,172 @@
+# Backend: STAGING.
+#
+#   docker compose -f docker-compose.staging.yml --env-file .env.staging up -d --build
+#
+# Same repository, same directory as production -- the branch decides which is
+# which. Check out `staging` and run this file; check out `unified` and run
+# docker-compose.yml. Containers already running are unaffected by a checkout,
+# so switching branches to rebuild one environment never disturbs the other.
+#
+# Nothing here is shared with production. Where prod points at RDS and AWS S3,
+# staging runs its own Postgres and its own MinIO, both defined below, so a
+# mistake in staging cannot reach the production database or bucket.
+#
+# What IS shared is the Tekion account -- there is no Tekion sandbox, so
+# staging posts to the same live dealer management system production does.
+#
+# Ports are offset from production so both stacks run on one box:
+#   prod api 8099  ->  staging api 8098
+#   prod web 3000  ->  staging web 3001
+name: rohrman-staging
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: rohrman-db-staging
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-rohrman}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: ${POSTGRES_DB:-rohrman_de1_staging}
+
+    volumes:
+      - db-data:/var/lib/postgresql/data
+
+    ports:
+      # Loopback only: psql from the box, nothing from outside it. Production's
+      # RDS is a different machine entirely and is not reachable from here.
+      - "127.0.0.1:5433:5432"
+
+    healthcheck:
+      # The api waits on this. Migrations run at its container start, and a
+      # database still initialising fails them.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rohrman} -d ${POSTGRES_DB:-rohrman_de1_staging}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  minio:
+    # MinIO is not pullable from Docker Hub any more; quay.io is the
+    # canonical registry. Pinned by digest so `latest` moving cannot change
+    # staging underneath us.
+    image: quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    container_name: rohrman-minio-staging
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER must be set}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set}
+
+    volumes:
+      - minio-data:/data
+
+    ports:
+      # S3 API published on the host so an ALB can front it. The api container
+      # reaches MinIO by its internal name, which is all archiving needs; but a
+      # presigned invoice URL is fetched by the BROWSER, and one signed for
+      # "minio" resolves on nobody's laptop. To make the staging invoice
+      # preview work, give MinIO a hostname both sides can use and set
+      # S3_ENDPOINT_URL to it -- the signature covers the host.
+      - "9000:9000"
+      # Console: loopback only. Admin UI, not for the internet.
+      - "127.0.0.1:9001:9001"
+
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # One-shot: create the bucket the api archives into, then exit. Re-running
+  # the stack re-runs it, which is harmless -- `mb --ignore-existing`.
+  minio-init:
+    image: quay.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    container_name: rohrman-minio-init-staging
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      S3_BUCKET: ${S3_BUCKET:-rohrman-invoices-staging}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
+      mc mb --ignore-existing local/$$S3_BUCKET &&
+      echo 'bucket ready: '$$S3_BUCKET
+      "
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rohrman-api-staging:latest
+    container_name: rohrman-api-staging
+    restart: unless-stopped
+
+    depends_on:
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+    # NOT scalable, for exactly the reason production is not: TEKION_LOCK is a
+    # threading.RLock and the Tekion client is a singleton whose active
+    # dealership is mutable state. A second replica posts to the wrong store.
+    deploy:
+      replicas: 1
+
+    env_file:
+      - .env.staging
+
+    environment:
+      # One worker, not two. The box now runs six containers on 3.8 GB, and OCR
+      # holds every page of an invoice at 300 DPI (~24 MB each) at once.
+      PIPELINE_WORKERS: ${PIPELINE_WORKERS:-1}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3001}
+
+    volumes:
+      - ./neura_vertex_ai.json:/app/neura_vertex_ai.json:ro
+      - api-uploads:/tmp/rohrman
+
+    ports:
+      # Published on all interfaces so the ALB reaches it on the instance's
+      # private IP. NOT public: the instance security group admits only the
+      # ALB's security group on this port.
+      - "8098:8000"
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/docs"]
+      interval: 30s
+      timeout: 5s
+      # Generous: the container runs migrations before it serves anything.
+      start_period: 60s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  api-uploads:
+  db-data:
+  minio-data:
