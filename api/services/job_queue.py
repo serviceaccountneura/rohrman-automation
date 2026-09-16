@@ -295,6 +295,13 @@ def confirm_duplicate(session: Session, doc: Document) -> Document:
     original.ocr_document_type = doc.ocr_document_type or original.ocr_document_type
     # The person who re-uploaded and confirmed now owns this row's result.
     original.uploaded_by_id = doc.uploaded_by_id or original.uploaded_by_id
+    # And so does the time they did it. The row's "Uploaded" column reads
+    # created_at, and keeping the original's meant an invoice re-uploaded today
+    # showed as uploaded twelve days ago -- the file, the uploader and the result
+    # are all the new upload's, so the timestamp has to be too. It also sorts
+    # the row back to the top of the list, which is where someone who has just
+    # uploaded it looks for it.
+    original.created_at = doc.created_at or original.created_at
 
     # Previous Tekion references belong to the earlier run and would be
     # misleading if this one fails. The UI shows them before confirming.
