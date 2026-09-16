@@ -38,6 +38,9 @@ STATUS_DUPLICATE = "DUPLICATE"
 # The invoice names a purchase order that already exists in Tekion. Like
 # DUPLICATE this is a question, not a failure -- nothing was posted.
 STATUS_PO_DECISION = "PO_DECISION"
+# Read and decided, not yet posted. A person checks the fields and GL lines and
+# releases it. Nothing has been sent to Tekion.
+STATUS_AWAITING_REVIEW = "AWAITING_REVIEW"
 # A batch scan that was broken into one child document per invoice. Terminal:
 # the parent itself is never processed, its children carry the actual work.
 STATUS_SPLIT = "SPLIT"
@@ -190,6 +193,46 @@ def hold_for_po_decision(session: Session, doc: Document, found: Any, summary: s
     session.add(doc)
     session.commit()
     print(f"[QUEUE] {doc.id} -> PO_DECISION ({found.po_number})")
+
+
+def hold_for_review(session: Session, doc: Document, draft_json: str) -> None:
+    """Park a document with what the flow would post, for a person to check.
+
+    Not an exception: nothing went wrong. The flow has done everything except
+    the one step that cannot be taken back.
+    """
+    doc.status = STATUS_AWAITING_REVIEW
+    doc.review_draft = draft_json
+    doc.review_approved = False
+    doc.exception_type = None
+    doc.severity = None
+    doc.last_error = ""
+    doc.locked_at = None
+    doc.locked_by = ""
+    doc.next_attempt_at = None
+    doc.processed_at = _utcnow()
+    session.add(doc)
+    session.commit()
+    print(f"[QUEUE] {doc.id} -> AWAITING_REVIEW")
+
+
+def approve_review(session: Session, doc: Document) -> Document:
+    """Release a reviewed document to be posted, exactly as it now stands."""
+    doc.review_approved = True
+    doc.status = STATUS_QUEUED
+    doc.attempts = 0
+    doc.exception_type = None
+    doc.severity = None
+    doc.last_error = ""
+    doc.locked_at = None
+    doc.locked_by = ""
+    doc.next_attempt_at = None
+    doc.processed_at = None
+    session.add(doc)
+    session.commit()
+    session.refresh(doc)
+    print(f"[QUEUE] {doc.id} review approved -- queued to post")
+    return doc
 
 
 def resolve_po_decision(session: Session, doc: Document, choice: str) -> Document:

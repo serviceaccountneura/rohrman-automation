@@ -133,6 +133,14 @@ class GlSplitInput(BaseModel):
     gl_account: str = Field(alias="glAccount")
     amount: float
     description: str | None = None
+    # The control this line carries in Tekion. Per line, because a person
+    # reviewing a split may give each account its own reference.
+    control: str | None = None
+    # The account's REAL Tekion id, when it is known. An id is not always
+    # "{dealer}_{number}" -- at Schaumburg Kia 1710_2246 is account 2245 -- so
+    # a line resolved against the chart of accounts says which it is rather
+    # than having one built from the number.
+    account_id: str | None = Field(default=None, alias="accountId")
 
     model_config = {"populate_by_name": True}
 
@@ -404,6 +412,18 @@ class PipelineFolder(str, Enum):
     VEHICLE_MANUFACTURING = "VEHICLE_MANUFACTURING"
 
 
+class ReviewEdit(BaseModel):
+    """A correction to a Misc invoice held for review.
+
+    `fields` merges into what is there; `lines` replaces the whole table,
+    because removing a line is an edit and a merge could not express it. Either
+    may be omitted to leave that half alone.
+    """
+
+    fields: dict[str, Any] | None = None
+    lines: list[dict[str, Any]] | None = None
+
+
 class PoDecisionRequest(BaseModel):
     """Which purchase order to invoice against.
 
@@ -471,6 +491,10 @@ class PipelineStatusResponse(BaseModel):
     # and the invoices already on it, so the choice can be made without opening
     # Tekion and without this endpoint calling it.
     po_candidate: dict[str, Any] | None = Field(default=None, alias="poCandidate")
+    # Set when status is AWAITING_REVIEW: what the flow would post -- the fields
+    # read and the GL lines chosen -- plus how those lines add up. Kept after
+    # posting as the record of what was approved.
+    review_draft: dict[str, Any] | None = Field(default=None, alias="reviewDraft")
     # What a person typed in on a previous re-run, so the form comes back filled
     # rather than blank on the second correction.
     manual_fields: dict[str, Any] = Field(default_factory=dict, alias="manualFields")

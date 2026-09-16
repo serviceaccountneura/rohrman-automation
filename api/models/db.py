@@ -253,6 +253,15 @@ class Document(SQLModel, table=True):
     # templates and handwritten annotations, none of which mean anything to a
     # Misc invoice.
     posting_details: str = Field(default="", max_length=8000)
+
+    # ── Review before posting (MISCELLANEOUS) ─────────────────────────────────
+    # What the flow decided it WOULD post -- the fields read and the GL lines
+    # chosen -- plus every correction a person makes to it. See
+    # api/services/misc_review.py for the shape.
+    review_draft: str = Field(default="", max_length=8000)
+    # Set when a person releases the draft to Tekion. Cleared once posting is
+    # attempted, so an approval covers exactly one attempt.
+    review_approved: bool = Field(default=False)
     split_from: UUID | None = Field(default=None, foreign_key="documents.id")
     # Which pages of the parent this document is, e.g. "1-2" or "3". Empty for
     # anything that was not split out of a batch.

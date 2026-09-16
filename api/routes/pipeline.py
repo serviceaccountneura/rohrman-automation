@@ -35,9 +35,10 @@ from api.models.schemas import (
     PipelineAcceptedResponse,
     PipelineStatusResponse,
     PoDecisionRequest,
+    ReviewEdit,
     RerunRequest,
 )
-from api.services import job_queue, po_reuse, pipeline_service, s3_service
+from api.services import job_queue, misc_review, po_reuse, pipeline_service, s3_service
 from api.services.pipeline_service import VALID_FOLDERS, normalize_folder
 
 router = APIRouter(prefix="/api/pipeline", tags=["pipeline"])
@@ -184,6 +185,131 @@ def discard_duplicate(
     session.delete(doc)
     session.commit()
     return MessageResponse(message="Duplicate discarded")
+
+
+def _review_payload(doc: Document) -> dict | None:
+    draft = misc_review.load(doc.review_draft)
+    if not draft:
+        return None
+    return {**draft, "balance": misc_review.balance(draft)}
+
+
+def _held_for_review(document_id: UUID, session: Session) -> Document:
+    doc = session.get(Document, document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if doc.status != job_queue.STATUS_AWAITING_REVIEW:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Document is {doc.status}, not waiting for review",
+        )
+    return doc
+
+
+def _chart(dealer_id: str, session: Session) -> dict[str, str]:
+    """{account number: account name} for a dealership, from the cached chart."""
+    from api.services.gl_service_misc import get_cached_gl_accounts
+
+    if not dealer_id:
+        return {}
+    return {
+        str(a.account_number): str(a.account_name)
+        for a in get_cached_gl_accounts(dealer_id, session)
+        if a.account_number
+    }
+
+
+@router.get("/jobs/{document_id}/gl-accounts")
+def review_gl_accounts(
+    document_id: UUID,
+    session: Annotated[Session, Depends(get_session)],
+) -> list[dict[str, str]]:
+    """The chart of accounts for the dealership this document belongs to.
+
+    For the editor: an account number is typed, and its name should appear as
+    it is typed, without a round trip per keystroke.
+    """
+    doc = session.get(Document, document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    dealer_id = misc_review.load(doc.review_draft).get("dealerId") or ""
+    return [
+        {"number": number, "name": name}
+        for number, name in sorted(_chart(dealer_id, session).items())
+    ]
+
+
+@router.put("/jobs/{document_id}/review", response_model=PipelineStatusResponse)
+def save_review(
+    document_id: UUID,
+    payload: ReviewEdit,
+    session: Annotated[Session, Depends(get_session)],
+) -> PipelineStatusResponse:
+    """Save a correction to a document held for review. Nothing is posted.
+
+    Saving is not validation. A half-finished edit -- a line added but not yet
+    given an amount -- is allowed to be saved and come back to; the checks run
+    when the document is posted.
+    """
+    doc = _held_for_review(document_id, session)
+    draft = misc_review.load(doc.review_draft)
+    updated = misc_review.apply_edit(
+        draft,
+        fields=payload.fields,
+        lines=payload.lines,
+        names=_chart(draft.get("dealerId") or "", session),
+    )
+    doc.review_draft = misc_review.dump(updated)
+
+    # The row in the documents table reads these, and should say what the
+    # person corrected rather than what OCR first read.
+    fields = updated.get("fields") or {}
+    doc.vendor_name = fields.get("vendorName") or doc.vendor_name
+    doc.invoice_number = fields.get("invoiceNumber") or doc.invoice_number
+    session.add(doc)
+    session.commit()
+    session.refresh(doc)
+    return _to_status(doc, session=session)
+
+
+@router.post("/jobs/{document_id}/post", response_model=PipelineStatusResponse)
+def post_reviewed(
+    document_id: UUID,
+    session: Annotated[Session, Depends(get_session)],
+) -> PipelineStatusResponse:
+    """Release a reviewed document to Tekion.
+
+    Everything that can be checked without Tekion is checked HERE, while the
+    person is still looking at the screen: every account exists at this
+    dealership, the lines add up, the vendor is mapped. A refusal comes back as
+    a 422 naming each problem, and the document stays in review.
+
+    What cannot be checked in advance -- Tekion itself refusing the purchase
+    order -- still ends in EXCEPTION, as any other run does.
+    """
+    from api.services.vendor_service import _find_mapping
+
+    doc = _held_for_review(document_id, session)
+    draft = misc_review.load(doc.review_draft)
+    dealer_id = draft.get("dealerId") or ""
+
+    problems = misc_review.problems(draft, set(_chart(dealer_id, session)))
+
+    vendor = str((draft.get("fields") or {}).get("vendorName") or "")
+    if vendor and dealer_id and _find_mapping(dealer_id, vendor, session) is None:
+        problems.append(
+            f"The vendor '{vendor}' is not mapped to a Tekion vendor at this dealership."
+        )
+
+    if problems:
+        # Kept on the draft too, so the refusal is still there after a reload.
+        draft["error"] = " ".join(problems)
+        doc.review_draft = misc_review.dump(draft)
+        session.add(doc)
+        session.commit()
+        raise HTTPException(status_code=422, detail=problems)
+
+    return _to_status(job_queue.approve_review(session, doc), session=session)
 
 
 @router.delete("/jobs/{document_id}", response_model=PipelineStatusResponse)
@@ -382,6 +508,7 @@ def _to_status(
         ocr_document_type=doc.ocr_document_type,
         duplicate_of=doc.duplicate_of,
         po_candidate=_as_json_object(doc.po_candidate) or None,
+        review_draft=_review_payload(doc),
         manual_fields=_as_json_object(doc.manual_fields),
         vehicle_details=_as_json_object(doc.vehicle_details),
         posting_details=_as_json_object(doc.posting_details),
