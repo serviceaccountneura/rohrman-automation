@@ -614,6 +614,9 @@ class DocumentItem(BaseModel):
     vin: str
     ro_number: str
     po_number: str
+    # The journal entry an OEM or vehicle document created. With po_number, it
+    # is how the table can say WHAT a deleted row left behind in Tekion.
+    transaction_number: str = ""
     po_type: str
     status: str
     exception_type: str | None
