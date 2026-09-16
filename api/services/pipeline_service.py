@@ -509,6 +509,37 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
     invoice_number = doc.invoice_number
     invoice_date = ocr_helpers.get_invoice_date(ocr)
     invoice_amount = ocr_helpers.get_total_amount(ocr)
+    line_items = ocr_helpers.get_raw_line_items(ocr)
+    gl_splits = ocr_helpers.get_gl_amount_splits(ocr)
+
+    # A CREDIT invoice runs the whole entry the other way.
+    #
+    # Honda sends parts returns and dollar adjustments as credit memos, totals
+    # printed "422.27 CR". The dealership is owed that money, so A/P is DEBITED
+    # and the inventory accounts are CREDITED. Posted as an ordinary invoice it
+    # balances perfectly and is completely backwards -- which is what happened,
+    # with 2410 and 2430 debited and A/P credited on a 1,001.52 credit.
+    #
+    # The journal entry already credits A/P with the NEGATIVE of the invoice
+    # amount, so a negative amount is all it takes for A/P to become the debit.
+    # The parts are read as magnitudes, so they flip with it.
+    if ocr_helpers.is_credit_invoice(ocr):
+        invoice_amount = -abs(invoice_amount)
+        for item in line_items:
+            item["unitPrice"] = -abs(item.get("unitPrice") or 0.0)
+            item["totalPrice"] = -abs(item.get("totalPrice") or 0.0)
+        # Written accounts keep the sign the clerk wrote, and on a credit memo
+        # that is a minus. Only if EVERY one came through positive -- the sign
+        # lost somewhere between the page and here -- are they all flipped: a
+        # credit memo whose accounts total its value as debits cannot be right,
+        # whereas a mixed split may be exactly what the clerk meant.
+        if gl_splits and all(sp["amount"] > 0 for sp in gl_splits):
+            for sp in gl_splits:
+                sp["amount"] = -abs(sp["amount"])
+        print(
+            f"[PIPE] {doc.id} credit invoice: total {invoice_amount:,.2f}, "
+            f"splits {[(sp['gl_account'], sp['amount']) for sp in gl_splits]}"
+        )
 
     # The SOP needs exactly these three off the ticket.
     missing = [
@@ -529,13 +560,13 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         invoice_date=invoice_date,
         invoice_amount=invoice_amount,
         dealership_name=doc.dealership_name,
-        # Each part becomes its own debit line on the entry.
-        line_items=ocr_helpers.get_raw_line_items(ocr),
+        # Each part becomes its own line on the entry.
+        line_items=line_items,
         # A GL account written on the invoice outranks anything we infer.
         invoice_gl_account=ocr_helpers.get_document_gl_account(ocr),
-        # Accounts with their own amounts. One debit line each, exactly as
-        # written -- see build_postings.
-        gl_splits=ocr_helpers.get_gl_amount_splits(ocr),
+        # Accounts with their own amounts. One line each, exactly as written
+        # -- see build_postings.
+        gl_splits=gl_splits,
     )
 
     try:
