@@ -110,19 +110,36 @@ async def process_upload(
             print(f"[PIPE] S3 archive failed ({e}); continuing without it")
             s3_key = ""
 
-    doc = Document(
-        file_name=file.filename or "",
-        s3_key=s3_key,
-        source_path=tmp.name,
-        file_hash=file_hash,
-        dealership_name=dealership_name,
-        po_type=po_type,
-        status=job_queue.STATUS_QUEUED,
-        uploaded_by_id=current_user.id,
-    )
-    session.add(doc)
-    session.commit()
-    session.refresh(doc)
+    # The same file already failed: run it again on that document rather than
+    # starting a second one. A rescan of it -- different bytes, same invoice --
+    # is caught after OCR instead; see job_queue.absorb_into_failed.
+    failed = job_queue.find_failed_same_file(session, file_hash)
+    if failed is not None:
+        doc = job_queue.reuse_failed_for_upload(
+            session,
+            failed,
+            file_name=file.filename or "",
+            s3_key=s3_key,
+            source_path=tmp.name,
+            file_hash=file_hash,
+            dealership_name=dealership_name,
+            po_type=po_type,
+            uploaded_by_id=current_user.id,
+        )
+    else:
+        doc = Document(
+            file_name=file.filename or "",
+            s3_key=s3_key,
+            source_path=tmp.name,
+            file_hash=file_hash,
+            dealership_name=dealership_name,
+            po_type=po_type,
+            status=job_queue.STATUS_QUEUED,
+            uploaded_by_id=current_user.id,
+        )
+        session.add(doc)
+        session.commit()
+        session.refresh(doc)
 
     print(f"[PIPE] queued {doc.id} ({po_type}, {file.filename})")
 
@@ -149,7 +166,7 @@ def confirm_duplicate(
     This will create a second record in Tekion. That is the point of confirming,
     but it is worth saying plainly.
     """
-    doc = session.get(Document, document_id)
+    doc = session.get(Document, job_queue.resolve_id(session, document_id))
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
     if doc.status != job_queue.STATUS_DUPLICATE:
@@ -168,7 +185,7 @@ def discard_duplicate(
     session: Annotated[Session, Depends(get_session)],
 ) -> MessageResponse:
     """Drop a held duplicate. The original document is untouched."""
-    doc = session.get(Document, document_id)
+    doc = session.get(Document, job_queue.resolve_id(session, document_id))
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
     if doc.status != job_queue.STATUS_DUPLICATE:
@@ -195,7 +212,7 @@ def _review_payload(doc: Document) -> dict | None:
 
 
 def _held_for_review(document_id: UUID, session: Session) -> Document:
-    doc = session.get(Document, document_id)
+    doc = session.get(Document, job_queue.resolve_id(session, document_id))
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
     if doc.status != job_queue.STATUS_AWAITING_REVIEW:
@@ -229,7 +246,7 @@ def review_gl_accounts(
     For the editor: an account number is typed, and its name should appear as
     it is typed, without a round trip per keystroke.
     """
-    doc = session.get(Document, document_id)
+    doc = session.get(Document, job_queue.resolve_id(session, document_id))
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
     dealer_id = misc_review.load(doc.review_draft).get("dealerId") or ""
@@ -330,7 +347,7 @@ def delete_document(
     Deleting an already-deleted document is not an error; it is already in the
     state the caller asked for.
     """
-    doc = session.get(Document, document_id)
+    doc = session.get(Document, job_queue.resolve_id(session, document_id))
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
     if doc.deleted_at is None:
@@ -349,7 +366,7 @@ def restore_document(
     whoever restored it decides what to do next -- re-running as a side effect
     of un-hiding a row would post to Tekion without anyone asking.
     """
-    doc = session.get(Document, document_id)
+    doc = session.get(Document, job_queue.resolve_id(session, document_id))
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
     if doc.deleted_at is not None:
@@ -373,7 +390,7 @@ def decide_purchase_order(
     asked again rather than inheriting a decision made about different
     paperwork.
     """
-    doc = session.get(Document, document_id)
+    doc = session.get(Document, job_queue.resolve_id(session, document_id))
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
     if doc.status != job_queue.STATUS_PO_DECISION:
@@ -407,7 +424,7 @@ def rerun_document(
     posted to Tekion, and running it again would create a second record there;
     that path is `confirm-duplicate`, which says what it does.
     """
-    doc = session.get(Document, document_id)
+    doc = session.get(Document, job_queue.resolve_id(session, document_id))
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
     if doc.status != job_queue.STATUS_EXCEPTION:
@@ -447,7 +464,7 @@ def get_job(
     session: Annotated[Session, Depends(get_session)],
 ) -> PipelineStatusResponse:
     """Poll one document's progress."""
-    doc = session.get(Document, document_id)
+    doc = session.get(Document, job_queue.resolve_id(session, document_id))
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
 

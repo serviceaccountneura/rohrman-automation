@@ -194,9 +194,18 @@ def run_job(document_id: UUID) -> None:
             _run(doc, session)
         except Exception as e:  # noqa: BLE001 — the row must never be left PROCESSING
             print(f"[PIPE] {document_id} crashed: {e}")
+            session.rollback()
+            # The run may have moved onto an earlier failed document for the
+            # same invoice (see job_queue.absorb_into_failed) -- that is the row
+            # to fail, not the one this job was claimed as.
+            doc = session.get(Document, job_queue.resolve_id(session, document_id))
+            if doc is None:
+                return
             _fail(session, doc, EX_TEKION_ERROR, error=str(e))
         finally:
-            _cleanup(doc)
+            live = session.get(Document, job_queue.resolve_id(session, document_id))
+            if live is not None:
+                _cleanup(live)
 
 
 def _resolve_source(doc: Document) -> str | None:
@@ -334,6 +343,20 @@ def _cache_ocr(doc: Document, ocr: dict[str, Any]) -> None:
         print(f"[PIPE] {doc.id} could not cache OCR: {e}")
 
 
+def _move_cached_ocr(from_id: UUID, doc: Document) -> None:
+    """Hand the OCR read for one document id over to another.
+
+    So a later "correct and re-run" on the document an upload was folded into
+    reuses what was read from the NEW file, not the one that failed.
+    """
+    try:
+        source = Path(tempfile.gettempdir()) / "rohrman" / "ocr" / f"{from_id}.json"
+        if source.exists():
+            source.replace(_ocr_cache_path(doc))
+    except OSError as e:
+        print(f"[PIPE] {doc.id} could not move cached OCR from {from_id}: {e}")
+
+
 def _load_cached_ocr(doc: Document) -> dict[str, Any] | None:
     try:
         path = _ocr_cache_path(doc)
@@ -365,6 +388,16 @@ def _run(doc: Document, session: Session) -> None:
     # that need it.
     overrides = manual_overrides(doc)
     cached = _load_cached_ocr(doc) if overrides else None
+    # A new upload, as opposed to a re-run, a retry or a released decision --
+    # nothing has been read from it yet. Only a new upload is folded into an
+    # earlier failed document; a document being re-run IS the one to keep.
+    new_upload = (
+        not doc.invoice_number
+        and not overrides
+        and not doc.duplicate_override
+        and not doc.review_approved
+        and not doc.po_choice
+    )
 
     # ── 1. Locate the file ───────────────────────────────────────────────────
     source = _resolve_source(doc)
@@ -422,6 +455,16 @@ def _run(doc: Document, session: Session) -> None:
         if duplicate is not None:
             job_queue.hold_as_duplicate(session, doc, duplicate)
             return
+
+    # ── 4a. The same invoice already failed ──────────────────────────────────
+    # Carry on as that document rather than starting a second one. If this run
+    # fails too, it fails there -- one invoice, one row.
+    if new_upload:
+        failed = job_queue.find_failed_same_invoice(session, doc)
+        if failed is not None:
+            upload_id = doc.id
+            doc = job_queue.absorb_into_failed(session, doc, failed)
+            _move_cached_ocr(upload_id, doc)
 
     # ── 4b. Deleted while it was running ─────────────────────────────────────
     # OCR takes tens of seconds, so there is a real window between claiming a

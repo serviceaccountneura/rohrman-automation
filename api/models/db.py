@@ -268,6 +268,23 @@ class Document(SQLModel, table=True):
     page_range: str = Field(default="", max_length=20)
 
 
+class DocumentAlias(SQLModel, table=True):
+    """An upload that was folded into an earlier document, and which one.
+
+    A re-scan of an invoice that already failed does not become a second row:
+    once OCR has read the invoice number, the new upload moves onto the failed
+    document and is processed there. The new row is dropped -- but the screen
+    that uploaded it is still asking about its id, so that id has to keep
+    leading somewhere. This is where.
+    """
+
+    __tablename__ = "document_aliases"
+
+    alias_id: UUID = Field(primary_key=True)
+    document_id: UUID = Field(foreign_key="documents.id", index=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
 class GlVendorMapping(SQLModel, table=True):
     """Master Miscellaneous Vendor-to-GL lookup table.
 
