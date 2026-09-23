@@ -456,10 +456,31 @@ def get_invoice_date(ocr: dict[str, Any]) -> str:
     )
 
 
+# How a printed figure says it is a CREDIT: "422.27 CR", "-1,001.52",
+# "(460.00)", "CR 541.52".
+_CREDIT_MARK = re.compile(r"(?:\bCR\b|\bCREDIT\b|^\s*-|^\s*\()", re.IGNORECASE)
+
+
+def _is_credit_value(value: Any) -> bool:
+    """Whether a printed amount is marked as a credit."""
+    if isinstance(value, (int, float)):
+        return value < 0
+    return bool(_CREDIT_MARK.search(str(value or "")))
+
+
 def _parse_amount(value: Any) -> float:
+    """The MAGNITUDE of a printed amount. Whether it is a credit is asked
+    separately -- see _is_credit_value -- because most callers want the size.
+
+    "422.27 CR" used to fail to parse at all and come back as 0.0. On a Honda
+    parts credit memo every total is printed that way, so no total was found,
+    and the invoice was posted for the first part's price, 332.25, instead of
+    its 422.27 total.
+    """
     if isinstance(value, (int, float)):
         return abs(float(value))
-    cleaned = re.sub(r"[$,]", "", str(value or "0"))
+    cleaned = re.sub(r"(?i)\b(?:CR|DR|CREDIT|DEBIT)\b", "", str(value or "0"))
+    cleaned = re.sub(r"[$,()\s]", "", cleaned)
     try:
         return abs(float(cleaned))
     except ValueError:
@@ -489,49 +510,65 @@ _GRAND_TOTAL_LABELS = (
 )
 
 
-def get_total_amount(ocr: dict[str, Any]) -> float:
-    """The amount owed on the invoice, tax included.
+def _grand_total_raw(ocr: dict[str, Any]) -> Any:
+    """The printed grand-total value, as printed -- "422.27 CR", "-1001.52".
 
     Label matching is deliberately prioritised rather than first-match: an
     invoice prints several numbers that read as totals, and picking the wrong
     one is not a rounding error. One S&S invoice listed EXTENDED 411.26, SALES
     TAX 34.96 and TOTAL 446.22; returning 411.26 as "the total" and then
     deducting tax produced a purchase order for 376.30 against a 446.22 bill.
+
+    Shared by get_total_amount and is_credit_invoice, so the size of the total
+    and whether it is a credit are read off the same figure.
     """
     totals = ocr.get("totals") or []
 
-    def value_for(predicate) -> float | None:
+    def raw_for(predicate) -> Any:
         for entry in totals:
             label = (entry.get("label") or "").strip().lower()
             if not label or any(bad in label for bad in _NOT_A_GRAND_TOTAL):
                 continue
-            if predicate(label):
-                amount = _parse_amount(entry.get("value"))
-                if amount:
-                    return amount
+            if predicate(label) and _parse_amount(entry.get("value")):
+                return entry.get("value")
         return None
 
     # 1. An unambiguous grand-total label.
     for wanted in _GRAND_TOTAL_LABELS:
-        found = value_for(lambda label, w=wanted: w in label)
+        found = raw_for(lambda label, w=wanted: w in label)
         if found is not None:
             return found
 
     # 2. The word "total" on its own.
-    found = value_for(lambda label: label == "total")
+    found = raw_for(lambda label: label == "total")
     if found is not None:
         return found
 
-    # 3. Any surviving label containing "total" — subtotals and line totals
+    # 3. Any surviving label containing "total" -- subtotals and line totals
     #    were excluded above.
-    found = value_for(lambda label: "total" in label)
+    found = raw_for(lambda label: "total" in label)
     if found is not None:
         return found
 
     po_contract = ocr.get("_po_contract") or {}
     summary = ocr.get("summary") or {}
-    fallback = ocr.get("total") or po_contract.get("total") or summary.get("total") or 0
-    return abs(float(fallback))
+    return ocr.get("total") or po_contract.get("total") or summary.get("total") or 0
+
+
+def get_total_amount(ocr: dict[str, Any]) -> float:
+    """The amount owed on the invoice, tax included, as a positive figure."""
+    return _parse_amount(_grand_total_raw(ocr))
+
+
+def is_credit_invoice(ocr: dict[str, Any]) -> bool:
+    """Whether the invoice is a CREDIT -- money owed to the dealership.
+
+    Honda prints a credit memo's totals as "422.27 CR"; OCR sometimes turns that
+    into "-422.27". Either way the whole entry runs the other direction: A/P is
+    debited, and the accounts the clerk writes are credited. Posting it as an
+    ordinary invoice balances perfectly and is completely backwards.
+    """
+    return _is_credit_value(_grand_total_raw(ocr))
 
 
 def to_flat_fields(ocr: dict[str, Any]) -> dict[str, Any]:
@@ -631,10 +668,16 @@ def get_raw_line_items(ocr: dict[str, Any]) -> list[dict[str, Any]]:
 # an annotation: "HTB 641.93" and "OBT 7992" both fail here, which is right --
 # the first is a memo of a figure and the second is a stock number.
 _NOTE_GL_LINE = re.compile(
-    r"^\s*(?:GL|G/?L|ACCT|ACCOUNT|A/C)?\s*#?\s*"
-    r"(\d{4,5}[A-Za-z]?)\s+"
-    r"(-\s*)?\$?\s*([\d,]+(?:\.\d{1,2})?)\s*\$?"
-    r"\s*(.*)$",
+    # A lead-in the clerk writes before the account: "* Credit GL# 2410".
+    # Without this the whole note failed to match, and the minus sign on it --
+    # the only place a credit is marked -- was never read.
+    r"^\s*(?:[*\-]+\s*)?(?P<word>CREDIT|DEBIT|CR|DR)?\s*"
+    r"(?:GL|G/?L|ACCT|ACCOUNT|A/C)?\s*#?\s*"
+    r"(?P<account>\d{4,5}[A-Za-z]?)\s+"
+    r"(?P<minus>-\s*)?\$?\s*(?P<figure>[\d,]+(?:\.\d{1,2})?)"
+    # Cents written raised, which OCR reads as a separate group: "-$422 27".
+    r"(?:\s+(?P<cents>\d{2})(?!\d))?"
+    r"\s*\$?\s*(?P<label>.*)$",
     re.IGNORECASE,
 )
 
@@ -658,15 +701,22 @@ def gl_notes(ocr: dict[str, Any]) -> list[dict[str, Any]]:
         match = _NOTE_GL_LINE.match(str(raw or ""))
         if not match:
             continue
-        amount = _parse_amount(match.group(3))
+        figure = match.group("figure")
+        if match.group("cents") and "." not in figure:
+            figure = f"{figure}.{match.group('cents')}"
+        amount = _parse_amount(figure)
         if amount is None:
             continue
-        negative = bool(match.group(2))
+        # A minus, or the word the clerk wrote in front of it. "Credit GL# 2410
+        # $460" is a credit whether or not a minus made it through OCR.
+        negative = bool(match.group("minus")) or (
+            (match.group("word") or "").upper() in ("CREDIT", "CR")
+        )
         found.append(
             {
-                "account": match.group(1).upper(),
+                "account": match.group("account").upper(),
                 "amount": -abs(amount) if negative else abs(amount),
-                "label": match.group(4).strip(),
+                "label": (match.group("label") or "").strip(),
                 "signed": negative,
             }
         )

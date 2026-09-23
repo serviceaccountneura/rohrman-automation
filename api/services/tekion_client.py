@@ -1309,7 +1309,9 @@ class TekionApiClient:
                             "glAccountId": s["gl_account_id"],
                             "postingAmount": {"amount": round(s["amount"] * 100), "currency": "USD"},
                             "controlNumberList": None,
-                            "refText": ref_text,
+                            # A line's own control when it has one, else the
+                            # document's -- which is what every line used to get.
+                            "refText": s.get("ref_text") or ref_text,
                         }
                         for s in gl_splits
                     ]

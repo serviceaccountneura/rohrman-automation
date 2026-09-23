@@ -22,12 +22,12 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import text
+from sqlalchemy import text, update
 from typing import Any
 
 from sqlmodel import Session, select
 
-from api.models.db import Document
+from api.models.db import Document, DocumentAlias
 
 STATUS_QUEUED = "QUEUED"
 STATUS_PROCESSING = "PROCESSING"
@@ -38,6 +38,9 @@ STATUS_DUPLICATE = "DUPLICATE"
 # The invoice names a purchase order that already exists in Tekion. Like
 # DUPLICATE this is a question, not a failure -- nothing was posted.
 STATUS_PO_DECISION = "PO_DECISION"
+# Read and decided, not yet posted. A person checks the fields and GL lines and
+# releases it. Nothing has been sent to Tekion.
+STATUS_AWAITING_REVIEW = "AWAITING_REVIEW"
 # A batch scan that was broken into one child document per invoice. Terminal:
 # the parent itself is never processed, its children carry the actual work.
 STATUS_SPLIT = "SPLIT"
@@ -192,6 +195,46 @@ def hold_for_po_decision(session: Session, doc: Document, found: Any, summary: s
     print(f"[QUEUE] {doc.id} -> PO_DECISION ({found.po_number})")
 
 
+def hold_for_review(session: Session, doc: Document, draft_json: str) -> None:
+    """Park a document with what the flow would post, for a person to check.
+
+    Not an exception: nothing went wrong. The flow has done everything except
+    the one step that cannot be taken back.
+    """
+    doc.status = STATUS_AWAITING_REVIEW
+    doc.review_draft = draft_json
+    doc.review_approved = False
+    doc.exception_type = None
+    doc.severity = None
+    doc.last_error = ""
+    doc.locked_at = None
+    doc.locked_by = ""
+    doc.next_attempt_at = None
+    doc.processed_at = _utcnow()
+    session.add(doc)
+    session.commit()
+    print(f"[QUEUE] {doc.id} -> AWAITING_REVIEW")
+
+
+def approve_review(session: Session, doc: Document) -> Document:
+    """Release a reviewed document to be posted, exactly as it now stands."""
+    doc.review_approved = True
+    doc.status = STATUS_QUEUED
+    doc.attempts = 0
+    doc.exception_type = None
+    doc.severity = None
+    doc.last_error = ""
+    doc.locked_at = None
+    doc.locked_by = ""
+    doc.next_attempt_at = None
+    doc.processed_at = None
+    session.add(doc)
+    session.commit()
+    session.refresh(doc)
+    print(f"[QUEUE] {doc.id} review approved -- queued to post")
+    return doc
+
+
 def resolve_po_decision(session: Session, doc: Document, choice: str) -> Document:
     """Re-queue a held document with the person's choice recorded.
 
@@ -252,6 +295,13 @@ def confirm_duplicate(session: Session, doc: Document) -> Document:
     original.ocr_document_type = doc.ocr_document_type or original.ocr_document_type
     # The person who re-uploaded and confirmed now owns this row's result.
     original.uploaded_by_id = doc.uploaded_by_id or original.uploaded_by_id
+    # And so does the time they did it. The row's "Uploaded" column reads
+    # created_at, and keeping the original's meant an invoice re-uploaded today
+    # showed as uploaded twelve days ago -- the file, the uploader and the result
+    # are all the new upload's, so the timestamp has to be too. It also sorts
+    # the row back to the top of the list, which is where someone who has just
+    # uploaded it looks for it.
+    original.created_at = doc.created_at or original.created_at
 
     # Previous Tekion references belong to the earlier run and would be
     # misleading if this one fails. The UI shows them before confirming.
@@ -425,6 +475,166 @@ def find_duplicate(session: Session, doc: Document) -> Document | None:
             return same_invoice
 
     return None
+
+
+# ── Re-uploading an invoice that failed ──────────────────────────────────────
+#
+# An invoice that ends in EXCEPTION gets fixed at the source -- rescanned,
+# written on, put in the right folder -- and uploaded again. That used to make a
+# second document, and a third if it failed again, so one invoice collected a
+# stack of rows and nobody could tell which was current. Instead the upload goes
+# onto the failed document and runs there: one invoice, one row, whatever
+# happens.
+#
+# Two ways to recognise it, the same two the duplicate check uses:
+#   * the same file -- known from the bytes, so settled at upload;
+#   * the same invoice rescanned -- known only once OCR has read the number,
+#     so settled mid-run by absorb_into_failed.
+
+
+def _clear_previous_run(row: Document) -> None:
+    """Forget everything the failed run decided, so this one starts clean.
+
+    What a person typed in, a review draft, a PO choice, the postings built:
+    all of it was about the earlier file. Carrying a correction made to one scan
+    onto a new scan of the same invoice would post what the person said about
+    the old paper, not what the new one says.
+    """
+    row.exception_type = None
+    row.severity = None
+    row.last_error = ""
+    row.next_attempt_at = None
+    row.processed_at = None
+    row.manual_fields = ""
+    row.review_draft = ""
+    row.review_approved = False
+    row.po_candidate = ""
+    row.po_choice = ""
+    row.posting_details = ""
+    row.vehicle_details = ""
+    row.po_number = ""
+    row.transaction_id = ""
+    row.transaction_number = ""
+    row.journal_id = ""
+    row.duplicate_of = None
+    row.duplicate_override = False
+
+
+def find_failed_same_file(session: Session, file_hash: str) -> Document | None:
+    """The most recent failed document made from exactly these bytes."""
+    if not file_hash:
+        return None
+    return session.exec(
+        select(Document)
+        .where(
+            Document.file_hash == file_hash,
+            Document.status == STATUS_EXCEPTION,
+            Document.deleted_at.is_(None),  # type: ignore[union-attr]
+        )
+        .order_by(Document.created_at.desc())  # type: ignore[attr-defined]
+    ).first()
+
+
+def reuse_failed_for_upload(
+    session: Session,
+    failed: Document,
+    *,
+    file_name: str,
+    s3_key: str,
+    source_path: str,
+    file_hash: str,
+    dealership_name: str,
+    po_type: str,
+    uploaded_by_id: Any,
+) -> Document:
+    """Queue a new upload of the same file on the document it failed as.
+
+    The dealership and folder are the new upload's. Choosing the wrong folder is
+    one of the commonest reasons a document fails, and re-uploading into the
+    right one is how that gets fixed.
+    """
+    _clear_previous_run(failed)
+    failed.file_name = file_name or failed.file_name
+    failed.s3_key = s3_key or failed.s3_key
+    failed.source_path = source_path
+    failed.file_hash = file_hash
+    failed.dealership_name = dealership_name or failed.dealership_name
+    failed.po_type = po_type
+    failed.uploaded_by_id = uploaded_by_id
+    failed.created_at = Document().created_at
+    # Read again from the file, not from what the failed run read.
+    failed.invoice_number = ""
+    failed.vendor_name = ""
+    failed.ro_number = ""
+    failed.vin = ""
+    failed.ocr_document_type = ""
+    failed.status = STATUS_QUEUED
+    failed.attempts = 0
+    failed.locked_at = None
+    failed.locked_by = ""
+    session.add(failed)
+    session.commit()
+    session.refresh(failed)
+    print(f"[QUEUE] same file re-uploaded -- re-running failed document {failed.id}")
+    return failed
+
+
+def find_failed_same_invoice(session: Session, doc: Document) -> Document | None:
+    """The most recent failed document for this invoice, other than this one."""
+    if not (doc.invoice_number and doc.dealership_name):
+        return None
+    return session.exec(
+        select(Document)
+        .where(
+            Document.invoice_number == doc.invoice_number,
+            Document.dealership_name == doc.dealership_name,
+            Document.po_type == doc.po_type,
+            Document.status == STATUS_EXCEPTION,
+            Document.deleted_at.is_(None),  # type: ignore[union-attr]
+            Document.id != doc.id,
+        )
+        .order_by(Document.created_at.desc())  # type: ignore[attr-defined]
+    ).first()
+
+
+def absorb_into_failed(session: Session, doc: Document, failed: Document) -> Document:
+    """Move a running upload onto the failed document for the same invoice.
+
+    Returns the failed document, now PROCESSING under the same worker, to carry
+    on with. `doc` is deleted; its id is recorded as an alias so a caller still
+    polling it is answered with the document it became.
+    """
+    _clear_previous_run(failed)
+    for field in (
+        "file_name", "s3_key", "source_path", "file_hash", "dealership_name",
+        "po_type", "vendor_name", "invoice_number", "ro_number", "vin",
+        "ocr_document_type", "uploaded_by_id", "created_at", "split_from",
+        "page_range", "attempts", "locked_at", "locked_by",
+    ):
+        setattr(failed, field, getattr(doc, field))
+    failed.status = STATUS_PROCESSING
+
+    # Anything that already pointed at `doc` follows it too.
+    session.exec(  # type: ignore[call-overload]
+        update(DocumentAlias)
+        .where(DocumentAlias.document_id == doc.id)  # type: ignore[arg-type]
+        .values(document_id=failed.id)
+    )
+    session.add(DocumentAlias(alias_id=doc.id, document_id=failed.id))
+    session.add(failed)
+    doc.source_path = ""  # handed over, not to be cleaned up with the row
+    session.delete(doc)
+    session.commit()
+    session.refresh(failed)
+    print(f"[QUEUE] {doc.id} is invoice {failed.invoice_number} again -- "
+          f"running on failed document {failed.id} instead")
+    return failed
+
+
+def resolve_id(session: Session, document_id: Any) -> Any:
+    """The document an id now refers to: itself, or what it was folded into."""
+    alias = session.get(DocumentAlias, document_id)
+    return alias.document_id if alias else document_id
 
 
 def queue_depth(session: Session) -> dict[str, int]:

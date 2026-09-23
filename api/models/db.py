@@ -253,10 +253,36 @@ class Document(SQLModel, table=True):
     # templates and handwritten annotations, none of which mean anything to a
     # Misc invoice.
     posting_details: str = Field(default="", max_length=8000)
+
+    # ── Review before posting (MISCELLANEOUS) ─────────────────────────────────
+    # What the flow decided it WOULD post -- the fields read and the GL lines
+    # chosen -- plus every correction a person makes to it. See
+    # api/services/misc_review.py for the shape.
+    review_draft: str = Field(default="", max_length=8000)
+    # Set when a person releases the draft to Tekion. Cleared once posting is
+    # attempted, so an approval covers exactly one attempt.
+    review_approved: bool = Field(default=False)
     split_from: UUID | None = Field(default=None, foreign_key="documents.id")
     # Which pages of the parent this document is, e.g. "1-2" or "3". Empty for
     # anything that was not split out of a batch.
     page_range: str = Field(default="", max_length=20)
+
+
+class DocumentAlias(SQLModel, table=True):
+    """An upload that was folded into an earlier document, and which one.
+
+    A re-scan of an invoice that already failed does not become a second row:
+    once OCR has read the invoice number, the new upload moves onto the failed
+    document and is processed there. The new row is dropped -- but the screen
+    that uploaded it is still asking about its id, so that id has to keep
+    leading somewhere. This is where.
+    """
+
+    __tablename__ = "document_aliases"
+
+    alias_id: UUID = Field(primary_key=True)
+    document_id: UUID = Field(foreign_key="documents.id", index=True)
+    created_at: datetime = Field(default_factory=_utcnow)
 
 
 class GlVendorMapping(SQLModel, table=True):

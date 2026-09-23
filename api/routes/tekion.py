@@ -469,9 +469,10 @@ def _create_misc_po(
             # table contains nothing that would reproduce it.
             gl_splits = [
                 {
-                    "gl_account_id": f"{dealer_id}_{sp.gl_account}",
+                    "gl_account_id": sp.account_id or f"{dealer_id}_{sp.gl_account}",
                     "amount": sp.amount,
                     "description": sp.description,
+                    "ref_text": sp.control or "",
                 }
                 for sp in req.gl_splits
             ]

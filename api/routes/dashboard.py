@@ -313,6 +313,7 @@ def list_documents(
             vin=doc.vin,
             ro_number=doc.ro_number,
             po_number=doc.po_number,
+            transaction_number=doc.transaction_number,
             po_type=doc.po_type,
             status=doc.status,
             exception_type=doc.exception_type,

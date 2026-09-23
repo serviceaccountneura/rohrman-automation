@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlmodel import Session, select
+from sqlmodel import Session, func, select
 
 from api.config import settings
 from api.services import access, email_service
@@ -436,7 +436,7 @@ def create_invite(
 
     email = req.email.strip().lower()
 
-    existing = session.exec(select(User).where(User.email == email)).first()
+    existing = session.exec(select(User).where(func.lower(User.email) == email)).first()
     if existing is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

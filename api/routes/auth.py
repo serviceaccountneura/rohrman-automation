@@ -17,7 +17,7 @@ from typing import Annotated
 
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlmodel import Session, select
+from sqlmodel import Session, func, select
 
 from api.config import settings
 from api.db import get_session
@@ -75,9 +75,22 @@ def _build_token_pair(user: User, session: Session) -> Token:
     )
 
 
+def _user_by_email(session: Session, email: str) -> User | None:
+    """The account for an address, whatever capitals it was typed with.
+
+    Email addresses are not case-sensitive in practice, and people type
+    "Abdul@..." as often as "abdul@...". Matching exactly meant an account made
+    in one spelling refused a login in the other. The column is lowered too, so
+    accounts saved before addresses were normalised are still found.
+    """
+    return session.exec(
+        select(User).where(func.lower(User.email) == email.strip().lower())
+    ).first()
+
+
 @router.post("/signup", response_model=UserRead, status_code=status.HTTP_201_CREATED)
 def signup(req: UserCreate, session: Annotated[Session, Depends(get_session)]) -> User:
-    existing = session.exec(select(User).where(User.email == req.email)).first()
+    existing = _user_by_email(session, req.email)
     if existing is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -110,7 +123,7 @@ def signup(req: UserCreate, session: Annotated[Session, Depends(get_session)]) -
     full_name = req.full_name or (invite.full_name if invite else None)
 
     user = User(
-        email=req.email,
+        email=req.email.strip().lower(),
         full_name=full_name,
         hashed_password=hash_password(req.password),
         role=role,
@@ -163,7 +176,7 @@ def validate_invite(
 
 @router.post("/login", response_model=Token)
 def login(req: UserLogin, session: Annotated[Session, Depends(get_session)]) -> Token:
-    user = session.exec(select(User).where(User.email == req.email)).first()
+    user = _user_by_email(session, req.email)
     if user is None or not verify_password(req.password, user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -294,7 +307,7 @@ def request_password_reset(
     )
 
     email = payload.email.strip().lower()
-    user = session.exec(select(User).where(User.email == email)).first()
+    user = _user_by_email(session, email)
     if not user or not user.is_active:
         # Deliberately silent. An inactive account should not be resettable
         # either -- that would be a way back in for someone who was switched off.

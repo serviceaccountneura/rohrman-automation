@@ -45,6 +45,7 @@ from api.models.db import Document
 from api.services import (
     document_splitter,
     job_queue,
+    misc_review,
     ocr_helpers,
     po_reuse,
     s3_service,
@@ -152,6 +153,11 @@ _RETRYABLE = {EX_OCR_FAILED}
 
 
 def _fail(session: Session, doc: Document, exception_type: str, error: str = "") -> None:
+    # An approval covers ONE attempt. A reviewed Misc invoice that fails -- a
+    # PO that turned out to be closed, a vendor Tekion no longer has -- must go
+    # back through review on a re-run, not post whatever was approved before
+    # the reason it failed was known.
+    doc.review_approved = False
     job_queue.fail(
         session,
         doc,
@@ -188,9 +194,18 @@ def run_job(document_id: UUID) -> None:
             _run(doc, session)
         except Exception as e:  # noqa: BLE001 — the row must never be left PROCESSING
             print(f"[PIPE] {document_id} crashed: {e}")
+            session.rollback()
+            # The run may have moved onto an earlier failed document for the
+            # same invoice (see job_queue.absorb_into_failed) -- that is the row
+            # to fail, not the one this job was claimed as.
+            doc = session.get(Document, job_queue.resolve_id(session, document_id))
+            if doc is None:
+                return
             _fail(session, doc, EX_TEKION_ERROR, error=str(e))
         finally:
-            _cleanup(doc)
+            live = session.get(Document, job_queue.resolve_id(session, document_id))
+            if live is not None:
+                _cleanup(live)
 
 
 def _resolve_source(doc: Document) -> str | None:
@@ -328,6 +343,20 @@ def _cache_ocr(doc: Document, ocr: dict[str, Any]) -> None:
         print(f"[PIPE] {doc.id} could not cache OCR: {e}")
 
 
+def _move_cached_ocr(from_id: UUID, doc: Document) -> None:
+    """Hand the OCR read for one document id over to another.
+
+    So a later "correct and re-run" on the document an upload was folded into
+    reuses what was read from the NEW file, not the one that failed.
+    """
+    try:
+        source = Path(tempfile.gettempdir()) / "rohrman" / "ocr" / f"{from_id}.json"
+        if source.exists():
+            source.replace(_ocr_cache_path(doc))
+    except OSError as e:
+        print(f"[PIPE] {doc.id} could not move cached OCR from {from_id}: {e}")
+
+
 def _load_cached_ocr(doc: Document) -> dict[str, Any] | None:
     try:
         path = _ocr_cache_path(doc)
@@ -359,6 +388,16 @@ def _run(doc: Document, session: Session) -> None:
     # that need it.
     overrides = manual_overrides(doc)
     cached = _load_cached_ocr(doc) if overrides else None
+    # A new upload, as opposed to a re-run, a retry or a released decision --
+    # nothing has been read from it yet. Only a new upload is folded into an
+    # earlier failed document; a document being re-run IS the one to keep.
+    new_upload = (
+        not doc.invoice_number
+        and not overrides
+        and not doc.duplicate_override
+        and not doc.review_approved
+        and not doc.po_choice
+    )
 
     # ── 1. Locate the file ───────────────────────────────────────────────────
     source = _resolve_source(doc)
@@ -416,6 +455,16 @@ def _run(doc: Document, session: Session) -> None:
         if duplicate is not None:
             job_queue.hold_as_duplicate(session, doc, duplicate)
             return
+
+    # ── 4a. The same invoice already failed ──────────────────────────────────
+    # Carry on as that document rather than starting a second one. If this run
+    # fails too, it fails there -- one invoice, one row.
+    if new_upload:
+        failed = job_queue.find_failed_same_invoice(session, doc)
+        if failed is not None:
+            upload_id = doc.id
+            doc = job_queue.absorb_into_failed(session, doc, failed)
+            _move_cached_ocr(upload_id, doc)
 
     # ── 4b. Deleted while it was running ─────────────────────────────────────
     # OCR takes tens of seconds, so there is a real window between claiming a
@@ -503,6 +552,37 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
     invoice_number = doc.invoice_number
     invoice_date = ocr_helpers.get_invoice_date(ocr)
     invoice_amount = ocr_helpers.get_total_amount(ocr)
+    line_items = ocr_helpers.get_raw_line_items(ocr)
+    gl_splits = ocr_helpers.get_gl_amount_splits(ocr)
+
+    # A CREDIT invoice runs the whole entry the other way.
+    #
+    # Honda sends parts returns and dollar adjustments as credit memos, totals
+    # printed "422.27 CR". The dealership is owed that money, so A/P is DEBITED
+    # and the inventory accounts are CREDITED. Posted as an ordinary invoice it
+    # balances perfectly and is completely backwards -- which is what happened,
+    # with 2410 and 2430 debited and A/P credited on a 1,001.52 credit.
+    #
+    # The journal entry already credits A/P with the NEGATIVE of the invoice
+    # amount, so a negative amount is all it takes for A/P to become the debit.
+    # The parts are read as magnitudes, so they flip with it.
+    if ocr_helpers.is_credit_invoice(ocr):
+        invoice_amount = -abs(invoice_amount)
+        for item in line_items:
+            item["unitPrice"] = -abs(item.get("unitPrice") or 0.0)
+            item["totalPrice"] = -abs(item.get("totalPrice") or 0.0)
+        # Written accounts keep the sign the clerk wrote, and on a credit memo
+        # that is a minus. Only if EVERY one came through positive -- the sign
+        # lost somewhere between the page and here -- are they all flipped: a
+        # credit memo whose accounts total its value as debits cannot be right,
+        # whereas a mixed split may be exactly what the clerk meant.
+        if gl_splits and all(sp["amount"] > 0 for sp in gl_splits):
+            for sp in gl_splits:
+                sp["amount"] = -abs(sp["amount"])
+        print(
+            f"[PIPE] {doc.id} credit invoice: total {invoice_amount:,.2f}, "
+            f"splits {[(sp['gl_account'], sp['amount']) for sp in gl_splits]}"
+        )
 
     # The SOP needs exactly these three off the ticket.
     missing = [
@@ -523,13 +603,13 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         invoice_date=invoice_date,
         invoice_amount=invoice_amount,
         dealership_name=doc.dealership_name,
-        # Each part becomes its own debit line on the entry.
-        line_items=ocr_helpers.get_raw_line_items(ocr),
+        # Each part becomes its own line on the entry.
+        line_items=line_items,
         # A GL account written on the invoice outranks anything we infer.
         invoice_gl_account=ocr_helpers.get_document_gl_account(ocr),
-        # Accounts with their own amounts. One debit line each, exactly as
-        # written -- see build_postings.
-        gl_splits=ocr_helpers.get_gl_amount_splits(ocr),
+        # Accounts with their own amounts. One line each, exactly as written
+        # -- see build_postings.
+        gl_splits=gl_splits,
     )
 
     try:
@@ -945,6 +1025,125 @@ def _resolve_existing_po(
     return None, True
 
 
+def _chart_by_number(dealer_id: str, session: Session) -> dict[str, str]:
+    """{account number: real Tekion account id} from the cached chart."""
+    from api.services.gl_service_misc import get_cached_gl_accounts
+
+    if not dealer_id:
+        return {}
+    return {
+        str(a.account_number): str(a.account_id)
+        for a in get_cached_gl_accounts(dealer_id, session)
+        if a.account_number
+    }
+
+
+def _propose_misc_draft(
+    doc: Document,
+    ocr: dict[str, Any],
+    session: Session,
+    total: float,
+    sales_tax: float,
+    line_items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Work out what this Misc invoice WOULD post, without posting it.
+
+    The same order of preference the posting itself uses, so what a person
+    reviews is what would have gone to Tekion had nobody looked:
+
+      1. accounts and amounts written on the invoice as a block
+      2. accounts written against the individual rows, summed per account
+      3. one account chosen from the descriptions, for the amount before tax
+
+    Best effort. If the chart cannot be read or no account can be chosen, the
+    draft comes back with no lines and says why -- a person can add them, which
+    is strictly better than failing the document over it.
+    """
+    from api.routes.tekion import _resolve_dealer, get_client
+    from api.services.gl_service_misc import (
+        get_or_fetch_gl_accounts,
+        resolve_misc_gl,
+    )
+
+    fields = {
+        "vendorName": doc.vendor_name,
+        "invoiceNumber": doc.invoice_number,
+        "invoiceDate": ocr_helpers.get_invoice_date(ocr),
+        "invoiceAmount": total or 0.0,
+        "salesTax": sales_tax or 0.0,
+        "dealershipName": doc.dealership_name,
+    }
+    dealer_id = ""
+    lines: list[dict[str, Any]] = []
+    source = ""
+
+    try:
+        with tekion_scope():
+            client = get_client(session)
+            dealer_id = _resolve_dealer(client, doc.dealership_name)
+            chart = {
+                str(a.account_number): str(a.account_name)
+                for a in get_or_fetch_gl_accounts(dealer_id, client, session)
+            }
+
+            written = ocr_helpers.get_gl_amount_splits(ocr)
+            per_row: dict[str, float] = {}
+            for item in line_items:
+                account = str(item.get("glAccount") or "")
+                if account:
+                    per_row[account] = round(
+                        per_row.get(account, 0.0) + item["qty"] * item["unitPrice"], 2
+                    )
+
+            if written:
+                source = "written on the invoice"
+                lines = [
+                    {
+                        "glAccount": sp["gl_account"],
+                        "amount": sp["amount"],
+                        "description": sp.get("description") or "",
+                    }
+                    for sp in written
+                ]
+            elif per_row:
+                source = "written against the rows"
+                lines = [{"glAccount": a, "amount": v} for a, v in per_row.items()]
+            elif total:
+                source = "chosen from the descriptions"
+                account_id = resolve_misc_gl(
+                    dealership_name=doc.dealership_name,
+                    dealer_id=dealer_id,
+                    line_descriptions=[
+                        i["description"] for i in line_items if i.get("description")
+                    ]
+                    or ["Misc purchase"],
+                    client=client,
+                    session=session,
+                )
+                lines = [
+                    {
+                        "glAccount": str(account_id).split("_")[-1],
+                        "amount": round(total - (sales_tax or 0.0), 2),
+                    }
+                ]
+
+            for line in lines:
+                line["glName"] = chart.get(str(line["glAccount"]), "")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[PIPE] {doc.id} could not propose GL lines: {exc}")
+        source = f"not decided automatically ({str(exc)[:120]})"
+        lines = []
+
+    draft = misc_review.new_draft(
+        dealer_id=dealer_id, fields=fields, lines=lines, source=source
+    )
+    print(
+        f"[PIPE] {doc.id} review draft: {len(draft['lines'])} line(s), "
+        f"{source or 'no source'}, balance={misc_review.balance(draft)['mode']}"
+    )
+    return draft
+
+
 def _run_purchase_order(
     doc: Document,
     ocr: dict[str, Any],
@@ -974,6 +1173,34 @@ def _run_purchase_order(
     total = ocr_helpers.get_total_amount(ocr)
     sales_tax = ocr_helpers.get_sales_tax(ocr)
     line_items = ocr_helpers.get_raw_line_items(ocr)
+
+    # ── MISC: stop and let a person check it first ─────────────────────────
+    #
+    # Before the missing-field check below, deliberately: a blank vendor or an
+    # unread total is exactly the kind of thing a person reviewing the draft
+    # can fix, and failing the document over it first would take that away.
+    review: dict[str, Any] | None = None
+    if doc.po_type == FOLDER_MISC:
+        if not doc.review_approved:
+            draft = misc_review.load(doc.review_draft)
+            if draft:
+                # Kept across re-runs, so a person's corrections survive a
+                # failed attempt. Only the stale refusal is cleared.
+                draft["error"] = ""
+            else:
+                draft = _propose_misc_draft(doc, ocr, session, total, sales_tax, line_items)
+            job_queue.hold_for_review(session, doc, misc_review.dump(draft))
+            return
+
+        # Approved: post what the person approved, not what OCR first read.
+        review = misc_review.load(doc.review_draft)
+        approved_fields = review.get("fields") or {}
+        total = misc_review._money(approved_fields.get("invoiceAmount")) or total
+        sales_tax = misc_review._money(approved_fields.get("salesTax"))
+        doc.vendor_name = approved_fields.get("vendorName") or doc.vendor_name
+        doc.invoice_number = approved_fields.get("invoiceNumber") or doc.invoice_number
+        session.add(doc)
+        session.commit()
 
     if not doc.vendor_name or not total:
         _fail(session, doc, EX_MISSING_FIELD, error="missing vendor name or total amount")
@@ -1165,19 +1392,41 @@ def _run_purchase_order(
                     unit_price=expected_po_total,
                 )
             ]
-            # Accounts and amounts written as a block outrank anything derived
-            # from the rows -- see get_gl_amount_splits.
-            req = CreateMiscPoRequest(
-                **common,
-                line_items=misc_items,
-                gl_splits=[
+            if review is not None:
+                # What a person approved. Every line is posted as its own split
+                # with its own control, and against the account's REAL Tekion id
+                # from the chart rather than one built from the number.
+                chart = _chart_by_number(review.get("dealerId") or "", session)
+                splits = [
+                    GlSplitInput(
+                        gl_account=line["glAccount"],
+                        amount=line["amount"],
+                        description=line.get("description") or None,
+                        control=line.get("control") or None,
+                        account_id=chart.get(line["glAccount"]),
+                    )
+                    for line in review.get("lines") or []
+                ]
+                # Consumed here, before the call: whatever Tekion answers, this
+                # approval has now been used.
+                doc.review_approved = False
+                session.add(doc)
+                session.commit()
+            else:
+                # Accounts and amounts written as a block outrank anything
+                # derived from the rows -- see get_gl_amount_splits.
+                splits = [
                     GlSplitInput(
                         gl_account=sp["gl_account"],
                         amount=sp["amount"],
                         description=sp["description"],
                     )
                     for sp in ocr_helpers.get_gl_amount_splits(ocr)
-                ],
+                ]
+            req = CreateMiscPoRequest(
+                **common,
+                line_items=misc_items,
+                gl_splits=splits,
             )
             with tekion_scope():
                 response = _create_misc_po(req, session, existing_po=existing_po)
