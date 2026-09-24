@@ -567,7 +567,14 @@ def _record_postings(
 
 
 def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> None:
-    """Parts Manufacture Ticket -> journal entry, saved as a draft."""
+    """Parts Manufacture Ticket -> journal entry, posted.
+
+    Posted, not left as a draft: opening every draft and pressing Submit by hand
+    was the one step of the SOP the automation still left to the clerk. A posted
+    entry cannot be undone in the UI, so everything that could refuse it -- the
+    parts reconciliation, the balance check -- runs first, and nothing is sent
+    when either says no.
+    """
     from api.routes.tekion import get_client, reset_client
     from api.services.je_creation import ExpectedJournalEntry, create_journal_entry
 
@@ -638,7 +645,9 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         # Serialized: create_journal_entry switches dealership on the shared client.
         with tekion_scope():
             client = get_client(session)
-            result = create_journal_entry(client, expected=expected, dry_run=False)
+            result = create_journal_entry(
+                client, expected=expected, dry_run=False, post=True
+            )
     except Exception as e:  # noqa: BLE001
         print(f"[PIPE] {doc.id} journal entry failed: {e}")
         reset_client()
@@ -676,7 +685,7 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         _fail(session, doc, EX_UNBALANCED, error=f"balance ${result.balance:.2f}")
         return
     if not result.saved:
-        _fail(session, doc, EX_TEKION_ERROR, error="draft was not saved")
+        _fail(session, doc, EX_TEKION_ERROR, error="the entry was not posted")
         return
 
     doc.transaction_id = result.transaction_id or ""

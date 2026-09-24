@@ -12,9 +12,10 @@ reproducing what a clerk does on Accounting -> Journal Entry -> Create New:
     3. Lines -- exactly two, and they must net to $0.00:
          line 1: GL 3000 TRADE CREDITORS  CREDIT  control = MMYY of the acct date
          line 2: GL 2410 PARTS INV        DEBIT
-    4. Save as Draft
+    4. Submit
+         -> POST /api/accounting/u/v2/transaction/dealer/{dealerId}/post
+       Save as Draft is still here and still works
          -> POST /api/accounting/u/v2/transaction/dealer/{dealerId}/draft
-    5. Submit -- deliberately not implemented, see submit().
 
 Only three values come off the Parts Ticket PDF: invoice number, invoice date,
 invoice amount. Everything else is either fixed by the SOP (journal 76, GL 3000)
@@ -44,10 +45,12 @@ INTEGRATION NOTE
     `create_journal_entry()` -- no other change is required.
 
 SAFETY
-    `create_journal_entry()` runs read-only by default. The Save as Draft write
-    is gated behind dry_run=False, and the entry is refused unless it balances
-    to $0.00. Submit always raises: drafts are reversible in the UI, posted
-    journal entries are not.
+    `create_journal_entry()` runs read-only by default; every write is gated
+    behind dry_run=False, and the entry is refused unless it balances to $0.00.
+
+    Posting is NOT reversible in the UI, where a draft is -- so which of the two
+    happens is an explicit argument (`post`) rather than a default. The OEM
+    flow asks for a post; anything that does not say stays on drafts.
 """
 from __future__ import annotations
 
@@ -57,10 +60,26 @@ from typing import Any
 
 from api.services.tekion_client import TekionApiClient
 
-# ── The captured Save as Draft call ───────────────────────────────────────────
+# ── The captured writes ───────────────────────────────────────────────────────
 # POST /api/accounting/u/v2/transaction/dealer/{dealerId}/draft  -> 200, DRAFT
+# POST /api/accounting/u/v2/transaction/dealer/{dealerId}/post   -> 200, POSTED
+#
+# Submit sends the SAME payload as the draft, to a different path, and comes
+# back with status POSTED and the transaction number. Captured 24 Sep 2026 by
+# submitting a $10 test entry at dealer 1707.
 _SAVE_DRAFT_METHOD = "POST"
 _SAVE_DRAFT_PATH = "/api/accounting/u/v2/transaction/dealer/{dealer_id}/draft"
+_POST_METHOD = "POST"
+_POST_PATH = "/api/accounting/u/v2/transaction/dealer/{dealer_id}/post"
+
+# Two keys the UI adds on Submit and not on a draft. Both were captured as sent
+# by Tekion's own screen: the first asks the server to run the journal's
+# validation rules, the second answers the A/R credit-limit prompt that a
+# GENERAL entry never raises.
+_POST_ONLY_FIELDS = {
+    "defaultJournalValidationRequired": True,
+    "userConsentToSkipCreditLimitCheckForAR": False,
+}
 
 # The control number is validated against vendor numbers before the save. This
 # is the same endpoint the AP approval flow uses for its vendor lookup.
@@ -157,6 +176,9 @@ class JournalEntryResult:
     # the SOP default. Worth surfacing -- the three are not equally trustworthy.
     debit_gl_source: str = ""
     saved: bool = False
+    # Whether it went in POSTED rather than as a draft. Separate from `saved`
+    # because the two differ in what can still be undone.
+    posted: bool = False
     transaction_id: str | None = None
     transaction_number: str | None = None
     status: str | None = None
@@ -546,19 +568,23 @@ class JournalEntryService:
         data = res.get("data") or {}
         return data.get("transaction") or data
 
-    # ── Step 5: Submit — intentionally not implemented ───────────────────────
+    # ── Step 5: Submit ───────────────────────────────────────────────────────
 
-    def submit(self, *_args: Any, **_kwargs: Any) -> None:
-        """The final post. NOT IMPLEMENTED ON PURPOSE.
+    def submit(self, payload: dict[str, Any], dealer_id: str) -> dict[str, Any]:
+        """Post the entry for real. Returns the created transaction.
 
-        Draft first, by explicit instruction: a draft is reversible in the UI, a
-        posted journal entry is not. Capture the Submit click the same way Save
-        as Draft was captured before implementing this.
+        There is no undo. A draft can be opened and deleted in the UI; a posted
+        entry has hit the ledger and has to be reversed with another entry. The
+        balance check upstream is what stands between this call and a wrong
+        posting, which is why it refuses rather than rounds.
         """
-        raise NotImplementedError(
-            "Submit is intentionally not implemented — the flow stops at Save as Draft. "
-            "Re-capture with npm run pw:capture:je and click Submit once to record it."
+        path = _POST_PATH.format(dealer_id=dealer_id)
+        print(f"[JE] Submit: {_POST_METHOD} {path}")
+        res = self.client._req_json(
+            path, method=_POST_METHOD, body={**payload, **_POST_ONLY_FIELDS}
         )
+        data = res.get("data") or {}
+        return data.get("transaction") or data
 
 
 # ── Orchestration ─────────────────────────────────────────────────────────────
@@ -569,14 +595,17 @@ def create_journal_entry(
     expected: ExpectedJournalEntry | None = None,
     dealership_name: str | None = None,
     dry_run: bool = True,
+    post: bool = False,
 ) -> JournalEntryResult:
-    """Run the Parts Manufacture Ticket SOP up to (but not including) Submit.
+    """Run the Parts Manufacture Ticket SOP and write the entry.
 
     Args:
         client: a logged-in TekionApiClient.
         expected: the entry to create. Defaults to HARDCODED_EXPECTED.
         dealership_name: dealer to switch to. Defaults to expected.dealership_name.
         dry_run: when True (default) nothing is written to Tekion.
+        post: submit the entry instead of leaving it as a draft. Not reversible,
+            so it is off unless the caller asks for it.
     """
     expected = expected or HARDCODED_EXPECTED
     svc = JournalEntryService(client)
@@ -688,16 +717,23 @@ def create_journal_entry(
         result.debit_total,
     )
 
-    # ── Step 4: Save as Draft ────────────────────────────────────────────────
+    # ── Step 4/5: write it ───────────────────────────────────────────────────
+    what = "Submit" if post else "Save as Draft"
     if dry_run:
-        result.notes.append("Dry run - stopped before Save as Draft. Nothing was written.")
+        result.notes.append(f"Dry run - stopped before {what}. Nothing was written.")
     else:
-        txn = svc.save_draft(result.payload, result.dealer_id)
+        txn = (
+            svc.submit(result.payload, result.dealer_id)
+            if post
+            else svc.save_draft(result.payload, result.dealer_id)
+        )
         result.saved = True
+        result.posted = post
         result.transaction_id = str(txn.get("id") or "")
         result.transaction_number = str(txn.get("transactionNumber") or "")
         result.status = txn.get("status")
-        print(f"[JE] Draft saved: transaction {result.transaction_number} "
-              f"(id={result.transaction_id}, status={result.status})")
+        print(f"[JE] {'Posted' if post else 'Draft saved'}: transaction "
+              f"{result.transaction_number} (id={result.transaction_id}, "
+              f"status={result.status})")
 
     return result

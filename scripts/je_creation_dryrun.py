@@ -76,7 +76,12 @@ def main() -> int:
     )
     ap.add_argument(
         "--save", action="store_true",
-        help="Actually save the draft to Tekion (creates a real DRAFT transaction)",
+        help="Actually write to Tekion (creates a real transaction)",
+    )
+    ap.add_argument(
+        "--post", action="store_true",
+        help="With --save, SUBMIT the entry instead of saving a draft. A posted "
+             "entry cannot be undone in the UI.",
     )
     args = ap.parse_args()
 
@@ -121,8 +126,11 @@ def main() -> int:
     _rule(f"2-3. Parts Manufacture Ticket SOP — journal {expected.journal_number}, "
           f"invoice {expected.invoice_number}")
     if args.save:
-        print("  !! --save given: a real DRAFT transaction will be created.\n")
-    result = create_journal_entry(client, expected=expected, dry_run=not args.save)
+        kind = "POSTED" if args.post else "DRAFT"
+        print(f"  !! --save given: a real {kind} transaction will be created.\n")
+    result = create_journal_entry(
+        client, expected=expected, dry_run=not args.save, post=args.post
+    )
 
     _rule("Result")
     print(f"  balanced                 : {result.balanced}")
