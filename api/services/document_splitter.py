@@ -70,6 +70,25 @@ from pipeline import get_client  # noqa: E402
 # Finding a header needs far less resolution than reading handwriting does.
 SEGMENT_DPI = 110
 
+# One segment costs roughly 40 tokens of JSON (two page numbers, an invoice
+# number, a vendor). A hundred invoices is far more than anyone scans in one
+# batch, and the headroom is free -- these are a ceiling, not a target, and
+# nothing is charged for tokens that are not produced.
+MAX_SEGMENT_TOKENS = 32768
+# Generous for the task, and small enough that it cannot crowd out the answer.
+SEGMENT_THINKING_TOKENS = 4096
+
+
+class SegmentationFailed(Exception):
+    """Segmentation produced nothing that could be trusted.
+
+    Distinct from "this is one document", which is a real answer. Raised only
+    when the splitter does not KNOW how the file divides -- a truncated reply,
+    a nonsense page range, segments that do not tile the file. The caller has
+    to treat a multi-page file it cannot read as a failure, because the
+    alternative is posting page one to Tekion and reporting success.
+    """
+
 SEGMENT_PROMPT = """You are separating a SCANNED BATCH of dealership paperwork into individual
 documents. The pages given to you may be one document, or several unrelated documents scanned
 together back to back.
@@ -197,9 +216,12 @@ def _covers_exactly(segments: list[Segment], total_pages: int) -> bool:
 def segment_documents(file_path: str | Path) -> list[Segment]:
     """The separate documents inside a file.
 
-    Returns one segment for an ordinary single invoice, several for a batch
-    scan, and an empty list when segmentation could not be trusted — callers
-    treat empty as "process this as one document", the existing behaviour.
+    One segment for an ordinary invoice, several for a batch scan.
+
+    Raises SegmentationFailed when the file could not be read reliably. That is
+    deliberately not the same as returning one segment: "this is a single
+    invoice" is an answer, "I could not tell" is not, and a caller that treats
+    them alike posts page one of a batch to Tekion and calls it a success.
     """
     path = Path(file_path)
     total = page_count(path)
@@ -217,15 +239,30 @@ def segment_documents(file_path: str | Path) -> list[Segment]:
                 temperature=0.0,
                 response_mime_type="application/json",
                 response_schema=_segment_schema(),
-                max_output_tokens=4096,
+                # Room for the answer AND for the model's own reasoning, which
+                # is charged to the same budget on a thinking model.
+                #
+                # 4096 was enough for a scan of about 28 invoices and silently
+                # not enough for 35: the reasoning consumed the allowance, the
+                # JSON was cut off in the middle of the third entry, parsing
+                # threw, and a 40-page batch was posted to Tekion as if it were
+                # one invoice. The ceiling has to sit far above any real batch,
+                # because crossing it does not look like an error.
+                max_output_tokens=MAX_SEGMENT_TOKENS,
+                # And cap the reasoning explicitly, so a hard page can never
+                # spend the whole budget thinking and leave nothing to answer
+                # with. Segmenting is a shallow task -- find the page where the
+                # invoice number changes -- and does not need deep reasoning.
+                thinking_config=types.ThinkingConfig(
+                    thinking_budget=SEGMENT_THINKING_TOKENS
+                ),
             ),
         )
         import json
 
         raw = json.loads(resp.text or "{}").get("documents") or []
     except Exception as e:  # noqa: BLE001
-        print(f"[SPLIT] segmentation failed ({e}); treating as one document")
-        return []
+        raise SegmentationFailed(f"could not read the segmentation reply: {e}") from e
 
     segments: list[Segment] = []
     for entry in raw:
@@ -238,19 +275,16 @@ def segment_documents(file_path: str | Path) -> list[Segment]:
                     vendor_name=str(entry.get("vendor_name") or "").strip(),
                 )
             )
-        except (TypeError, ValueError):
-            print(f"[SPLIT] unusable segment {entry!r}; treating as one document")
-            return []
+        except (TypeError, ValueError) as e:
+            raise SegmentationFailed(f"unusable segment {entry!r}") from e
 
     segments.sort(key=lambda s: s.page_start)
     segments = _merge_repeats(segments)
 
     if not _covers_exactly(segments, total):
-        print(
-            f"[SPLIT] segments do not tile {total} pages "
-            f"({[str(s) for s in segments]}); treating as one document"
+        raise SegmentationFailed(
+            f"segments do not tile {total} pages: {[str(s) for s in segments]}"
         )
-        return []
 
     # Distinct invoice numbers are the evidence that this really is a batch.
     # Several segments that cannot name themselves are not enough to act on.

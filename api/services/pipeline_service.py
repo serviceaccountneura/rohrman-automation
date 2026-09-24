@@ -120,6 +120,11 @@ EX_NO_LINE_ITEMS = "NO_LINE_ITEMS"
 # or an amount the template needs was never written on the invoice. Not an
 # error -- a document that needs a human step before it can be processed.
 EX_VMI_REFUSED = "VEHICLE_ENTRY_REFUSED"
+# A multi-page file the splitter could not divide. Held rather than processed:
+# a batch scan read as one document posts its FIRST invoice to Tekion and
+# reports success, which is indistinguishable from a good run until someone
+# opens the invoice and finds the other thirty missing.
+EX_SPLIT_FAILED = "BATCH_SPLIT_FAILED"
 EX_TEKION_ERROR = "TEKION_ERROR"
 # Tekion answered, and the answer was no. Distinct from TEKION_ERROR because a
 # rejection is final — retrying re-runs OCR and asks the same question again.
@@ -138,6 +143,7 @@ _SEVERITY = {
     EX_NO_LINE_ITEMS: "HIGH",
     EX_TEKION_ERROR: "HIGH",
     EX_TEKION_REJECTED: "HIGH",
+    EX_SPLIT_FAILED: "HIGH",
 }
 
 # Only OCR is retried, and only because it is free of side effects: reading a
@@ -248,6 +254,22 @@ def _split_batch(doc: Document, source: str, session: Session) -> bool:
 
     try:
         segments = document_splitter.segment_documents(source)
+    except document_splitter.SegmentationFailed as e:
+        # We know this file has several pages and we do NOT know how it
+        # divides. Processing it as one document would read the first invoice,
+        # post it, and report success -- the failure that prompted this, where
+        # a 40-page batch became a single journal entry and looked fine.
+        #
+        # Hold it for a person instead. Nothing has been sent to Tekion.
+        print(f"[SPLIT] {doc.id} could not be segmented ({e}); holding for review")
+        _fail(
+            session,
+            doc,
+            EX_SPLIT_FAILED,
+            f"This file has {document_splitter.page_count(source)} pages and could not be "
+            f"separated into individual invoices, so nothing was posted. {e}",
+        )
+        return True
     except Exception as e:  # noqa: BLE001 — never fail a job over segmentation
         print(f"[SPLIT] {doc.id} segmentation error ({e}); processing as one document")
         return False

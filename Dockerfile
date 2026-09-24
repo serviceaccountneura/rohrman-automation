@@ -40,6 +40,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # and Vertex with real credentials.
 RUN useradd --create-home --uid 10001 app
 
+# The uploads volume mounts here. Create it owned by `app` in the image: Docker
+# seeds a fresh named volume from the image's directory, so the volume comes up
+# writable instead of root-owned. Without this the app cannot create its OCR
+# cache under it -- "Permission denied: /tmp/rohrman/ocr" -- and every re-run
+# pays for a second Gemini pass over a document it had already read.
+RUN mkdir -p /tmp/rohrman && chown -R app:app /tmp/rohrman
+
 WORKDIR /app
 
 COPY --from=builder --chown=app:app /app/.venv /app/.venv
