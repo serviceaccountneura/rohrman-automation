@@ -695,9 +695,14 @@ def get_unpriced_gl_accounts(ocr: dict[str, Any], priced: dict[str, float]) -> l
     document rather than shrink it.
     """
     missing: list[str] = []
-    for raw in ocr.get("handwritten_notes") or []:
-        note = str(raw or "")
-
+    # Line by line: two accounts OCR joined into one note are still two
+    # accounts, and _MARKED_ACCOUNT below takes only the first per note.
+    notes = [
+        line
+        for raw in ocr.get("handwritten_notes") or []
+        for line in ocr_helpers.note_lines(raw)
+    ]
+    for note in notes:
         # A note that reads "GL 2245 1129$" contains TWO four-digit numbers, and
         # only the first is an account -- the second is the amount. Reading both
         # as accounts reported 1129 as written-but-unpriced and refused an

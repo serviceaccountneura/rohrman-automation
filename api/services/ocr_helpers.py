@@ -682,6 +682,41 @@ _NOTE_GL_LINE = re.compile(
 )
 
 
+def note_lines(raw: Any) -> list[str]:
+    """One handwritten note, split into the lines it was written on.
+
+    OCR does not transcribe a block of handwriting consistently. The same two
+    lines come back as two notes on one run and as ONE note joined by a newline
+    on the next -- "# 2410 $414 00\\n# 6777 - $82 80". Anything that reads a note
+    as a single annotation then sees the first account and swallows the second
+    into its label, which dropped 6777 and its minus and posted a journal entry
+    out of balance by exactly that figure.
+    """
+    return [line.strip() for line in str(raw or "").splitlines() if line.strip()]
+
+
+def _note_annotations(ocr: dict[str, Any]) -> list[str]:
+    """Every "account amount" annotation in the notes, one per entry.
+
+    Each line is read on its own. A line that is not an annotation by itself
+    is tried joined to the one before it, for the clerk who writes the account
+    and puts the figure underneath: "GL# 2410" then "$414.00".
+    """
+    annotations: list[str] = []
+    for raw in ocr.get("handwritten_notes") or []:
+        carry = ""
+        for line in note_lines(raw):
+            if _NOTE_GL_LINE.match(line):
+                annotations.append(line)
+                carry = ""
+            elif carry and _NOTE_GL_LINE.match(f"{carry} {line}"):
+                annotations.append(f"{carry} {line}")
+                carry = ""
+            else:
+                carry = line
+    return annotations
+
+
 def gl_notes(ocr: dict[str, Any]) -> list[dict[str, Any]]:
     """Accounts and amounts read straight off the transcribed handwriting.
 
@@ -697,8 +732,8 @@ def gl_notes(ocr: dict[str, Any]) -> list[dict[str, Any]]:
     as opposed to the amount simply arriving positive.
     """
     found: list[dict[str, Any]] = []
-    for raw in ocr.get("handwritten_notes") or []:
-        match = _NOTE_GL_LINE.match(str(raw or ""))
+    for text in _note_annotations(ocr):
+        match = _NOTE_GL_LINE.match(text)
         if not match:
             continue
         figure = match.group("figure")
