@@ -674,7 +674,11 @@ _NOTE_GL_LINE = re.compile(
     r"^\s*(?:[*\-]+\s*)?(?P<word>CREDIT|DEBIT|CR|DR)?\s*"
     r"(?:GL|G/?L|ACCT|ACCOUNT|A/C)?\s*#?\s*"
     r"(?P<account>\d{4,5}[A-Za-z]?)\s+"
-    r"(?P<minus>-\s*)?\$?\s*(?P<figure>[\d,]+(?:\.\d{1,2})?)"
+    # The figure may start at the decimal point: clerks write small credits as
+    # "-$.25", with no leading zero. Requiring a digit first skipped that note
+    # entirely, its minus with it, and the 6777 discount on 80092491307A
+    # posted as +0.25 -- an entry $0.50 out of balance.
+    r"(?P<minus>-\s*)?\$?\s*(?P<figure>[\d,]+(?:\.\d{1,2})?|\.\d{1,2})"
     # Cents written raised, which OCR reads as a separate group: "-$422 27".
     r"(?:\s+(?P<cents>\d{2})(?!\d))?"
     r"\s*\$?\s*(?P<label>.*)$",
