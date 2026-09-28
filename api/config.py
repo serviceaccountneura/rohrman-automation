@@ -21,8 +21,10 @@ class Settings(BaseSettings):
     # ── JWT ───────────────────────────────────────────────────────────────────
     jwt_secret: str = "change-me-in-production-please-use-a-long-random-string"
     jwt_algorithm: str = "HS256"
-    access_token_expire_minutes: int = 15
-    refresh_token_expire_days: int = 7
+    # One token per login, no refresh: when it expires the user signs in again.
+    # 7 days. Renewing short-lived tokens with single-use refresh tokens raced
+    # whenever two requests renewed at once, and a lost race ended the session.
+    access_token_expire_minutes: int = 10080
 
     # ── AWS S3 ────────────────────────────────────────────────────────────────
     aws_access_key_id: str = ""

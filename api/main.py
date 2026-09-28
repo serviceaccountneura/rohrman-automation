@@ -61,7 +61,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Auth routes — public (signup/login/refresh). /me enforces auth internally.
+# Auth routes — public (signup/login). /me enforces auth internally.
 app.include_router(auth.router)
 
 # Protected routes — require a valid access token for every path operation.

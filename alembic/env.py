@@ -17,7 +17,7 @@ if config.config_file_name is not None:
 # add your model's MetaData object here
 # for 'autogenerate' support
 from api.config import settings  # noqa: E402
-from api.models.db import User, RefreshToken  # noqa: E402,F401  (register tables)
+from api.models.db import User  # noqa: E402,F401  (register tables)
 import sqlmodel  # noqa: E402
 
 target_metadata = sqlmodel.SQLModel.metadata
