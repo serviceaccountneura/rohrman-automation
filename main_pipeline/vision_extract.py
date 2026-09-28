@@ -78,6 +78,29 @@ NUMBERS & FAITHFULNESS:
 - If a token is genuinely unreadable, add it to `illegible[]` rather than guessing.
 - Capture handwritten annotations, margin notes, stamps, signatures and initials in
   `handwritten_notes[]` (note signatures as "[signature] <legible name>").
+- HANDWRITTEN GL LINES IN `handwritten_notes[]`: when the clerk writes a GL account with an amount
+  beside it, the sign of that amount is read from this transcription and nowhere else, so copy
+  each such line in exactly this form:
+
+      #<account> <amount>
+
+  * ONE entry per written line. Never join two written lines into one entry, and never split one
+    written line across two entries.
+  * Account FIRST, then the amount -- the order the clerk wrote it. Never put the amount first.
+  * Keep a minus exactly where it is written, directly in front of the amount: "-$271.19".
+    A dash before the dollar sign is a minus, not a "#" and not part of the account.
+  * Write cents with a decimal point. Raised or underlined cents ($1,669^90, $271^19) become
+    $1,669.90 and $271.19. Keep a leading point as written: -$.25.
+  * Copy only what is written. Add no words, labels or codes that are not on the page.
+
+  Examples -- as written on the page -> entry in `handwritten_notes[]`:
+
+      #2410   $1,669^90        ->  "#2410 $1,669.90"
+      #6777   -$271^19         ->  "#6777 -$271.19"
+      GL# 6777  -$.25          ->  "#6777 -$.25"
+
+  Everything else in `handwritten_notes[]` -- signatures, PO numbers, stock numbers, other
+  notes -- is unchanged by this rule.
 
 MULTI-DOCUMENT UPLOADS:
 - One upload may be a single document spanning pages, OR a PRIMARY document plus SUPPORTING
