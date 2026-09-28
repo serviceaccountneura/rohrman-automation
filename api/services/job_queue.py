@@ -333,12 +333,13 @@ def confirm_duplicate(session: Session, doc: Document) -> Document:
 
 
 def requeue_for_rerun(session: Session, doc: Document) -> Document:
-    """Put a failed document back on the queue after a person corrected it.
+    """Put a failed document back on the queue when a person asks to re-run it.
 
     The attempt counter is reset. Retries exist to ride out a flaky Tekion, and
-    this is not a retry -- the inputs changed, so the previous failures say
-    nothing about whether this run will work, and letting them count would
-    exhaust the budget on a document that is now correct.
+    this is not a retry -- a person either corrected the inputs or fixed the
+    cause elsewhere, so the previous failures say nothing about whether this
+    run will work, and letting them count would exhaust the budget on a
+    document that is now correct.
 
     The previous error is cleared for the same reason: leaving it visible next
     to a QUEUED row reads as a fresh failure.
@@ -355,7 +356,7 @@ def requeue_for_rerun(session: Session, doc: Document) -> Document:
     session.add(doc)
     session.commit()
     session.refresh(doc)
-    print(f"[QUEUE] {doc.id} -> QUEUED (re-run with corrections)")
+    print(f"[QUEUE] {doc.id} -> QUEUED (re-run requested)")
     return doc
 
 
