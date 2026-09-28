@@ -413,7 +413,11 @@ def rerun_document(
     payload: RerunRequest,
     session: Annotated[Session, Depends(get_session)],
 ) -> PipelineStatusResponse:
-    """Run a refused document again, with fields a person supplied.
+    """Run a refused document again, with any fields a person supplied.
+
+    Corrections are optional. With none, the document simply runs again on the
+    same data -- for a refusal that was fixed somewhere else: a bug fixed on our
+    side, or a setting changed in Tekion.
 
     The invoice is not read again. OCR from the first attempt is cached, the
     corrections are overlaid on it, and the document goes back on the queue --
@@ -446,15 +450,28 @@ def rerun_document(
         elif str(value).strip():
             fields[key] = value
 
-    if not fields:
-        raise HTTPException(
-            status_code=400,
-            detail="No corrections supplied. Fill in at least one field before re-running.",
-        )
+    if not supplied:
+        # Running again unchanged is only safe if nothing reached Tekion. A
+        # failure after a PO or journal entry was created would create it a
+        # second time; that needs a person to look, not a button.
+        already = doc.po_number or doc.transaction_number
+        if already:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Part of this document already reached Tekion ({already}). "
+                    "Running it again unchanged would create that again. "
+                    "Check it in Tekion first."
+                ),
+            )
 
-    doc.manual_fields = json.dumps(fields)[:4000]
+    if fields:
+        doc.manual_fields = json.dumps(fields)[:4000]
     job_queue.requeue_for_rerun(session, doc)
-    print(f"[PIPE] {doc.id} re-run requested with {fields}")
+    print(
+        f"[PIPE] {doc.id} re-run requested "
+        + (f"with {fields}" if supplied else "as-is (no new corrections)")
+    )
     return _to_status(doc, session=session)
 
 
