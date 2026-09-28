@@ -195,6 +195,7 @@ GL ACCOUNTS & SPATIAL BINDING:
 
         GL# 7193   $2,378.11        -> {"gl_account": "7193", "amount": "2378.11", ...}
         GL# 3142   $202.12          -> {"gl_account": "3142", "amount": "202.12", ...}
+        #6777      -$271^19         -> {"gl_account": "6777", "amount": "-271.19", ...}
 
     Accounts written this way do NOT belong to any single row and must not be copied into
     `line_items[].gl_account`. This is now the usual way GL accounts are marked: expect the
@@ -251,8 +252,11 @@ GL ACCOUNTS & SPATIAL BINDING:
   - When a handwritten GL code points instead at a labelled figure in a totals column, use that
     figure and name the label (e.g. `{"gl_account": "3300", "amount": "32133.00",
     "mapped_description": "TOTAL dealer cost"}`).
-  - Report `amount` as a POSITIVE number in `gl_mappings[]`. Debit/credit direction is decided
-    downstream, never here.
+  - Report `amount` in `gl_mappings[]` WITH ITS SIGN, exactly as the page shows it. A minus in
+    front of the figure, "CR" beside it, or brackets around it mean a credit: report it as a
+    negative number -- "-$271.19" -> "-271.19", "$118.03 CR" -> "-118.03", "(82.80)" -> "-82.80",
+    "-$.25" -> "-0.25". A figure written with none of those is positive. Never add a minus the page
+    does not show, and never drop one it does.
 
 Return ONLY the JSON object described by the schema. No commentary, no markdown fences.
 """
