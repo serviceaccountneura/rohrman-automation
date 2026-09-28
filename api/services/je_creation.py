@@ -458,7 +458,11 @@ class JournalEntryService:
             }
             if description:
                 # The part name, so the line says what it is on the JE screen.
-                row["refText"] = description[:_REF_TEXT_MAX]
+                # `description` is the Description column. NOT refText: that is
+                # the Control column, and a CUSTOM control holding free text
+                # with no refId is refused at post time with A217 "Mandatory
+                # fields are not filled as per COA". Drafts do not check it.
+                row["description"] = description[:_REF_TEXT_MAX]
             return row
 
         # A written block replaces the per-part debit entirely: it names the
@@ -481,7 +485,11 @@ class JournalEntryService:
                 }
                 description = split.get("description")
                 if description:
-                    row["refText"] = str(description)[:_REF_TEXT_MAX]
+                    # Description column, not refText (the Control column) --
+                    # see _debit above. OCR labels the written amount on some
+                    # runs ("Invoice Total") and not others, and every labelled
+                    # run was refused with A217 while the unlabelled ones posted.
+                    row["description"] = str(description)[:_REF_TEXT_MAX]
                 postings.append(row)
             return postings
 
