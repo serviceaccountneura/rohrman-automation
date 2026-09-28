@@ -32,6 +32,7 @@ CONCURRENCY
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -390,6 +391,44 @@ def _load_cached_ocr(doc: Document) -> dict[str, Any] | None:
         return None
 
 
+def signed_amount(value: Any) -> float | None:
+    """A typed amount with its sign: "-118.03", "118.03 CR" and "(118.03)" are credits."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    magnitude = ocr_helpers._parse_amount(text)
+    if not magnitude and not re.search(r"\d", text):
+        return None
+    negative = (
+        text.lstrip("$ ").startswith("-")
+        or re.search(r"(?i)\bCR\b|\bCREDIT\b", text) is not None
+        or (text.startswith("(") and text.endswith(")"))
+    )
+    return round(-magnitude if negative else magnitude, 2)
+
+
+def read_fields(doc: Document) -> dict[str, Any]:
+    """What was read off this document, for the correction form, in any folder.
+
+    The form used to fill itself from vehicle_details alone, which only the
+    vehicle flow writes -- so an OEM invoice whose date and handwritten GL
+    lines were read perfectly showed "Not found" and "None read".
+
+    GL amounts carry their sign, as they would post. Empty when there is no
+    cached OCR to read from.
+    """
+    ocr = _load_cached_ocr(doc)
+    if not ocr:
+        return {}
+    splits = ocr_helpers.get_gl_amount_splits(ocr) or [
+        {"gl_account": n["account"], "amount": n["amount"]} for n in ocr_helpers.gl_notes(ocr)
+    ]
+    return {
+        "invoiceDate": ocr_helpers.get_invoice_date(ocr) or "",
+        "glAnnotations": {str(s["gl_account"]): round(float(s["amount"]), 2) for s in splits},
+    }
+
+
 def manual_overrides(doc: Document) -> dict[str, Any]:
     """What a person typed in for this document, or {}."""
     if not doc.manual_fields:
@@ -409,6 +448,10 @@ def _run(doc: Document, session: Session) -> None:
     # "fix the stock number and try again" impossible for exactly the documents
     # that need it.
     overrides = manual_overrides(doc)
+    # Any re-run a person asked for -- with corrections or without -- reuses
+    # the first reading. The rerun endpoint always leaves a marker, so "Run
+    # again" with nothing edited does not quietly send the invoice back through
+    # Gemini and come back with a different reading than the one on screen.
     cached = _load_cached_ocr(doc) if overrides else None
     # A new upload, as opposed to a re-run, a retry or a released decision --
     # nothing has been read from it yet. Only a new upload is folded into an
@@ -576,6 +619,34 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
     invoice_amount = ocr_helpers.get_total_amount(ocr)
     line_items = ocr_helpers.get_raw_line_items(ocr)
     gl_splits = ocr_helpers.get_gl_amount_splits(ocr)
+
+    # What a person corrected on "Correct and run again" outranks what OCR
+    # read -- they are looking at the invoice. Before this, only the vehicle
+    # flow applied corrections, and an OEM correction was saved and ignored.
+    corrected = manual_overrides(doc)
+    if str(corrected.get("invoice_number") or "").strip():
+        invoice_number = doc.invoice_number = str(corrected["invoice_number"]).strip()
+    if str(corrected.get("invoice_date") or "").strip():
+        invoice_date = str(corrected["invoice_date"]).strip()
+    if str(corrected.get("dealership_name") or "").strip():
+        doc.dealership_name = str(corrected["dealership_name"]).strip()
+    written = corrected.get("gl_annotations") or {}
+    if written:
+        # The card sends the whole list as the person left it, so it replaces
+        # what was read rather than merging. The sign is kept: "-118.03" on
+        # 6777 is the discount, and dropping it is what unbalanced entries.
+        gl_splits = [
+            {"gl_account": str(account).strip().upper(), "amount": amount, "description": None}
+            for account, amount in (
+                (a, signed_amount(v)) for a, v in written.items()
+            )
+            if str(account).strip() and amount is not None
+        ]
+    if corrected:
+        print(
+            f"[PIPE] {doc.id} OEM corrections applied: number={invoice_number!r} "
+            f"date={invoice_date!r} splits={[(s['gl_account'], s['amount']) for s in gl_splits]}"
+        )
 
     # A CREDIT invoice runs the whole entry the other way.
     #
