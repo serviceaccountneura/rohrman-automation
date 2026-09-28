@@ -500,6 +500,9 @@ class PipelineStatusResponse(BaseModel):
     manual_fields: dict[str, Any] = Field(default_factory=dict, alias="manualFields")
     # What the vehicle flow read, matched and built. Present on refusals too.
     vehicle_details: dict[str, Any] = Field(default_factory=dict, alias="vehicleDetails")
+    # What was read off the document in any folder -- invoice date, and the
+    # handwritten GL lines with their signs -- for the correction form.
+    read_fields: dict[str, Any] = Field(default_factory=dict, alias="readFields")
     # What this document posted to Tekion -- the GL accounts, the amount against
     # each, and the totals. The same shape for every flow, so one component
     # renders a Misc split, a journal entry and a vehicle purchase alike.

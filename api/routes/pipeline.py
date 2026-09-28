@@ -465,8 +465,10 @@ def rerun_document(
                 ),
             )
 
-    if fields:
-        doc.manual_fields = json.dumps(fields)[:4000]
+    # The marker makes the worker reuse the first reading even when nothing
+    # was corrected; see _run. Ignored by everything that applies corrections.
+    fields["rerun"] = True
+    doc.manual_fields = json.dumps(fields)[:4000]
     job_queue.requeue_for_rerun(session, doc)
     print(
         f"[PIPE] {doc.id} re-run requested "
@@ -496,7 +498,7 @@ def get_job(
             ).all()
         )
 
-    return _to_status(doc, children, session=session)
+    return _to_status(doc, children, session=session, include_read=True)
 
 
 def _as_json_object(raw: str) -> dict:
@@ -519,6 +521,7 @@ def _to_status(
     doc: Document,
     children: list[UUID] | None = None,
     session: Session | None = None,
+    include_read: bool = False,
 ) -> PipelineStatusResponse:
     uploaded_by = ""
     if session is not None and doc.uploaded_by_id is not None:
@@ -545,6 +548,13 @@ def _to_status(
         review_draft=_review_payload(doc),
         manual_fields=_as_json_object(doc.manual_fields),
         vehicle_details=_as_json_object(doc.vehicle_details),
+        # Only for a failed document, where the correction form needs it; it
+        # costs a file read, so the polling paths do not pay for it.
+        read_fields=(
+            pipeline_service.read_fields(doc)
+            if include_read and doc.status == job_queue.STATUS_EXCEPTION
+            else {}
+        ),
         posting_details=_as_json_object(doc.posting_details),
         needs_fields=[
             str(f) for f in (_as_json_object(doc.vehicle_details).get("needs") or [])
