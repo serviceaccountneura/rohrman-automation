@@ -53,6 +53,19 @@ from api.services.security import (
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
+# How long a refresh token stays usable after it has been rotated.
+#
+# Rotation makes a refresh token single-use, but one page load can present the
+# same token more than once: the frontend's proxy and its dashboard layout both
+# read the session, and so does every open tab. The first caller rotated it and
+# every other one was refused, which ended a perfectly good session -- and the
+# frontend, left holding a spent token, retried it on every request.
+#
+# A few seconds covers requests that were already in flight. Logout, a password
+# reset and deleting the user still end a token immediately; only rotation
+# leaves this window.
+ROTATION_GRACE = timedelta(seconds=30)
+
 
 def _build_token_pair(user: User, session: Session) -> Token:
     access_token, _, _ = create_access_token(user.id, user.email)
@@ -217,8 +230,17 @@ def refresh(
     stored = session.exec(
         select(RefreshToken).where(RefreshToken.jti == jti)
     ).first()
-    if stored is None or stored.revoked:
+    if stored is None:
         raise credentials_exc
+    if stored.revoked:
+        # Retired by rotation moments ago: a concurrent request carrying the
+        # same token, not a replay. Anything else revoked stays revoked.
+        rotated_recently = (
+            stored.rotated_at is not None
+            and _utcnow() - stored.rotated_at < ROTATION_GRACE
+        )
+        if not rotated_recently:
+            raise credentials_exc
 
     # Defense in depth: verify the presented token matches the stored hash.
     if stored.token_hash != hash_refresh_token(req.refresh_token):
@@ -231,10 +253,14 @@ def refresh(
     if user is None or not user.is_active:
         raise credentials_exc
 
-    # Rotate: revoke the old refresh token, issue a fresh pair.
-    stored.revoked = True
-    session.add(stored)
-    session.commit()
+    # Rotate: revoke the old refresh token, issue a fresh pair. The grace
+    # window runs from the FIRST rotation, so reusing the token inside it does
+    # not keep extending it.
+    if not stored.revoked:
+        stored.revoked = True
+        stored.rotated_at = _utcnow()
+        session.add(stored)
+        session.commit()
 
     return _build_token_pair(user, session)
 

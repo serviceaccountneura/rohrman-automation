@@ -73,6 +73,11 @@ class RefreshToken(SQLModel, table=True):
     token_hash: str = Field(index=True, max_length=128)
     expires_at: datetime
     revoked: bool = Field(default=False)
+    # When this token was exchanged for a new pair. Distinguishes a token
+    # retired by rotation -- which stays usable for a few seconds, see
+    # ROTATION_GRACE in routes/auth.py -- from one revoked by logout, which
+    # never is. NULL for anything revoked any other way.
+    rotated_at: datetime | None = Field(default=None)
     created_at: datetime = Field(default_factory=_utcnow)
 
 
