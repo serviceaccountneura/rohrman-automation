@@ -665,11 +665,12 @@ def create_journal_entry(
     # falling through to a balance check that reads "balance $0.00" and says
     # nothing about why. A written account used to be skipped silently, which
     # would have posted that line with no account at all.
-    missing = [
+    # Once each: the same account can be both the debit and a written line.
+    missing = list(dict.fromkeys(
         str(p.expected)
         for p in problems
         if p.found == "not in this dealership's chart"
-    ]
+    ))
     if missing or len(resolved) < 2:
         result.accounts_not_in_chart = missing
         dealership = expected.dealership_name or "this dealership"
