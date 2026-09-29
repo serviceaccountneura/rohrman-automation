@@ -724,12 +724,13 @@ def _note_annotations(ocr: dict[str, Any]) -> list[str]:
 def gl_notes(ocr: dict[str, Any]) -> list[dict[str, Any]]:
     """Accounts and amounts read straight off the transcribed handwriting.
 
-    THE SIGN LIVES HERE AND NOWHERE ELSE. The vision prompt asks for a POSITIVE
-    figure in `gl_mappings` and leaves debit/credit to be decided downstream, so
-    a clerk who writes "GL# 6777 -$62.10" gets 62.10 back from the structured
-    output. The raw note is the only place that minus survives, and without it
-    a discount posts as a charge -- which is how a Honda parts invoice came out
-    $124.20 over, exactly twice the discount.
+    One of TWO places the sign is read. The vision prompt used to demand a
+    POSITIVE figure in `gl_mappings`, so a clerk who wrote "GL# 6777 -$62.10"
+    got 62.10 back from the structured output, and this note was the only place
+    the minus survived -- without it a discount posts as a charge, which is how
+    a Honda parts invoice came out $124.20 over, exactly twice the discount.
+    `gl_mappings` now carries the sign as written too; get_gl_amount_splits
+    takes a minus from either.
 
     Returns [{"account", "amount" (signed), "label", "signed"}] in the order the
     notes were read. `signed` records whether a minus was actually on the page,
@@ -788,16 +789,23 @@ def get_gl_amount_splits(ocr: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(mapping, dict):
             continue
         account = _first_gl(mapping.get("gl_account"))
-        amount = _parse_amount(mapping.get("amount"))
+        raw = mapping.get("amount")
+        amount = _parse_amount(raw)
         # An account with no amount is the older style and belongs to the
         # per-line path; taking it here would post a zero split.
         if not account or not amount:
             continue
 
-        # The transcription of this same figure, for its sign. gl_mappings
-        # reports a positive amount whatever the page says -- see gl_notes --
-        # so a discount written "-$62.10" arrives here as a charge unless the
-        # note is consulted.
+        # The sign as Gemini reported it. The prompt used to demand a positive
+        # figure here, which threw away a minus the model had read correctly
+        # and left the note transcription as the only place it could survive --
+        # and that free text came back jumbled often enough ("-#271 19 #6777")
+        # to post a discount as a charge. It now asks for the sign as written.
+        mapped_credit = _is_credit_value(str(raw or "").replace("$", "").strip())
+
+        # The transcription of this same figure, also for its sign. Either one
+        # showing a minus makes it a credit: an unsigned reading in one place is
+        # not evidence against a minus read in the other.
         twin = next(
             (
                 i
@@ -808,14 +816,12 @@ def get_gl_amount_splits(ocr: dict[str, Any]) -> list[dict[str, Any]]:
             ),
             None,
         )
+        note_credit = False
         if twin is not None:
             claimed.add(twin)
-            amount = notes[twin]["amount"]
-        elif amount < 0:
-            # A minus that came through the structured output anyway means the
-            # model saw one; the prompt asking for positives does not make it
-            # noise.
-            pass
+            note_credit = notes[twin]["amount"] < 0
+        if mapped_credit or note_credit:
+            amount = -abs(amount)
 
         splits.append(
             {

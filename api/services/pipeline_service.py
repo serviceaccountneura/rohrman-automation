@@ -1276,24 +1276,17 @@ def _run_purchase_order(
     sales_tax = ocr_helpers.get_sales_tax(ocr)
     line_items = ocr_helpers.get_raw_line_items(ocr)
 
-    # ── MISC: stop and let a person check it first ─────────────────────────
+    # ── MISC: posts straight away, like every other folder ────────────────
     #
-    # Before the missing-field check below, deliberately: a blank vendor or an
-    # unread total is exactly the kind of thing a person reviewing the draft
-    # can fix, and failing the document over it first would take that away.
+    # Misc used to stop at AWAITING_REVIEW until a person approved the draft
+    # (dc7b655). It no longer waits: an upload goes to Tekion on the lines
+    # read off the invoice, the same as the other folders.
+    #
+    # A document that was ALREADY held for review before this change can still
+    # be approved, and then posts what the person approved -- so nothing that
+    # was waiting is stranded.
     review: dict[str, Any] | None = None
-    if doc.po_type == FOLDER_MISC:
-        if not doc.review_approved:
-            draft = misc_review.load(doc.review_draft)
-            if draft:
-                # Kept across re-runs, so a person's corrections survive a
-                # failed attempt. Only the stale refusal is cleared.
-                draft["error"] = ""
-            else:
-                draft = _propose_misc_draft(doc, ocr, session, total, sales_tax, line_items)
-            job_queue.hold_for_review(session, doc, misc_review.dump(draft))
-            return
-
+    if doc.po_type == FOLDER_MISC and doc.review_approved:
         # Approved: post what the person approved, not what OCR first read.
         review = misc_review.load(doc.review_draft)
         approved_fields = review.get("fields") or {}

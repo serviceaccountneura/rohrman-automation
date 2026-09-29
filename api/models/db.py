@@ -58,22 +58,13 @@ class User(SQLModel, table=True):
     dealerships: str = Field(default="", max_length=4000)
     is_active: bool = Field(default=True)
     is_superuser: bool = Field(default=False)
+    # Tokens issued before this are refused. There is no server-side session
+    # to revoke -- a login is one signed token, good for 7 days -- so this is
+    # how a password reset still signs out every existing session. NULL means
+    # every unexpired token is good.
+    tokens_valid_after: datetime | None = Field(default=None)
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
-
-
-class RefreshToken(SQLModel, table=True):
-    __tablename__ = "refresh_tokens"
-
-    id: UUID = Field(default_factory=uuid4, primary_key=True)
-    user_id: UUID = Field(foreign_key="users.id", index=True)
-    # The jti (JWT ID) of the refresh token — used to look up + revoke.
-    jti: str = Field(index=True, unique=True, max_length=64)
-    # SHA-256 of the token so we never store the raw refresh token.
-    token_hash: str = Field(index=True, max_length=128)
-    expires_at: datetime
-    revoked: bool = Field(default=False)
-    created_at: datetime = Field(default_factory=_utcnow)
 
 
 class VendorMapping(SQLModel, table=True):

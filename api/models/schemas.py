@@ -364,13 +364,8 @@ class UpdateUserStatusRequest(BaseModel):
 
 class Token(BaseModel):
     access_token: str
-    refresh_token: str
     token_type: str = "bearer"
-    expires_in: int  # seconds until access token expires
-
-
-class RefreshRequest(BaseModel):
-    refresh_token: str
+    expires_in: int  # seconds until the token expires; then sign in again
 
 
 class MessageResponse(BaseModel):
