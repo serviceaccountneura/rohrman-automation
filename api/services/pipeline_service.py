@@ -130,6 +130,12 @@ EX_TEKION_ERROR = "TEKION_ERROR"
 # Tekion answered, and the answer was no. Distinct from TEKION_ERROR because a
 # rejection is final — retrying re-runs OCR and asks the same question again.
 EX_TEKION_REJECTED = "TEKION_REJECTED"
+# The entry needs a GL account the dealership's chart does not have -- usually
+# one written on the invoice (2420 on a Kia memo whose parts account is 2410).
+EX_GL_NOT_IN_CHART = "GL_ACCOUNT_NOT_FOUND"
+# The invoice's printed total is zero, e.g. a core credit memo for .00CR.
+# Nothing to post, which is different from a total that could not be read.
+EX_ZERO_TOTAL = "ZERO_TOTAL"
 
 _SEVERITY = {
     EX_OCR_FAILED: "HIGH",
@@ -145,6 +151,8 @@ _SEVERITY = {
     EX_TEKION_ERROR: "HIGH",
     EX_TEKION_REJECTED: "HIGH",
     EX_SPLIT_FAILED: "HIGH",
+    EX_GL_NOT_IN_CHART: "HIGH",
+    EX_ZERO_TOTAL: "LOW",
 }
 
 # Only OCR is retried, and only because it is free of side effects: reading a
@@ -687,6 +695,16 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         )
         if not value
     ]
+    # A total that was READ as zero is not a missing total: a core credit memo
+    # can genuinely be .00CR. Say so, instead of "missing: invoice_amount".
+    if missing == ["invoice_amount"] and ocr_helpers.has_printed_zero_total(ocr):
+        _fail(
+            session,
+            doc,
+            EX_ZERO_TOTAL,
+            error="Invoice total is $0.00, so there is nothing to post to Tekion.",
+        )
+        return
     if missing:
         _fail(session, doc, EX_MISSING_FIELD, error=f"missing: {', '.join(missing)}")
         return
@@ -741,6 +759,17 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
             doc,
             EX_NO_LINE_ITEMS if result.no_line_items else EX_LINE_ITEMS_MISMATCH,
             error="; ".join(result.notes) or "invoice parts do not match the total",
+        )
+        return
+    # Also before `balanced`, for the same reason: nothing was built, so the
+    # balance is a meaningless $0.00. Name the account instead.
+    if result.accounts_not_in_chart or len(result.resolved_accounts or {}) < 2:
+        _fail(
+            session,
+            doc,
+            EX_GL_NOT_IN_CHART,
+            error=(result.notes[-1] if result.notes else "")
+            or "a GL account is not in this dealership's chart",
         )
         return
     if not result.balanced:

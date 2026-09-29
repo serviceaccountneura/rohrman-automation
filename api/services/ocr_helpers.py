@@ -560,6 +560,28 @@ def get_total_amount(ocr: dict[str, Any]) -> float:
     return _parse_amount(_grand_total_raw(ocr))
 
 
+def has_printed_zero_total(ocr: dict[str, Any]) -> bool:
+    """Whether the invoice's total was READ, and reads zero.
+
+    get_total_amount returns 0.0 both for a total that says .00 and for one
+    that was never found, and the two need different answers: a Kia core
+    credit memo printed ".00CR" has nothing to post, while an unread total
+    needs a clearer scan. Only true when a total figure is actually present.
+    """
+    # _grand_total_raw skips zero values and falls back to a bare 0 when it
+    # finds nothing, so it cannot answer this: look for the total line itself.
+    if get_total_amount(ocr):
+        return False
+    for entry in ocr.get("totals") or []:
+        label = (entry.get("label") or "").strip().lower()
+        if "total" not in label or any(bad in label for bad in _NOT_A_GRAND_TOTAL):
+            continue
+        value = str(entry.get("value") or "").strip()
+        if re.search(r"\d", value) and _parse_amount(value) == 0.0:
+            return True
+    return False
+
+
 def is_credit_invoice(ocr: dict[str, Any]) -> bool:
     """Whether the invoice is a CREDIT -- money owed to the dealership.
 
