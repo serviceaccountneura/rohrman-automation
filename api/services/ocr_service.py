@@ -36,10 +36,14 @@ VISION_MODEL = "gemini-3.6-flash"
 VISION_LOCATION = "global"
 
 
-def extract_document(file_path: str | Path) -> dict[str, Any]:
+def extract_document(file_path: str | Path, straighten: bool = True) -> dict[str, Any]:
     """Run vision-first extraction on a PDF/image file.
 
     Returns the structured JSON dict (same shape as vision_extract.py produces).
+
+    `straighten=False` skips the orientation check, for a file the pipeline
+    has already turned upright (see page_orientation.upright_file) -- checking
+    it again would cost about two seconds a page to learn nothing.
     """
     path = Path(file_path)
     if not path.exists():
@@ -49,7 +53,7 @@ def extract_document(file_path: str | Path) -> dict[str, Any]:
     # Upright before reading: a sideways scan is where small print -- the
     # invoice number, above all -- gets misread. See page_orientation.
     images = [
-        page_orientation.upright(img, f"{path.name} page {i}")
+        page_orientation.upright(img, f"{path.name} page {i}") if straighten else img
         for i, img in enumerate(load_pages(path), start=1)
     ]
     parts = [pil_to_part(img) for img in images]

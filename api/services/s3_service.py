@@ -189,6 +189,32 @@ def upload_file(local_path: str | Path, s3_key: str) -> None:
     )
 
 
+def upright_key(s3_key: str) -> str:
+    """Where the upright copy of a scan is kept: beside the original, ".upright" before the extension.
+
+    The original is never replaced -- it is the record of what was received.
+    """
+    path = Path(s3_key)
+    return str(path.with_name(f"{path.stem}.upright{path.suffix}"))
+
+
+def exists(s3_key: str) -> bool:
+    """Whether an object is stored under this key. False on any error."""
+    if not s3_key or not is_configured():
+        return False
+    try:
+        _get_s3_client().head_object(Bucket=settings.s3_bucket, Key=s3_key)
+        return True
+    except Exception:  # noqa: BLE001 - absent, forbidden or unreachable: not usable
+        return False
+
+
+def viewable_key(s3_key: str) -> str:
+    """The key to show someone: the upright copy when there is one, else the original."""
+    upright = upright_key(s3_key)
+    return upright if exists(upright) else s3_key
+
+
 def download_file(s3_key: str, local_path: str | Path) -> None:
     """Fetch an archived file back to disk.
 

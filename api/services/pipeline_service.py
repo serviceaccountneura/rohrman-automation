@@ -48,6 +48,7 @@ from api.services import (
     job_queue,
     misc_review,
     ocr_helpers,
+    page_orientation,
     po_reuse,
     s3_service,
 )
@@ -189,10 +190,13 @@ def _cleanup(doc: Document) -> None:
         return
     if not doc.source_path:
         return
-    try:
-        Path(doc.source_path).unlink(missing_ok=True)
-    except OSError:
-        pass
+    original = Path(doc.source_path)
+    # The upright copy _upright_source may have written beside it goes too.
+    for path in (original, original.with_name(f"{original.stem}.upright{original.suffix}")):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 # ── Entry point (called by the workers) ───────────────────────────────────────
@@ -241,6 +245,54 @@ def _resolve_source(doc: Document) -> str | None:
             print(f"[PIPE] {doc.id} could not restore from S3: {e}")
     return None
 
+
+
+def _upright_source(doc: Document, source: str | None, reading: bool) -> tuple[str | None, bool]:
+    """The file to work from, turned upright; and whether orientation is settled.
+
+    A fresh read checks every page (page_orientation.upright_file). When any
+    page was turned, the upright copy is stored beside the original in S3 --
+    the original stays as the record of what was received -- and the preview
+    serves it (see s3_service.viewable_key).
+
+    A re-run reads nothing, but its file may still be attached in Tekion, so
+    it uses the upright copy stored on the first run. A split-out invoice was
+    cut from an upright file already.
+
+    Returns (path, settled). `settled` False means orientation is unknown and
+    the reader should check each page itself.
+    """
+    if not source:
+        return source, False
+    if doc.split_from:
+        return source, True
+
+    upright_s3 = s3_service.upright_key(doc.s3_key) if doc.s3_key else ""
+
+    if not reading:
+        if upright_s3 and s3_service.exists(upright_s3):
+            local = str(Path(source).with_name(f"{Path(source).stem}.upright{Path(source).suffix}"))
+            try:
+                s3_service.download_file(upright_s3, local)
+                return local, True
+            except Exception as e:  # noqa: BLE001
+                print(f"[PIPE] {doc.id} could not fetch the upright copy ({e}); using the original")
+        return source, False
+
+    try:
+        path = page_orientation.upright_file(source)
+    except Exception as e:  # noqa: BLE001 - never block a document over this
+        print(f"[PIPE] {doc.id} could not check orientation ({e}); using the original")
+        return source, False
+    if path is None:
+        return source, True
+    if upright_s3:
+        try:
+            s3_service.upload_file(path, upright_s3)
+            print(f"[PIPE] {doc.id} stored upright copy at {upright_s3}")
+        except Exception as e:  # noqa: BLE001 - only the preview loses out
+            print(f"[PIPE] {doc.id} could not store the upright copy: {e}")
+    return path, True
 
 
 def _utcnow() -> datetime:
@@ -478,6 +530,12 @@ def _run(doc: Document, session: Session) -> None:
         _fail(session, doc, EX_FILE_MISSING, error=f"no readable source for {doc.file_name!r}")
         return
 
+    # ── 1a. Turn it upright ──────────────────────────────────────────────────
+    # Before splitting and before reading, so a sideways scan is upright for
+    # every step after this one: the batch split, Gemini, the preview and the
+    # copy attached in Tekion.
+    source, straightened = _upright_source(doc, source, reading=cached is None)
+
     # ── 1b. Split a batch scan before OCR ────────────────────────────────────
     # OCR describes one document, so several invoices in one file have to become
     # several documents first. Children are never re-segmented.
@@ -491,7 +549,7 @@ def _run(doc: Document, session: Session) -> None:
     else:
         print(f"[PIPE] {doc.id} OCR starting ({doc.po_type} folder)")
         try:
-            ocr = extract_document(source)
+            ocr = extract_document(source, straighten=not straightened)
         except Exception as e:  # noqa: BLE001
             print(f"[PIPE] OCR failed: {e}")
             _fail(session, doc, EX_OCR_FAILED, error=str(e))
@@ -1010,7 +1068,9 @@ def _run_stock_pre_invoice(
             session,
             doc,
             EX_AMOUNT_MISMATCH,
-            error="; ".join(str(d) for d in result.discrepancies),
+            # The plain-language notes when there are any; the raw comparison
+            # ("gl_lines: invoice says ..., PO says ...") only as a fallback.
+            error="; ".join(result.notes) or "; ".join(str(d) for d in result.discrepancies),
         )
         return
     if not result.posted:
@@ -1412,6 +1472,30 @@ def _run_purchase_order(
                     )
                 if problem:
                     _fail(session, doc, EX_TEKION_REJECTED, error=problem)
+                    return
+
+                # These lines come from the rows AS READ, not the reconciled
+                # ones, so nothing has yet made them add up. The purchase order
+                # is created first and the pre-invoice for the invoice total
+                # after it -- Tekion refuses a pre-invoice worth a different
+                # amount than its PO, leaving the PO behind as an orphan. Check
+                # before either is sent.
+                lines_total = round(
+                    sum((it.labor_amount or 0.0) + (it.parts_amount or 0.0) for it in items), 2
+                )
+                if round(abs(lines_total - expected_po_total), 2) > 0.01:
+                    _fail(
+                        session,
+                        doc,
+                        EX_AMOUNT_MISMATCH,
+                        error=(
+                            f"The repair order lines on this invoice add up to "
+                            f"${lines_total:,.2f}, but the invoice is "
+                            f"${expected_po_total:,.2f} before tax. Nothing was sent to "
+                            "Tekion — check the amounts read from each row, correct "
+                            "them, and run it again."
+                        ),
+                    )
                     return
 
                 req = CreateSubletPoRequest(**common, line_items=items)

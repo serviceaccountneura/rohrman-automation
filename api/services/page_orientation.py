@@ -15,6 +15,7 @@ missed rotation costs what it always cost; a wrong one would cost more.
 """
 from __future__ import annotations
 
+import io
 import re
 import shutil
 import subprocess
@@ -62,28 +63,74 @@ def detect_rotation(image: Image.Image) -> tuple[int, float] | None:
     return int(rotate.group(1)) % 360, float(confidence.group(1))
 
 
-def upright(image: Image.Image, label: str = "") -> Image.Image:
-    """The page turned so its text reads normally; unchanged if in doubt."""
+def rotation_needed(image: Image.Image, label: str = "") -> int:
+    """Degrees to turn this page clockwise so it reads upright; 0 if in doubt."""
     found = detect_rotation(image)
     if found is None:
-        return image
+        return 0
     degrees, confidence = found
     if degrees == 0:
-        return image
+        return 0
     if confidence < MIN_CONFIDENCE:
         print(f"[OCR] {label} looks turned {degrees} degrees but confidence "
               f"{confidence:.2f} is low; left as scanned")
-        return image
-    # PIL rotates counter-clockwise; Tesseract's "Rotate" is clockwise.
-    turned = image.rotate(-degrees, expand=True)
-
+        return 0
     # Confirm before trusting it: the turned page must now read as upright.
     # A wrong call does not survive this -- turning an upright page over gives
     # a page Tesseract then says is upside down.
-    check = detect_rotation(turned)
+    # PIL rotates counter-clockwise; Tesseract's "Rotate" is clockwise.
+    check = detect_rotation(image.rotate(-degrees, expand=True))
     if check is None or check[0] != 0:
         print(f"[OCR] {label} looked turned {degrees} degrees (confidence "
               f"{confidence:.2f}) but did not read upright after turning; left as scanned")
-        return image
+        return 0
     print(f"[OCR] {label} turned {degrees} degrees upright (confidence {confidence:.2f})")
-    return turned
+    return degrees
+
+
+def upright(image: Image.Image, label: str = "") -> Image.Image:
+    """The page turned so its text reads normally; unchanged if in doubt."""
+    degrees = rotation_needed(image, label)
+    return image.rotate(-degrees, expand=True) if degrees else image
+
+
+def upright_file(path: str | Path) -> str | None:
+    """Write an upright copy of a scan next to it; its path, or None if none needed.
+
+    Done on the FILE, before a batch is split or anything is read, so every
+    later step -- splitting, reading, the preview, the copy attached in
+    Tekion -- sees the page the right way up.
+
+    A PDF page is turned by setting its /Rotate, which is lossless and
+    instant: the scan itself is not re-rendered. An image is rotated and saved
+    in its own format. Raises on failure, so the caller can tell "nothing
+    needed turning" from "could not check" and fall back to the original.
+    """
+    path = Path(path)
+    target = path.with_name(f"{path.stem}.upright{path.suffix}")
+    if path.suffix.lower() == ".pdf":
+        import fitz  # PyMuPDF, already a dependency of the page loader
+
+        doc = fitz.open(str(path))
+        turned = 0
+        for number, page in enumerate(doc, start=1):
+            scale = _CHECK_LONG_SIDE / max(page.rect.width, page.rect.height)
+            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), colorspace=fitz.csGRAY)
+            image = Image.open(io.BytesIO(pix.tobytes("png")))
+            degrees = rotation_needed(image, f"{path.name} page {number}")
+            if degrees:
+                page.set_rotation((page.rotation + degrees) % 360)
+                turned += 1
+        if not turned:
+            doc.close()
+            return None
+        doc.save(str(target))
+        doc.close()
+        return str(target)
+
+    image = Image.open(path)
+    degrees = rotation_needed(image.convert("RGB"), path.name)
+    if not degrees:
+        return None
+    image.rotate(-degrees, expand=True).save(target)
+    return str(target)
