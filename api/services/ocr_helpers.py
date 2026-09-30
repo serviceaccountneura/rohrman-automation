@@ -507,6 +507,10 @@ _NOT_A_GRAND_TOTAL = (
 _GRAND_TOTAL_LABELS = (
     "grand total", "total amount due", "amount due", "balance due",
     "invoice total", "total due", "total amount", "net due", "please pay",
+    # Honda on Grand prints its total as "PAY THIS AMOUNT". Missing from this
+    # list, the total fell through to a guess that picked the -16.00 core
+    # return, and a $112.64 invoice was sent to Tekion as a $16 credit.
+    "pay this amount", "amount to pay", "total to pay",
 )
 
 
@@ -550,9 +554,45 @@ def _grand_total_raw(ocr: dict[str, Any]) -> Any:
     if found is not None:
         return found
 
+    # 4. No total line at all: add up what the invoice prints instead --
+    #    subtotal plus tax and freight -- before trusting a guess made
+    #    elsewhere. That guess (the _po_contract total) is built from the rows,
+    #    and on a parts invoice with a core return it took the core line.
+    rebuilt = _total_from_parts(totals)
+    if rebuilt is not None:
+        return rebuilt
+
     po_contract = ocr.get("_po_contract") or {}
     summary = ocr.get("summary") or {}
     return ocr.get("total") or po_contract.get("total") or summary.get("total") or 0
+
+
+def _total_from_parts(totals: list[dict[str, Any]]) -> float | None:
+    """Subtotal + tax + freight/shipping/handling, when a subtotal is printed.
+
+    Signed, so a subtotal printed "CR" gives a negative total and the invoice
+    still reads as a credit. None when there is no subtotal to start from.
+    """
+    def signed(value: Any) -> float:
+        amount = _parse_amount(value)
+        return -amount if _is_credit_value(value) else amount
+
+    subtotal = None
+    extras = 0.0
+    for entry in totals:
+        label = (entry.get("label") or "").strip().lower()
+        value = entry.get("value")
+        if not label or not re.search(r"\d", str(value or "")):
+            continue
+        if subtotal is None and ("subtotal" in label or "sub total" in label or "sub-total" in label):
+            subtotal = signed(value)
+        elif "tax" in label and "exempt" not in label:
+            extras += signed(value)
+        elif any(word in label for word in ("freight", "shipping", "handling", "delivery")):
+            extras += signed(value)
+    if subtotal is None:
+        return None
+    return round(subtotal + extras, 2)
 
 
 def get_total_amount(ocr: dict[str, Any]) -> float:

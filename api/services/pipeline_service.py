@@ -1538,6 +1538,35 @@ def _run_purchase_order(
                     )
                     for sp in ocr_helpers.get_gl_amount_splits(ocr)
                 ]
+
+            # The GL lines must add up to the invoice before anything is sent.
+            # Misc used to have a person approve every draft, and that was the
+            # only check; with the review gone (781c61f) a $112.64 invoice read
+            # as a $16 credit went to Tekion with a 2410 line of 112.64 against
+            # A/P of 16.00. Either total is accepted -- clerks split the whole
+            # invoice, or only the goods when tax is posted on its own.
+            if splits:
+                split_total = round(sum(float(sp.amount) for sp in splits), 2)
+                if all(
+                    abs(split_total - target) > 0.01
+                    for target in (round(total, 2), round(expected_po_total, 2))
+                ):
+                    before_tax = (
+                        f" (${expected_po_total:,.2f} before tax)" if sales_tax else ""
+                    )
+                    _fail(
+                        session,
+                        doc,
+                        EX_AMOUNT_MISMATCH,
+                        error=(
+                            f"The GL lines on this invoice add up to ${split_total:,.2f}, "
+                            f"but the invoice total read is ${total:,.2f}{before_tax}. "
+                            "Nothing was sent to Tekion. Check the total and the GL "
+                            "lines, correct them, and run it again."
+                        ),
+                    )
+                    return
+
             req = CreateMiscPoRequest(
                 **common,
                 line_items=misc_items,
