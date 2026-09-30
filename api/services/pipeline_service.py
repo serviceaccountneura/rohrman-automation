@@ -1492,6 +1492,20 @@ def _run_purchase_order(
                 response = _create_stock_po(req, session)
 
         else:  # MISCELLANEOUS
+            # A credit row -- a core return read as qty -1 or price -16.00 --
+            # cannot be a purchase order line: Tekion refuses the whole order
+            # ("items[0].qty must be greater than or equal to 0"). The rows
+            # still add up, so itemising looked safe; post the single line for
+            # the total instead, as Misc already does when rows don't add up.
+            if any(
+                (item.get("qty") or 0) < 0 or (item.get("unitPrice") or 0) < 0
+                for item in line_items
+            ):
+                print(
+                    f"[PIPE] {doc.id} a line is a credit (core return or similar) — "
+                    f"using a single line for {expected_po_total}"
+                )
+                line_items = []
             misc_items = [
                 MiscLineItem(
                     part_name=item["description"] or "Misc purchase",
