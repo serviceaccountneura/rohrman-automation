@@ -1547,8 +1547,10 @@ def _run_purchase_order(
             # invoice, or only the goods when tax is posted on its own.
             if splits:
                 split_total = round(sum(float(sp.amount) for sp in splits), 2)
+                # Rounded before comparing: 112.64 - 112.63 is 0.0100000000005
+                # in floating point, which would refuse a one-cent difference.
                 if all(
-                    abs(split_total - target) > 0.01
+                    round(abs(split_total - target), 2) > 0.01
                     for target in (round(total, 2), round(expected_po_total, 2))
                 ):
                     before_tax = (
