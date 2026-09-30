@@ -25,6 +25,7 @@ if not os.environ.get("VERTEX_CREDENTIALS"):
 
 from google.genai import types  # noqa: E402
 
+from api.services import page_orientation  # noqa: E402
 from api.services.ocr_helpers import to_flat_fields  # noqa: E402
 from normalize import to_po_contract  # noqa: E402
 from pipeline import get_client, load_pages, pil_to_part  # noqa: E402
@@ -45,7 +46,12 @@ def extract_document(file_path: str | Path) -> dict[str, Any]:
         raise FileNotFoundError(f"File not found: {path}")
 
     client = get_client(location=VISION_LOCATION)
-    images = load_pages(path)
+    # Upright before reading: a sideways scan is where small print -- the
+    # invoice number, above all -- gets misread. See page_orientation.
+    images = [
+        page_orientation.upright(img, f"{path.name} page {i}")
+        for i, img in enumerate(load_pages(path), start=1)
+    ]
     parts = [pil_to_part(img) for img in images]
     parts.append(types.Part.from_text(text=VISION_PROMPT))
 
