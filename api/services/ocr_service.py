@@ -25,7 +25,8 @@ if not os.environ.get("VERTEX_CREDENTIALS"):
 
 from google.genai import types  # noqa: E402
 
-from api.services import page_orientation  # noqa: E402
+from api.config import settings  # noqa: E402
+from api.services import page_enhance, page_orientation  # noqa: E402
 from api.services.ocr_helpers import to_flat_fields  # noqa: E402
 from normalize import to_po_contract  # noqa: E402
 from pipeline import get_client, load_pages, pil_to_part  # noqa: E402
@@ -34,6 +35,22 @@ from vision_extract import VISION_PROMPT, build_response_schema, validate  # noq
 VISION_MODEL = "gemini-3.6-flash"
 # Gemini 3 models are only served from the global endpoint, not us-central1.
 VISION_LOCATION = "global"
+
+
+def _load_for_reading(path: Path) -> list:
+    """The pages as images: PDFs at the enhancement step's 350 DPI when it is on."""
+    if settings.ocr_enhance and path.suffix.lower() == ".pdf":
+        import fitz
+        from PIL import Image
+
+        scale = page_enhance.DPI / 72.0
+        pages = []
+        with fitz.open(str(path)) as doc:
+            for page in doc:
+                pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+                pages.append(Image.frombytes("RGB", (pix.width, pix.height), pix.samples))
+        return pages
+    return load_pages(path)
 
 
 def extract_document(file_path: str | Path, straighten: bool = True) -> dict[str, Any]:
@@ -54,8 +71,11 @@ def extract_document(file_path: str | Path, straighten: bool = True) -> dict[str
     # invoice number, above all -- gets misread. See page_orientation.
     images = [
         page_orientation.upright(img, f"{path.name} page {i}") if straighten else img
-        for i, img in enumerate(load_pages(path), start=1)
+        for i, img in enumerate(_load_for_reading(path), start=1)
     ]
+    # Then cleaned up for reading -- the copy Gemini sees, nothing else.
+    if settings.ocr_enhance:
+        images = page_enhance.enhance_pages(images)
     parts = [pil_to_part(img) for img in images]
     parts.append(types.Part.from_text(text=VISION_PROMPT))
 

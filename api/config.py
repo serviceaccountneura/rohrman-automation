@@ -54,6 +54,11 @@ class Settings(BaseSettings):
     # which is the case on real S3 and therefore in production.
     s3_public_endpoint_url: str = ""
 
+    # Clean up each page (crop, enlarge, flatten the background, boost local
+    # contrast) before Gemini reads it -- see api/services/page_enhance.py.
+    # False sends the page as scanned, as before.
+    ocr_enhance: bool = True
+
     # ── Frontend ──────────────────────────────────────────────────────────────
     frontend_url: str = "http://localhost:3000"
 
