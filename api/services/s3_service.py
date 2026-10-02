@@ -209,10 +209,19 @@ def exists(s3_key: str) -> bool:
         return False
 
 
+def enhanced_key(s3_key: str, multi_page: bool) -> str:
+    """Where the cleaned-up copy Gemini read is kept: ".enhanced.png" for one page, ".pdf" for several."""
+    path = Path(s3_key)
+    return str(path.with_name(f"{path.stem}.enhanced.{'pdf' if multi_page else 'png'}"))
+
+
 def viewable_key(s3_key: str) -> str:
-    """The key to show someone: the upright copy when there is one, else the original."""
-    upright = upright_key(s3_key)
-    return upright if exists(upright) else s3_key
+    """The key to show someone, best first: the cleaned-up copy Gemini read,
+    then the upright copy, then the original as uploaded."""
+    for candidate in (enhanced_key(s3_key, False), enhanced_key(s3_key, True), upright_key(s3_key)):
+        if exists(candidate):
+            return candidate
+    return s3_key
 
 
 def download_file(s3_key: str, local_path: str | Path) -> None:

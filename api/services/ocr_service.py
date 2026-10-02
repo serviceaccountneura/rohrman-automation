@@ -53,7 +53,11 @@ def _load_for_reading(path: Path) -> list:
     return load_pages(path)
 
 
-def extract_document(file_path: str | Path, straighten: bool = True) -> dict[str, Any]:
+def extract_document(
+    file_path: str | Path,
+    straighten: bool = True,
+    pages_out: list | None = None,
+) -> dict[str, Any]:
     """Run vision-first extraction on a PDF/image file.
 
     Returns the structured JSON dict (same shape as vision_extract.py produces).
@@ -61,6 +65,9 @@ def extract_document(file_path: str | Path, straighten: bool = True) -> dict[str
     `straighten=False` skips the orientation check, for a file the pipeline
     has already turned upright (see page_orientation.upright_file) -- checking
     it again would cost about two seconds a page to learn nothing.
+
+    `pages_out`, when given, receives the cleaned-up pages exactly as Gemini
+    saw them, so the pipeline can store them for the preview.
     """
     path = Path(file_path)
     if not path.exists():
@@ -76,6 +83,8 @@ def extract_document(file_path: str | Path, straighten: bool = True) -> dict[str
     # Then cleaned up for reading -- the copy Gemini sees, nothing else.
     if settings.ocr_enhance:
         images = page_enhance.enhance_pages(images)
+        if pages_out is not None:
+            pages_out.extend(images)
     parts = [pil_to_part(img) for img in images]
     parts.append(types.Part.from_text(text=VISION_PROMPT))
 

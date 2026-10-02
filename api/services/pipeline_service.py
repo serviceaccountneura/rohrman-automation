@@ -191,8 +191,13 @@ def _cleanup(doc: Document) -> None:
     if not doc.source_path:
         return
     original = Path(doc.source_path)
-    # The upright copy _upright_source may have written beside it goes too.
-    for path in (original, original.with_name(f"{original.stem}.upright{original.suffix}")):
+    # The upright and cleaned-up copies written beside it go too.
+    for path in (
+        original,
+        original.with_name(f"{original.stem}.upright{original.suffix}"),
+        original.with_name(f"{original.stem}.enhanced.png"),
+        original.with_name(f"{original.stem}.enhanced.pdf"),
+    ):
         try:
             path.unlink(missing_ok=True)
         except OSError:
@@ -255,29 +260,17 @@ def _upright_source(doc: Document, source: str | None, reading: bool) -> tuple[s
     the original stays as the record of what was received -- and the preview
     serves it (see s3_service.viewable_key).
 
-    A re-run reads nothing, but its file may still be attached in Tekion, so
-    it uses the upright copy stored on the first run. A split-out invoice was
-    cut from an upright file already.
+    A re-run reads nothing, so it needs nothing turned. Tekion is always sent
+    the ORIGINAL file, never this one -- see _run. A split-out invoice is cut
+    from the original upload and is turned upright here like any other.
 
     Returns (path, settled). `settled` False means orientation is unknown and
     the reader should check each page itself.
     """
-    if not source:
+    if not source or not reading:
         return source, False
-    if doc.split_from:
-        return source, True
 
     upright_s3 = s3_service.upright_key(doc.s3_key) if doc.s3_key else ""
-
-    if not reading:
-        if upright_s3 and s3_service.exists(upright_s3):
-            local = str(Path(source).with_name(f"{Path(source).stem}.upright{Path(source).suffix}"))
-            try:
-                s3_service.download_file(upright_s3, local)
-                return local, True
-            except Exception as e:  # noqa: BLE001
-                print(f"[PIPE] {doc.id} could not fetch the upright copy ({e}); using the original")
-        return source, False
 
     try:
         path = page_orientation.upright_file(source)
@@ -295,11 +288,49 @@ def _upright_source(doc: Document, source: str | None, reading: bool) -> tuple[s
     return path, True
 
 
+def _store_enhanced_copy(doc: Document, source: str, pages: list) -> None:
+    """Store what Gemini read -- the cleaned-up grayscale pages -- for the preview.
+
+    One page is kept as a PNG, shown pixel for pixel; several as a PDF. Beside
+    the original in S3 as <name>.enhanced.png / .pdf. Only the preview uses it:
+    the original stays the record, and it is the original that goes to Tekion.
+    Best-effort -- a failure costs the preview, nothing else.
+    """
+    if not pages or not doc.s3_key or not s3_service.is_configured():
+        return
+    try:
+        multi = len(pages) > 1
+        local = Path(source).with_name(f"{Path(source).stem}.enhanced.{'pdf' if multi else 'png'}")
+        if multi:
+            import io
+
+            import fitz
+
+            out = fitz.open()
+            for page in pages:
+                buf = io.BytesIO()
+                page.save(buf, format="PNG")
+                pdf_page = out.new_page(width=float(page.width), height=float(page.height))
+                pdf_page.insert_image(pdf_page.rect, stream=buf.getvalue())
+            out.save(str(local), garbage=4, deflate=True)
+            out.close()
+        else:
+            pages[0].save(local, format="PNG")
+        key = s3_service.enhanced_key(doc.s3_key, multi)
+        s3_service.upload_file(local, key)
+        local.unlink(missing_ok=True)
+        print(f"[PIPE] {doc.id} stored cleaned-up copy at {key}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[PIPE] {doc.id} could not store the cleaned-up copy: {e}")
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _split_batch(doc: Document, source: str, session: Session) -> bool:
+def _split_batch(
+    doc: Document, source: str, session: Session, original: str | None = None
+) -> bool:
     """Break a batch scan into one child document per invoice.
 
     Returns True when the document was split and this run is finished — the
@@ -343,7 +374,10 @@ def _split_batch(doc: Document, source: str, session: Session) -> bool:
         print(f"[SPLIT]   {seg}")
 
     try:
-        written = document_splitter.split_pdf(source, segments)
+        # Read from the upright file, cut from the original: the pages are in
+        # the same order, and each invoice keeps the file as it was received.
+        # Each one is turned upright on its own run, like any other upload.
+        written = document_splitter.split_pdf(original or source, segments)
     except Exception as e:  # noqa: BLE001
         print(f"[SPLIT] {doc.id} could not be split ({e}); processing as one document")
         return False
@@ -532,14 +566,17 @@ def _run(doc: Document, session: Session) -> None:
 
     # ── 1a. Turn it upright ──────────────────────────────────────────────────
     # Before splitting and before reading, so a sideways scan is upright for
-    # every step after this one: the batch split, Gemini, the preview and the
-    # copy attached in Tekion.
+    # the batch split, Gemini and the preview.
+    # The file as uploaded. Tekion is sent this one -- not turned, not cleaned
+    # up -- and a batch is cut from it, so each invoice it splits into is the
+    # original too.
+    original = source
     source, straightened = _upright_source(doc, source, reading=cached is None)
 
     # ── 1b. Split a batch scan before OCR ────────────────────────────────────
     # OCR describes one document, so several invoices in one file have to become
     # several documents first. Children are never re-segmented.
-    if cached is None and not doc.split_from and _split_batch(doc, source, session):
+    if cached is None and not doc.split_from and _split_batch(doc, source, session, original):
         return
 
     # ── 2. OCR ───────────────────────────────────────────────────────────────
@@ -548,12 +585,14 @@ def _run(doc: Document, session: Session) -> None:
         ocr = cached
     else:
         print(f"[PIPE] {doc.id} OCR starting ({doc.po_type} folder)")
+        enhanced_pages: list = []
         try:
-            ocr = extract_document(source, straighten=not straightened)
+            ocr = extract_document(source, straighten=not straightened, pages_out=enhanced_pages)
         except Exception as e:  # noqa: BLE001
             print(f"[PIPE] OCR failed: {e}")
             _fail(session, doc, EX_OCR_FAILED, error=str(e))
             return
+        _store_enhanced_copy(doc, source, enhanced_pages)
         _cache_ocr(doc, ocr)
 
     # ── 3. Record what OCR found ─────────────────────────────────────────────
@@ -614,11 +653,11 @@ def _run(doc: Document, session: Session) -> None:
     elif doc.po_type == FOLDER_STOCK:
         # A vendor stock order is not created here — the PO already exists and
         # the invoice arrives afterwards to be attached to it.
-        _run_stock_pre_invoice(doc, ocr, session, source)
+        _run_stock_pre_invoice(doc, ocr, session, original)
     else:
         # `source` is handed on so the PO flow can attach the invoice PDF to the
         # pre-invoice — we already have the file, so there is no reason not to.
-        _run_purchase_order(doc, ocr, session, source)
+        _run_purchase_order(doc, ocr, session, original)
 
 
 # ── OEM -> Journal entry ──────────────────────────────────────────────────────
