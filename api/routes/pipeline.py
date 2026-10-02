@@ -27,6 +27,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlmodel import Session, select
 
+from api.config import settings
 from api.db import get_session
 from api.deps import CurrentUserDep
 from api.models.db import Document, User
@@ -50,6 +51,19 @@ ALLOWED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", 
 def list_folders() -> dict[str, list[str]]:
     """The valid upload folders, for the frontend to render."""
     return {"folders": sorted(VALID_FOLDERS)}
+
+
+@router.get("/tekion-writes")
+def tekion_writes() -> dict[str, object]:
+    """Whether Misc, Sublet and Vendor Stock create anything in Tekion.
+
+    TEKION_PO_WRITES in the env file; the frontend shows a test-mode banner on
+    those folders while it is off. OEM and Vehicle always save drafts.
+    """
+    return {
+        "poWrites": settings.tekion_po_writes,
+        "folders": ["SUBLET", "MISCELLANEOUS", "STOCK"],
+    }
 
 
 @router.get("/queue")
