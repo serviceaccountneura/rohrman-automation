@@ -41,6 +41,7 @@ from uuid import UUID
 
 from sqlmodel import Session
 
+from api.config import settings
 from api.db import engine
 from api.models.db import Document
 from api.services import (
@@ -1087,7 +1088,9 @@ def _run_stock_pre_invoice(
     try:
         with tekion_scope():
             client = get_client(session)
-            result = pre_invoice_stock_order(client, expected, dry_run=False)
+            # TEKION_PO_WRITES off: the built-in dry run reads the PO and checks
+            # the amounts, then stops before attaching or posting anything.
+            result = pre_invoice_stock_order(client, expected, dry_run=not settings.tekion_po_writes)
     except Exception as e:  # noqa: BLE001
         print(f"[PIPE] {doc.id} stock pre-invoice failed: {e}")
         reset_client()
@@ -1112,7 +1115,10 @@ def _run_stock_pre_invoice(
             error="; ".join(result.notes) or "; ".join(str(d) for d in result.discrepancies),
         )
         return
-    if not result.posted:
+    # A dry run (TEKION_PO_WRITES off) that matched the PO is a success here:
+    # everything up to the pre-invoice ran, and only the posting was skipped.
+    dry_run_ok = not settings.tekion_po_writes and result.matched
+    if not result.posted and not dry_run_ok:
         _fail(session, doc, EX_TEKION_ERROR, error="; ".join(result.notes) or "not posted")
         return
 
@@ -1144,7 +1150,10 @@ def _run_stock_pre_invoice(
     )
 
     job_queue.complete(session, doc)
-    print(f"[PIPE] {doc.id} -> PROCESSED (pre-invoiced PO {doc.po_number})")
+    if dry_run_ok:
+        print(f"[PIPE] {doc.id} -> PROCESSED (TEKION_PO_WRITES off: PO {doc.po_number} matched, nothing posted)")
+    else:
+        print(f"[PIPE] {doc.id} -> PROCESSED (pre-invoiced PO {doc.po_number})")
 
 
 # ── SUBLET / MISCELLANEOUS -> Purchase order ─────────────────────────────────

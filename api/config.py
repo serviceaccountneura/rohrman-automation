@@ -59,6 +59,13 @@ class Settings(BaseSettings):
     # False sends the page as scanned, as before.
     ocr_enhance: bool = True
 
+    # TESTING BRANCH (staging-no-preinvoice): Misc, Sublet and Vendor Stock
+    # read, check and show their GL lines but create NOTHING in Tekion -- no
+    # purchase order, no pre-invoice, no uploaded invoice. OEM and Vehicle
+    # still save their drafts. Set TEKION_PO_WRITES=true (or change this
+    # default) to reconnect; every guarded call is marked "TEKION_PO_WRITES".
+    tekion_po_writes: bool = False
+
     # ── Frontend ──────────────────────────────────────────────────────────────
     frontend_url: str = "http://localhost:3000"
 
