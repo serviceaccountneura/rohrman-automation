@@ -58,11 +58,13 @@ def tekion_writes() -> dict[str, object]:
     """Whether Misc, Sublet and Vendor Stock create anything in Tekion.
 
     TEKION_PO_WRITES in the env file; the frontend shows a test-mode banner on
-    those folders while it is off. OEM and Vehicle always save drafts.
+    those folders while it is off. OEM and Vehicle always save their journal
+    entry as a draft, whatever the switch says; `draftFolders` names them.
     """
     return {
         "poWrites": settings.tekion_po_writes,
         "folders": ["SUBLET", "MISCELLANEOUS", "STOCK"],
+        "draftFolders": ["OEM", "VEHICLE_MANUFACTURING"],
     }
 
 
