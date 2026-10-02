@@ -107,6 +107,9 @@ class SubletLineItem(BaseModel):
 class _CreatePoBase(BaseModel):
     dealership_name: str = Field(alias="dealershipName")
     vendor_name: str = Field(alias="vendorName")
+    # Dealer-vendor codes written on the invoice ("1707-310"). One for the
+    # dealership being posted to picks the vendor ahead of the name.
+    vendor_codes: list[str] = Field(default_factory=list, alias="vendorCodes")
     invoice_number: str = Field(alias="invoiceNumber")
     invoice_amount: float = Field(alias="invoiceAmount")
     sales_tax: float = Field(default=0.0, alias="salesTax")

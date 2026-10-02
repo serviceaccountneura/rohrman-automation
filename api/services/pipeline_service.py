@@ -1461,6 +1461,7 @@ def _run_purchase_order(
     common = {
         "dealership_name": doc.dealership_name,
         "vendor_name": doc.vendor_name,
+        "vendor_codes": ocr_helpers.get_vendor_codes(ocr),
         "invoice_number": doc.invoice_number,
         "invoice_amount": total,
         "sales_tax": sales_tax,

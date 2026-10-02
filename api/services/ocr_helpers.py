@@ -783,6 +783,34 @@ def _note_annotations(ocr: dict[str, Any]) -> list[str]:
     return annotations
 
 
+# The dealership's own code for the vendor, written or stamped on the invoice
+# as dealer number, dash, vendor number: "1707-310" is vendor 1707_310 in
+# Tekion. A whole note and nothing else, so a GL line ("#3142 $72.69"), a date
+# or a phone number never reads as one.
+_VENDOR_CODE_RE = re.compile(
+    r"^\s*(?:vendor|vend|v)?\s*#?\s*(\d{4})\s*[-_\u2013\u2014]\s*(\d{1,6})\s*$",
+    re.IGNORECASE,
+)
+
+
+def get_vendor_codes(ocr: dict[str, Any]) -> list[str]:
+    """Dealer-vendor codes written on the invoice, as "1707-310", in order.
+
+    From `vendor.id`, where the vision prompt asks for it, and from the
+    handwritten notes, where it lands when the model does not file it there.
+    Which dealer a code belongs to is checked by the caller: only one naming
+    the dealership being posted to is used.
+    """
+    raw = [str((ocr.get("vendor") or {}).get("id") or "")]
+    raw += [str(n) for n in (ocr.get("handwritten_notes") or [])]
+    codes: list[str] = []
+    for text in raw:
+        m = _VENDOR_CODE_RE.match(text)
+        if m and f"{m[1]}-{m[2]}" not in codes:
+            codes.append(f"{m[1]}-{m[2]}")
+    return codes
+
+
 def gl_notes(ocr: dict[str, Any]) -> list[dict[str, Any]]:
     """Accounts and amounts read straight off the transcribed handwriting.
 

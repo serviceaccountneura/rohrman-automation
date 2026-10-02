@@ -86,8 +86,9 @@ def _resolve_vendor(
     dealer_id: str,
     vendor_name: str,
     session: Session,
+    vendor_codes: list[str] | None = None,
 ) -> dict:
-    result = resolve_vendor(dealer_id, vendor_name, session, client)
+    result = resolve_vendor(dealer_id, vendor_name, session, client, vendor_codes)
     if result["resolved"]:
         return result["vendor"]
 
@@ -256,7 +257,9 @@ def _create_sublet_po(
     try:
         client = get_client(session)
         dealer_id = _resolve_dealer(client, req.dealership_name)
-        vendor = _resolve_vendor(client, dealer_id, req.vendor_name, session)
+        vendor = _resolve_vendor(
+            client, dealer_id, req.vendor_name, session, req.vendor_codes
+        )
 
         # Build sublet items — each line item has its own RO + job.
         #
@@ -430,7 +433,9 @@ def _create_misc_po(
     try:
         client = get_client(session)
         dealer_id = _resolve_dealer(client, req.dealership_name)
-        vendor = _resolve_vendor(client, dealer_id, req.vendor_name, session)
+        vendor = _resolve_vendor(
+            client, dealer_id, req.vendor_name, session, req.vendor_codes
+        )
 
         # Build misc items — each line item has its own GL account.
         if req.line_items:
@@ -597,7 +602,9 @@ def _create_stock_po(
     try:
         client = get_client(session)
         dealer_id = _resolve_dealer(client, req.dealership_name)
-        vendor = _resolve_vendor(client, dealer_id, req.vendor_name, session)
+        vendor = _resolve_vendor(
+            client, dealer_id, req.vendor_name, session, req.vendor_codes
+        )
 
         if not req.parts:
             raise HTTPException(

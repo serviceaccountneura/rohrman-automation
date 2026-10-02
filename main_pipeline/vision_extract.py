@@ -76,6 +76,11 @@ TABLES (most important — reproduce them faithfully):
   parts with a single space, number first. Do not add text from outside the field. Report it the
   same way every time, code included.
 
+THE VENDOR CODE (`vendor.id`): the dealership often writes or stamps its own code for the vendor
+  on the invoice: a dealer number, a dash, then a vendor number ("1707-310"). Copy it into
+  `vendor.id` exactly as written, and keep it in `handwritten_notes[]` too. Only that code -- never
+  the vendor's customer, account or remit-to numbers. null when there is none.
+
 NUMBERS & FAITHFULNESS:
 - Clean currency of symbols and commas into the string value where a number is expected
   ("$1,250.00" stays readable but represents 1250.00; "-$376.00" is negative). Preserve negatives.
