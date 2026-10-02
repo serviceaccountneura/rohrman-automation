@@ -70,11 +70,11 @@ TABLES (most important — reproduce them faithfully):
 - ALSO populate the typed helpers where they apply: `line_items[]` for part/qty/price rows,
   `totals[]` for subtotal/tax/total/balance figures, `identifiers[]` for invoice/PO/control/account
   numbers and dates. These may duplicate data already in `tables[]` — that is fine and expected.
-- THE INVOICE NUMBER is exactly what is printed in the invoice-number field: everything on that
-  line inside that box, as printed ("6101029 RI" when "RI" sits beside the digits on the same
-  line). Text printed on a SEPARATE LINE below it -- a store, branch or location code such as
-  "HOM" under "331937" -- is not part of the number: report "331937". Report it the same way
-  every time.
+- THE INVOICE NUMBER is everything printed in the invoice-number field, as one value: the
+  number, plus any short letter code printed with it in that field -- beside it on the same line
+  ("6101029 RI") or directly beneath it ("331937" with "HOM" under it is "331937 HOM"). Join the
+  parts with a single space, number first. Do not add text from outside the field. Report it the
+  same way every time, code included.
 
 NUMBERS & FAITHFULNESS:
 - Clean currency of symbols and commas into the string value where a number is expected
