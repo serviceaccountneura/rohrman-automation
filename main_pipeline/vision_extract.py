@@ -105,9 +105,9 @@ NUMBERS & FAITHFULNESS:
 
   Examples -- as written on the page -> entry in `handwritten_notes[]`:
 
-      #2410   $1,669^90        ->  "#2410 $1,669.90"
-      #6777   -$271^19         ->  "#6777 -$271.19"
-      GL# 6777  -$.25          ->  "#6777 -$.25"
+      #5003   $1,669^90        ->  "#5003 $1,669.90"
+      #8004   -$271^19         ->  "#8004 -$271.19"
+      GL# 8004  -$.25          ->  "#8004 -$.25"
 
   Everything else in `handwritten_notes[]` -- signatures, PO numbers, stock numbers, other
   notes -- is unchanged by this rule.
@@ -182,13 +182,13 @@ GL ACCOUNTS & SPATIAL BINDING:
      spatial target independently to ensure every line item, subtotal, discount, or extra fee is
      assigned its correct GL code and corresponding dollar amount.
 - POPULATE OUTPUT:
-  - For items in `line_items[]`, populate the string field `gl_account` (e.g. `gl_account: "2410"`)
+  - For items in `line_items[]`, populate the string field `gl_account` (e.g. `gl_account: "5003"`)
     on EVERY row that has one. This is per-row: three rows with three different handwritten codes
     must come back as three different `gl_account` values, not one repeated or one at document
     level. Leave it empty only for a row with no code of its own.
   - For fees, discounts, freight, or subtotals outside the main table that have an assigned GL
     code, populate `gl_mappings[]` with: `gl_account`, `amount`, and `mapped_description`
-    (e.g. `{"gl_account": "7555", "amount": "15.12", "mapped_description": "Delivery Charge"}`).
+    (e.g. `{"gl_account": "9006", "amount": "15.12", "mapped_description": "Delivery Charge"}`).
   - GL CODES WRITTEN WITH THEIR OWN AMOUNTS: wherever an account appears with a dollar figure
     beside it, that is the clerk stating how the invoice divides. It may be circled, boxed, in a
     margin, at the foot of the page, or just written plainly with nothing around it -- the layout
@@ -196,16 +196,16 @@ GL ACCOUNTS & SPATIAL BINDING:
     account number followed by an amount. The commonest form is a short list written in open
     space on the page:
 
-        GL 2245    1129$
-        GL 2250     368$
+        GL 1005    1129$
+        GL 1006     368$
 
     There is no limit to how many lines such a list has, and the prefix varies -- "GL", "GL#",
     "gl", or nothing at all before the number. Capture EVERY such pair in `gl_mappings[]`, one
     entry each, with the amount exactly as written:
 
-        GL# 7193   $2,378.11        -> {"gl_account": "7193", "amount": "2378.11", ...}
-        GL# 3142   $202.12          -> {"gl_account": "3142", "amount": "202.12", ...}
-        #6777      -$271^19         -> {"gl_account": "6777", "amount": "-271.19", ...}
+        GL# 5007   $2,378.11        -> {"gl_account": "5007", "amount": "2378.11", ...}
+        GL# 8006   $202.12          -> {"gl_account": "8006", "amount": "202.12", ...}
+        #8004      -$271^19         -> {"gl_account": "8004", "amount": "-271.19", ...}
 
     Accounts written this way do NOT belong to any single row and must not be copied into
     `line_items[].gl_account`. This is now the usual way GL accounts are marked: expect the
@@ -222,7 +222,7 @@ GL ACCOUNTS & SPATIAL BINDING:
     code rather than shown as a dollar figure. In `1001948819-KAC0780KAC-KRS0290-FPA0156`,
     `KAC0780KAC` carries 780.00 and `KRS0290` carries 290.00: read the digit run beside the
     letters and drop leading zeros. When a handwritten GL code points at such a segment, emit
-    `{"gl_account": "2245", "amount": "780.00", "mapped_description": "KAC0780KAC"}` -- put the
+    `{"gl_account": "1005", "amount": "780.00", "mapped_description": "KAC0780KAC"}` -- put the
     code segment verbatim in `mapped_description` so the reading can be checked.
   - A REPAIR ORDER NUMBER WRITTEN ON A ROW: a sublet invoice often bills several vehicles at
     once, one per row, with that vehicle's repair order number written beside it -- frequently by
@@ -260,7 +260,7 @@ GL ACCOUNTS & SPATIAL BINDING:
     key code, dealer number, order reference, zip code and phone number. If the invoice has no
     such run, return an empty array.
   - When a handwritten GL code points instead at a labelled figure in a totals column, use that
-    figure and name the label (e.g. `{"gl_account": "3300", "amount": "32133.00",
+    figure and name the label (e.g. `{"gl_account": "9008", "amount": "32133.00",
     "mapped_description": "TOTAL dealer cost"}`).
   - Report `amount` in `gl_mappings[]` WITH ITS SIGN, exactly as the page shows it. A minus in
     front of the figure, "CR" beside it, or brackets around it mean a credit: report it as a
