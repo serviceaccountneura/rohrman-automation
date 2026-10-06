@@ -34,6 +34,13 @@ def _match_key(name: str) -> str:
     words = text.split()
     while words and words[-1] in {s.replace(".", "") for s in _LEGAL_SUFFIXES}:
         words.pop()
+    # A plural is the same name: the invoice prints "Aramark Refreshment
+    # Services" and the mapping says "ARAMARK REFRESHMENT SERVICE". Both sides
+    # go through here, so dropping the S matches them. "GLASS" keeps its own.
+    words = [
+        w[:-1] if len(w) > 3 and w.endswith("S") and not w.endswith("SS") else w
+        for w in words
+    ]
     return " ".join(words)
 
 
@@ -92,14 +99,43 @@ def _find_mapping(
     return None
 
 
+def _vendor_from_code(
+    dealer_id: str, vendor_codes: list[str], client: TekionApiClient
+) -> dict | None:
+    """The Tekion vendor named by a code written on the invoice, or None.
+
+    A code is "<dealer>-<vendor>". Only one for THIS dealership is used: a
+    code for another store names that store's vendor, and posting to it would
+    be posting to the wrong books. Tried as "<dealer>_<vendor>", the usual
+    display id, then the bare vendor number, which some stores use.
+    """
+    for code in vendor_codes:
+        dealer, _, number = code.partition("-")
+        if dealer != str(dealer_id) or not number:
+            continue
+        for display_id in (f"{dealer}_{number}", number):
+            vendor = client.get_vendor_by_display_id(display_id)
+            if vendor:
+                print(
+                    f"[VENDOR] code {code!r} written on the invoice -> "
+                    f"{vendor.get('name')!r} ({display_id})"
+                )
+                return vendor
+        print(f"[VENDOR] code {code!r} is not a vendor in Tekion; matching by name")
+    return None
+
+
 def resolve_vendor(
     dealer_id: str,
     vendor_name: str,
     session: Session,
     client: TekionApiClient,
+    vendor_codes: list[str] | None = None,
 ) -> dict:
     """Resolve a vendor for PO creation.
 
+    0. A vendor code written on the invoice for this dealership ("1707-310")
+       wins: the clerk has said exactly which vendor it is.
     1. Look up (dealer_id, normalized vendor_name) in vendor_mappings.
     2. If found, fetch the full vendor record from Tekion by vendorDisplayId.
     3. If not in mapping, search Tekion by name and return candidates for
@@ -110,6 +146,10 @@ def resolve_vendor(
         {"resolved": False, "reason": "not_in_mapping",
          "candidates": [...], "vendor_name": ...}  — needs human review
     """
+    vendor = _vendor_from_code(dealer_id, vendor_codes or [], client)
+    if vendor:
+        return {"resolved": True, "vendor": vendor}
+
     mapping = _find_mapping(dealer_id, vendor_name, session)
 
     if mapping:

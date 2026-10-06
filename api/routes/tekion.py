@@ -14,6 +14,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 
+from api.config import settings
 from api.db import get_session
 from api.deps import CurrentUserDep
 from api.models.db import Document, VendorMapping
@@ -85,8 +86,9 @@ def _resolve_vendor(
     dealer_id: str,
     vendor_name: str,
     session: Session,
+    vendor_codes: list[str] | None = None,
 ) -> dict:
-    result = resolve_vendor(dealer_id, vendor_name, session, client)
+    result = resolve_vendor(dealer_id, vendor_name, session, client, vendor_codes)
     if result["resolved"]:
         return result["vendor"]
 
@@ -235,6 +237,11 @@ def _gl_lines_posted(
     return lines
 
 
+# What a purchase order looks like to the rest of the flow when nothing was
+# created in Tekion (TEKION_PO_WRITES off): no number, no id.
+_PO_NOT_CREATED = {"poNumber": "", "poId": None, "status": "NOT_CREATED", "universalId": ""}
+
+
 def _create_sublet_po(
     req: CreateSubletPoRequest,
     session: Session,
@@ -250,7 +257,9 @@ def _create_sublet_po(
     try:
         client = get_client(session)
         dealer_id = _resolve_dealer(client, req.dealership_name)
-        vendor = _resolve_vendor(client, dealer_id, req.vendor_name, session)
+        vendor = _resolve_vendor(
+            client, dealer_id, req.vendor_name, session, req.vendor_codes
+        )
 
         # Build sublet items — each line item has its own RO + job.
         #
@@ -330,7 +339,7 @@ def _create_sublet_po(
                     }
                 )
 
-            po = client.create_sublet_po(
+            po = _PO_NOT_CREATED if not settings.tekion_po_writes else client.create_sublet_po(  # TEKION_PO_WRITES
                 vendor_id=int(vendor["id"]),
                 vendor_name=vendor["name"],
                 vendor_display_id=vendor["displayId"],
@@ -353,11 +362,11 @@ def _create_sublet_po(
 
         # Upload invoice document if provided.
         attachment_media_ids: list[str] = []
-        if req.invoice_file_path:
+        if req.invoice_file_path and settings.tekion_po_writes:  # TEKION_PO_WRITES
             media_id = client.upload_document(req.invoice_file_path)
             attachment_media_ids.append(media_id)
 
-        result = client.pre_invoice(
+        result = {"invoiceId": None} if not settings.tekion_po_writes else client.pre_invoice(  # TEKION_PO_WRITES
             vendor_id=vendor["id"],
             vendor_site_id=vendor["siteId"],
             vendor_name=vendor["name"],
@@ -424,7 +433,9 @@ def _create_misc_po(
     try:
         client = get_client(session)
         dealer_id = _resolve_dealer(client, req.dealership_name)
-        vendor = _resolve_vendor(client, dealer_id, req.vendor_name, session)
+        vendor = _resolve_vendor(
+            client, dealer_id, req.vendor_name, session, req.vendor_codes
+        )
 
         # Build misc items — each line item has its own GL account.
         if req.line_items:
@@ -442,7 +453,7 @@ def _create_misc_po(
         if existing_po:
             po = existing_po
         else:
-            po = client.create_misc_po(
+            po = _PO_NOT_CREATED if not settings.tekion_po_writes else client.create_misc_po(  # TEKION_PO_WRITES
                 vendor_id=vendor["id"],
                 vendor_name=vendor["name"],
                 vendor_display_id=vendor["displayId"],
@@ -521,11 +532,11 @@ def _create_misc_po(
 
         # Upload invoice document if provided.
         attachment_media_ids: list[str] = []
-        if req.invoice_file_path:
+        if req.invoice_file_path and settings.tekion_po_writes:  # TEKION_PO_WRITES
             media_id = client.upload_document(req.invoice_file_path)
             attachment_media_ids.append(media_id)
 
-        result = client.pre_invoice(
+        result = {"invoiceId": None} if not settings.tekion_po_writes else client.pre_invoice(  # TEKION_PO_WRITES
             vendor_id=vendor["id"],
             vendor_site_id=vendor["siteId"],
             vendor_name=vendor["name"],
@@ -591,7 +602,9 @@ def _create_stock_po(
     try:
         client = get_client(session)
         dealer_id = _resolve_dealer(client, req.dealership_name)
-        vendor = _resolve_vendor(client, dealer_id, req.vendor_name, session)
+        vendor = _resolve_vendor(
+            client, dealer_id, req.vendor_name, session, req.vendor_codes
+        )
 
         if not req.parts:
             raise HTTPException(
