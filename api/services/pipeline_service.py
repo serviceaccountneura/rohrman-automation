@@ -325,6 +325,44 @@ def _store_enhanced_copy(doc: Document, source: str, pages: list) -> None:
         print(f"[PIPE] {doc.id} could not store the cleaned-up copy: {e}")
 
 
+def _store_confidence(doc: Document, ocr: dict[str, Any]) -> None:
+    """Keep the confidence read beside the original in S3, for the detail page.
+
+    In S3 rather than a column, so this testing branch needs no migration and
+    the staging database stays usable by the staging branch. Best-effort.
+    """
+    second = ocr.get("_confidence")
+    if not second or not doc.s3_key or not s3_service.is_configured():
+        return
+    try:
+        local = Path(tempfile.gettempdir()) / f"{doc.id}.confidence.json"
+        local.write_text(json.dumps(second, default=str), encoding="utf-8")
+        s3_service.upload_file(local, s3_service.confidence_key(doc.s3_key))
+        local.unlink(missing_ok=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[PIPE] {doc.id} could not store the confidence read: {e}")
+
+
+def read_confidence(doc: Document) -> dict[str, Any]:
+    """The confidence read for this document: the OCR cache first, then S3. {} if none."""
+    cached = _load_cached_ocr(doc)
+    if cached and cached.get("_confidence"):
+        return cached["_confidence"]
+    if not doc.s3_key or not s3_service.is_configured():
+        return {}
+    key = s3_service.confidence_key(doc.s3_key)
+    if not s3_service.exists(key):
+        return {}
+    try:
+        local = Path(tempfile.gettempdir()) / f"{doc.id}.confidence.read.json"
+        s3_service.download_file(key, local)
+        data = json.loads(local.read_text(encoding="utf-8"))
+        local.unlink(missing_ok=True)
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -595,6 +633,7 @@ def _run(doc: Document, session: Session) -> None:
             return
         _store_enhanced_copy(doc, source, enhanced_pages)
         _cache_ocr(doc, ocr)
+        _store_confidence(doc, ocr)
 
     # ── 3. Record what OCR found ─────────────────────────────────────────────
     doc.ocr_document_type = ocr_helpers.get_document_type(ocr)

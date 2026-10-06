@@ -504,6 +504,7 @@ class PipelineStatusResponse(BaseModel):
     # What this document posted to Tekion -- the GL accounts, the amount against
     # each, and the totals. The same shape for every flow, so one component
     # renders a Misc split, a journal entry and a vehicle purchase alike.
+    confidence: dict[str, Any] = Field(default_factory=dict, alias="confidence")
     posting_details: dict[str, Any] = Field(
         default_factory=dict, alias="postingDetails"
     )

@@ -66,6 +66,14 @@ class Settings(BaseSettings):
     # default) to reconnect; every guarded call is marked "TEKION_PO_WRITES".
     tekion_po_writes: bool = False
 
+    # TESTING BRANCH (staging-test-gemini-2.5pro-confidence-score): a second
+    # read of the invoice number and handwritten GL lines by a model that
+    # reports its confidence per character, and its values used for those
+    # fields. See api/services/confidence_read.py. CONFIDENCE_READ=false turns
+    # it off.
+    confidence_read: bool = True
+    confidence_model: str = "gemini-2.5-pro"
+
     # ── Frontend ──────────────────────────────────────────────────────────────
     frontend_url: str = "http://localhost:3000"
 

@@ -215,6 +215,12 @@ def enhanced_key(s3_key: str, multi_page: bool) -> str:
     return str(path.with_name(f"{path.stem}.enhanced.{'pdf' if multi_page else 'png'}"))
 
 
+def confidence_key(s3_key: str) -> str:
+    """Where the confidence read of a document is kept: ".confidence.json" beside the original."""
+    path = Path(s3_key)
+    return str(path.with_name(f"{path.stem}.confidence.json"))
+
+
 def viewable_key(s3_key: str) -> str:
     """The key to show someone, best first: the cleaned-up copy Gemini read,
     then the upright copy, then the original as uploaded."""

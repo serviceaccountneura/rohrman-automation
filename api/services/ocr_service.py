@@ -26,7 +26,7 @@ if not os.environ.get("VERTEX_CREDENTIALS"):
 from google.genai import types  # noqa: E402
 
 from api.config import settings  # noqa: E402
-from api.services import page_enhance, page_orientation  # noqa: E402
+from api.services import confidence_read, page_enhance, page_orientation  # noqa: E402
 from api.services.ocr_helpers import to_flat_fields  # noqa: E402
 from normalize import to_po_contract  # noqa: E402
 from pipeline import get_client, load_pages, pil_to_part  # noqa: E402
@@ -86,6 +86,17 @@ def extract_document(
         if pages_out is not None:
             pages_out.extend(images)
     parts = [pil_to_part(img) for img in images]
+
+    # The confidence read runs alongside the main one, on the same pages, so
+    # it adds no time unless it is the slower of the two.
+    second_read = None
+    if settings.confidence_read:
+        from concurrent.futures import ThreadPoolExecutor
+
+        pool = ThreadPoolExecutor(max_workers=1)
+        second_read = pool.submit(confidence_read.read, list(parts), client)
+        pool.shutdown(wait=False)
+
     parts.append(types.Part.from_text(text=VISION_PROMPT))
 
     # Vertex AI intermittently drops the connection on long structured-schema
@@ -121,6 +132,19 @@ def extract_document(
 
     if not isinstance(doc, dict):
         doc = {"document_type": None}
+
+    if second_read is not None:
+        second = second_read.result()
+        doc = confidence_read.apply(doc, second)
+        doc["_confidence"] = second
+        print(
+            f"[OCR] confidence read ({second.get('model')}, {second.get('seconds')}s): "
+            + (f"error {second['error']}" if second.get("error") else
+               f"invoice {second['invoice_number']['value']!r} "
+               f"{second['invoice_number']['confidence']}%, "
+               + ", ".join(f"#{ln['account']['value']} {ln['account']['confidence']}%"
+                           for ln in second["gl_lines"]))
+        )
 
     doc["_pages"] = len(images)
     doc["_po_contract"] = to_po_contract(doc)

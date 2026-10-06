@@ -572,6 +572,9 @@ def _to_status(
             else {}
         ),
         posting_details=_as_json_object(doc.posting_details),
+        # Testing branch: 2.5 Pro's read of the invoice number and GL lines,
+        # with confidence per character. Detail page only -- it costs a read.
+        confidence=pipeline_service.read_confidence(doc) if include_read else {},
         needs_fields=[
             str(f) for f in (_as_json_object(doc.vehicle_details).get("needs") or [])
         ],
