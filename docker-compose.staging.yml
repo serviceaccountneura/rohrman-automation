@@ -113,6 +113,32 @@ services:
       echo 'bucket ready: '$$S3_BUCKET
       "
 
+  # TESTING BRANCH (staging-test-gemini-2.5pro-confidence-score): PaddleOCR,
+  # the third reader in the vote on handwritten GL lines and the invoice
+  # number. Its own container with a hard memory cap, so running out of memory
+  # kills this, never the API or production. Reached only from the api
+  # container; no port on the host.
+  paddle:
+    build:
+      context: ./paddle_ocr
+    image: rohrman-paddle-staging:latest
+    container_name: rohrman-paddle-staging
+    restart: unless-stopped
+    mem_limit: 1g
+    memswap_limit: 1g
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8100/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   api:
     build:
       context: .
@@ -140,6 +166,7 @@ services:
       # One worker, not two. The box now runs six containers on 3.8 GB, and OCR
       # holds every page of an invoice at 300 DPI (~24 MB each) at once.
       PIPELINE_WORKERS: ${PIPELINE_WORKERS:-1}
+      PADDLE_OCR_URL: ${PADDLE_OCR_URL:-http://paddle:8100}
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3001}
 
     volumes:

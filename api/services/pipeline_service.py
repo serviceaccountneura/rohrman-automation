@@ -138,6 +138,9 @@ EX_GL_NOT_IN_CHART = "GL_ACCOUNT_NOT_FOUND"
 # The invoice's printed total is zero, e.g. a core credit memo for .00CR.
 # Nothing to post, which is different from a total that could not be read.
 EX_ZERO_TOTAL = "ZERO_TOTAL"
+# TESTING BRANCH: three readers voted on the invoice number and the handwritten
+# GL lines (api/services/confidence_read.py) and no two agreed on a value.
+EX_UNCLEAR_READING = "UNCLEAR_READING"
 
 _SEVERITY = {
     EX_OCR_FAILED: "HIGH",
@@ -155,6 +158,7 @@ _SEVERITY = {
     EX_SPLIT_FAILED: "HIGH",
     EX_GL_NOT_IN_CHART: "HIGH",
     EX_ZERO_TOTAL: "LOW",
+    EX_UNCLEAR_READING: "HIGH",
 }
 
 # Only OCR is retried, and only because it is free of side effects: reading a
@@ -323,6 +327,35 @@ def _store_enhanced_copy(doc: Document, source: str, pages: list) -> None:
         print(f"[PIPE] {doc.id} stored cleaned-up copy at {key}")
     except Exception as e:  # noqa: BLE001
         print(f"[PIPE] {doc.id} could not store the cleaned-up copy: {e}")
+
+
+def _gl_total_disagrees(ocr: dict[str, Any]) -> list[str]:
+    """The voted GL amounts against the printed invoice total (testing branch).
+
+    [] when they match, when there are no handwritten GL lines, or when no
+    total was read; otherwise one line saying both figures and what each
+    reader read, for the UNCLEAR_READING message.
+    """
+    votes = (ocr.get("_confidence") or {}).get("votes") or {}
+    lines = votes.get("gl_lines") or []
+    total = ocr_helpers.get_total_amount(ocr)
+    if not lines or not total:
+        return []
+    try:
+        voted = round(sum(float(ln["amount"]["final"]) for ln in lines), 2)
+    except (TypeError, ValueError, KeyError):
+        return []
+    if abs(voted - round(float(total), 2)) <= 0.01:
+        return []
+    readings = []
+    for ln in lines:
+        said = {r: (v or {}).get("value") for r, v in ln["amount"]["readers"].items() if v}
+        readings.append(", ".join(f"{name} {said[r]!r}" for r, name in (
+            ("flash", "Gemini 3.6 Flash"), ("pro", "Gemini 2.5 Pro"), ("paddle", "PaddleOCR")) if said.get(r)))
+    return [
+        f"GL amounts (${voted:,.2f}) against the invoice total (${float(total):,.2f}); "
+        f"the readers read {'; '.join(readings)}"
+    ]
 
 
 def _store_confidence(doc: Document, ocr: dict[str, Any]) -> None:
@@ -631,6 +664,14 @@ def _run(doc: Document, session: Session) -> None:
             print(f"[PIPE] OCR failed: {e}")
             _fail(session, doc, EX_OCR_FAILED, error=str(e))
             return
+        # Two readers can share a misreading: on a Toyota invoice 2.5 Pro and
+        # PaddleOCR both read a handwritten 474.56 as 474.50 and outvoted Flash.
+        # The printed total settles it. Not for vehicle invoices, whose
+        # handwritten amounts are holdback and fees rather than a split of the
+        # total. Recorded with the vote, so the confidence page shows it too.
+        second = ocr.get("_confidence")
+        if second and second.get("votes") and not second.get("unresolved") and doc.po_type != FOLDER_VMI:
+            second["unresolved"] = _gl_total_disagrees(ocr)
         _store_enhanced_copy(doc, source, enhanced_pages)
         _cache_ocr(doc, ocr)
         _store_confidence(doc, ocr)
@@ -683,6 +724,26 @@ def _run(doc: Document, session: Session) -> None:
     session.refresh(doc)
     if doc.deleted_at is not None:
         print(f"[PIPE] {doc.id} deleted while processing -- nothing posted")
+        return
+
+    # ── 4c. The readers disagree (testing branch) ────────────────────────────
+    # Gemini 3.6 Flash, Gemini 2.5 Pro and PaddleOCR each read the invoice
+    # number and the handwritten GL lines. A value no two of them agree on is
+    # a guess, so stop before Tekion and let a person look. Only on a fresh
+    # read: running it again -- with corrections or without -- is a person
+    # saying they have checked it.
+    unresolved = (ocr.get("_confidence") or {}).get("unresolved") or []
+    if cached is None and unresolved:
+        _fail(
+            session,
+            doc,
+            EX_UNCLEAR_READING,
+            error=(
+                "The readers did not agree on: " + "; ".join(unresolved)
+                + ". Nothing was sent to Tekion. Check these against the invoice, "
+                "correct any that are wrong, and run it again."
+            )[:1000],
+        )
         return
 
     # ── 5. Dispatch on the folder ────────────────────────────────────────────

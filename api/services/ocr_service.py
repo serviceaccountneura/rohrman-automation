@@ -94,7 +94,7 @@ def extract_document(
         from concurrent.futures import ThreadPoolExecutor
 
         pool = ThreadPoolExecutor(max_workers=1)
-        second_read = pool.submit(confidence_read.read, list(parts), client)
+        second_read = pool.submit(confidence_read.read, list(images), list(parts), client)
         pool.shutdown(wait=False)
 
     parts.append(types.Part.from_text(text=VISION_PROMPT))
@@ -137,14 +137,23 @@ def extract_document(
         second = second_read.result()
         doc = confidence_read.apply(doc, second)
         doc["_confidence"] = second
-        print(
-            f"[OCR] confidence read ({second.get('model')}, {second.get('seconds')}s): "
-            + (f"error {second['error']}" if second.get("error") else
-               f"invoice {second['invoice_number']['value']!r} "
-               f"{second['invoice_number']['confidence']}%, "
-               + ", ".join(f"#{ln['account']['value']} {ln['account']['confidence']}%"
-                           for ln in second["gl_lines"]))
-        )
+        if second.get("error"):
+            print(f"[OCR] confidence read failed ({second.get('model')}): {second['error']}")
+        else:
+            votes = second.get("votes") or {}
+            summary = [f"invoice {votes['invoice_number']['final'] or '?'} "
+                       f"{votes['invoice_number']['agree']}/{votes['invoice_number']['of']}"]
+            summary += [
+                f"#{ln['account']['final'] or '?'} {ln['account']['agree']}/{ln['account']['of']} "
+                f"{ln['amount']['final'] or '?'} {ln['amount']['agree']}/{ln['amount']['of']}"
+                for ln in votes.get("gl_lines") or []
+            ]
+            print(
+                f"[OCR] vote (2.5 Pro {second.get('seconds')}s, PaddleOCR "
+                f"{'%ss' % second['paddle']['seconds'] if second['paddle']['available'] else 'unavailable'}): "
+                + ", ".join(summary)
+                + (f" -- UNRESOLVED: {'; '.join(second['unresolved'])}" if second.get("unresolved") else "")
+            )
 
     doc["_pages"] = len(images)
     doc["_po_contract"] = to_po_contract(doc)
