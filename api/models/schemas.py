@@ -666,6 +666,7 @@ class ExceptionAnalyticsResponse(BaseModel):
     medium: int
     low: int
     auto_resolved: int
+    total_documents: int = 0
     by_exception_type: list[ExceptionTypeCount]
 
 

@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func
+from sqlalchemy import String, cast, func, or_
 from sqlmodel import Session, select
 
 from api.db import get_session
@@ -127,6 +127,45 @@ def _filtered(
     return query
 
 
+SearchQuery = Query(
+    default=None,
+    description="Only rows whose invoice, vendor, PO, RO, VIN or id contains this text.",
+)
+
+
+def _search_condition(term: str):
+    """Match `term` against the columns shown in the document/exception tables.
+
+    Search runs here rather than in the browser: the UI only ever holds one
+    page of rows, so a client-side search could never find anything later.
+    """
+    escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    pattern = f"%{escaped}%"
+    return or_(
+        Document.invoice_number.ilike(pattern, escape="\\"),
+        Document.vendor_name.ilike(pattern, escape="\\"),
+        Document.po_number.ilike(pattern, escape="\\"),
+        Document.ro_number.ilike(pattern, escape="\\"),
+        Document.vin.ilike(pattern, escape="\\"),
+        cast(Document.id, String).ilike(pattern, escape="\\"),
+    )
+
+
+def _severity_condition(severity: str):
+    """Documents the exceptions UI files under `severity`.
+
+    Medium is everything that is neither HIGH nor LOW — including null —
+    so the Medium card and its filtered list stay in agreement.
+    """
+    level = severity.strip().upper()
+    if level == "MEDIUM":
+        return or_(
+            Document.severity.is_(None),
+            Document.severity.notin_(("HIGH", "LOW")),
+        )
+    return Document.severity == level
+
+
 @router.get("", response_model=DashboardResponse)
 def get_dashboard(
     session: Annotated[Session, Depends(get_session)],
@@ -225,16 +264,14 @@ def filter_options(
     vendor list from another store is a list of dead ends.
     """
     vendors = session.exec(
-        _for_dealership(
-            select(Document.vendor_name)
-            .where(Document.vendor_name != "")
-            .distinct(),
+        _filtered(
+            select(Document.vendor_name).where(Document.vendor_name != "").distinct(),
             dealership_name,
         ).order_by(Document.vendor_name)
     ).all()
 
     exception_types = session.exec(
-        _for_dealership(
+        _filtered(
             select(Document.exception_type)
             .where(Document.exception_type.is_not(None))
             .distinct(),
@@ -261,36 +298,36 @@ def list_documents(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     dealership_name: str | None = DealershipQuery,
+    search: str | None = SearchQuery,
 ) -> DocumentListResponse:
-    """Paginated list of documents, optionally filtered by po_type and/or status."""
-    query = _for_dealership(select(Document), dealership_name)
+    """Paginated active documents for one folder.
 
+    Deleted rows are left out here the same way they are on the dashboard: a
+    soft-deleted document must not inflate the folder total, show up in search,
+    or disagree with the Document Intake card that already excludes it.
+    """
+    conditions = []
     if po_type:
-        query = query.where(Document.po_type == po_type)
+        conditions.append(Document.po_type == po_type)
     if status:
-        query = query.where(Document.status == status)
+        conditions.append(Document.status == status)
+    if search and search.strip():
+        conditions.append(_search_condition(search.strip()))
 
-    # Total count (before pagination)
-    count_query = _for_dealership(
-        select(func.count()).select_from(Document), dealership_name
-    )
-    if po_type:
-        count_query = count_query.where(Document.po_type == po_type)
-    if status:
-        count_query = count_query.where(Document.status == status)
-    total = session.exec(count_query).one()
+    def _scoped(query):
+        return _filtered(query, dealership_name).where(*conditions)
 
-    # Paginated results
+    total = session.exec(_scoped(select(func.count()).select_from(Document))).one()
+
+    # id tiebreak keeps pages stable when created_at collides.
     offset = (page - 1) * page_size
     docs = session.exec(
-        query.order_by(Document.created_at.desc())  # type: ignore[union-attr]
+        _scoped(select(Document))
+        .order_by(Document.created_at.desc(), Document.id.desc())  # type: ignore[union-attr]
         .offset(offset)
         .limit(page_size)
     ).all()
 
-    # Deleted rows are INCLUDED here on purpose -- the table greys them out, and
-    # hiding them would make "deleted" indistinguishable from "gone", which is
-    # the thing a soft delete exists to avoid.
     removers = {
         u.id: (u.full_name or u.email or "")
         for u in session.exec(
@@ -323,7 +360,7 @@ def list_documents(
         for doc in docs
     ]
 
-    total_pages = (total + page_size - 1) // page_size
+    total_pages = (total + page_size - 1) // page_size if page_size else 0
 
     return DocumentListResponse(
         items=items,
@@ -348,41 +385,46 @@ def list_exceptions(
         default=None,
         description="Filter by document type (AP_INVOICE, PARTS_TICKET, etc.)",
     ),
+    status: str | None = Query(
+        default="EXCEPTION",
+        description=(
+            "Which documents to list: EXCEPTION (the open queue, default) or "
+            "AUTO_RESOLVED, so the summary card's View all can open its own count."
+        ),
+    ),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     dealership_name: str | None = DealershipQuery,
+    date_from: str | None = DateFromQuery,
+    date_to: str | None = DateToQuery,
+    vendor: str | None = VendorQuery,
+    search: str | None = SearchQuery,
 ) -> ExceptionListResponse:
-    """Paginated list of exception documents, optionally filtered by severity, exception_type, and/or document_type."""
-    query = _for_dealership(
-        select(Document).where(Document.status == "EXCEPTION"), dealership_name
-    )
-
+    """Paginated active exception queue under the same filters as the dashboard."""
+    conditions = [Document.status == (status or "EXCEPTION")]
     if severity:
-        query = query.where(Document.severity == severity)
-    if exception_type:
-        query = query.where(Document.exception_type == exception_type)
+        conditions.append(_severity_condition(severity))
     if document_type:
-        query = query.where(Document.document_type == document_type)
+        conditions.append(Document.document_type == document_type)
+    if search and search.strip():
+        conditions.append(_search_condition(search.strip()))
 
-    # Total count
-    count_query = _for_dealership(
-        select(func.count())
-        .select_from(Document)
-        .where(Document.status == "EXCEPTION"),
-        dealership_name,
-    )
-    if severity:
-        count_query = count_query.where(Document.severity == severity)
-    if exception_type:
-        count_query = count_query.where(Document.exception_type == exception_type)
-    if document_type:
-        count_query = count_query.where(Document.document_type == document_type)
-    total = session.exec(count_query).one()
+    def _scoped(query):
+        return _filtered(
+            query,
+            dealership_name,
+            date_from=date_from,
+            date_to=date_to,
+            vendor=vendor,
+            exception_type=exception_type,
+        ).where(*conditions)
 
-    # Paginated results
+    total = session.exec(_scoped(select(func.count()).select_from(Document))).one()
+
     offset = (page - 1) * page_size
     docs = session.exec(
-        query.order_by(Document.created_at.desc())  # type: ignore[union-attr]
+        _scoped(select(Document))
+        .order_by(Document.created_at.desc(), Document.id.desc())  # type: ignore[union-attr]
         .offset(offset)
         .limit(page_size)
     ).all()
@@ -404,7 +446,7 @@ def list_exceptions(
         for doc in docs
     ]
 
-    total_pages = (total + page_size - 1) // page_size
+    total_pages = (total + page_size - 1) // page_size if page_size else 0
 
     return ExceptionListResponse(
         items=items,
@@ -419,46 +461,43 @@ def list_exceptions(
 def exception_analytics(
     session: Annotated[Session, Depends(get_session)],
     dealership_name: str | None = DealershipQuery,
+    date_from: str | None = DateFromQuery,
+    date_to: str | None = DateToQuery,
+    vendor: str | None = VendorQuery,
+    exception_type: str | None = ExceptionTypeQuery,
 ) -> ExceptionAnalyticsResponse:
-    """Aggregated exception analytics — counts by severity and exception type."""
-    # Total exceptions (status=EXCEPTION)
-    total = session.exec(
-        _for_dealership(
-            select(func.count())
-            .select_from(Document)
-            .where(Document.status == "EXCEPTION"),
-            dealership_name,
-        )
-    ).one()
+    """Counts for the exceptions summary cards under the page's filters.
 
-    # By severity
-    def _sev_count(level: str) -> int:
+    Severity and search are deliberately not taken: the cards are the breakdown
+    a severity is chosen from, and narrowing them by it would zero every card
+    but one.
+    """
+
+    def _scoped(query, *, by_exception_type: bool = True):
+        return _filtered(
+            query,
+            dealership_name,
+            date_from=date_from,
+            date_to=date_to,
+            vendor=vendor,
+            exception_type=exception_type if by_exception_type else None,
+        )
+
+    def _count(*conditions, by_exception_type: bool = True) -> int:
         return session.exec(
-            _for_dealership(
-                select(func.count())
-                .select_from(Document)
-                .where(Document.status == "EXCEPTION", Document.severity == level),
-                dealership_name,
-            )
+            _scoped(
+                select(func.count()).select_from(Document),
+                by_exception_type=by_exception_type,
+            ).where(*conditions)
         ).one()
 
-    # Auto-resolved count
-    auto_resolved = session.exec(
-        _for_dealership(
-            select(func.count())
-            .select_from(Document)
-            .where(Document.status == "AUTO_RESOLVED"),
-            dealership_name,
-        )
-    ).one()
+    is_exception = Document.status == "EXCEPTION"
 
-    # Breakdown by exception_type
     type_rows = session.exec(
-        _for_dealership(
+        _scoped(
             select(Document.exception_type, func.count()).where(
-                Document.status == "EXCEPTION", Document.exception_type.isnot(None)
-            ),
-            dealership_name,
+                is_exception, Document.exception_type.isnot(None)  # type: ignore[union-attr]
+            )
         )
         .group_by(Document.exception_type)
         .order_by(func.count().desc())
@@ -468,11 +507,12 @@ def exception_analytics(
     ]
 
     return ExceptionAnalyticsResponse(
-        total_exceptions=total,
-        critical=_sev_count("HIGH"),
-        medium=_sev_count("MEDIUM"),
-        low=_sev_count("LOW"),
-        auto_resolved=auto_resolved,
+        total_exceptions=_count(is_exception),
+        critical=_count(is_exception, _severity_condition("HIGH")),
+        medium=_count(is_exception, _severity_condition("MEDIUM")),
+        low=_count(is_exception, _severity_condition("LOW")),
+        auto_resolved=_count(Document.status == "AUTO_RESOLVED"),
+        total_documents=_count(by_exception_type=False),
         by_exception_type=by_type,
     )
 
