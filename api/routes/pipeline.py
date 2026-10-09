@@ -55,16 +55,18 @@ def list_folders() -> dict[str, list[str]]:
 
 @router.get("/tekion-writes")
 def tekion_writes() -> dict[str, object]:
-    """Whether Misc, Sublet and Vendor Stock create anything in Tekion.
+    """What each folder writes to Tekion, for the banner on its page.
 
-    TEKION_PO_WRITES in the env file; the frontend shows a test-mode banner on
-    those folders while it is off. OEM and Vehicle always save their journal
-    entry as a draft, whatever the switch says; `draftFolders` names them.
+    `folders` follow TEKION_PO_WRITES (`poWrites`): a test-mode banner while it
+    is off. `postFolders` post their journal entry -- OEM when OEM_POST is on.
+    `draftFolders` save theirs as a draft: Vehicle always, OEM when OEM_POST is
+    off.
     """
     return {
         "poWrites": settings.tekion_po_writes,
         "folders": ["SUBLET", "MISCELLANEOUS", "STOCK"],
-        "draftFolders": ["OEM", "VEHICLE_MANUFACTURING"],
+        "postFolders": ["OEM"] if settings.oem_post else [],
+        "draftFolders": ["VEHICLE_MANUFACTURING"] + ([] if settings.oem_post else ["OEM"]),
     }
 
 

@@ -6,7 +6,7 @@ upload folder decides which Tekion flow runs:
     SUBLET         -> Sublet PO   + pre-invoice   (api/routes/tekion.py)
     MISCELLANEOUS  -> Misc PO     + pre-invoice   (api/routes/tekion.py)
     STOCK          -> Vendor stock order          (api/routes/tekion.py)
-    OEM            -> Journal entry, saved as draft (api/services/je_creation.py)
+    OEM            -> Journal entry, posted or saved as draft by OEM_POST (api/services/je_creation.py)
     VEHICLE_MANUFACTURING -> Vehicle purchase journal entry from a
                       per-manufacturer template (api/services/vmi_je_creation.py)
 
@@ -716,7 +716,15 @@ def _record_postings(
 
 
 def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> None:
-    """Parts Manufacture Ticket -> journal entry, saved as a draft."""
+    """Parts Manufacture Ticket -> journal entry, posted or left as a draft.
+
+    OEM_POST decides (settings.oem_post): production posts, staging saves a
+    draft. Posting saves the clerk opening every draft and pressing Submit, the
+    one step of the SOP the automation otherwise leaves to them. A posted entry
+    cannot be undone in the UI, so everything that could refuse it -- the parts
+    reconciliation, the balance check -- runs first, and nothing is sent when
+    either says no.
+    """
     from api.routes.tekion import get_client, reset_client
     from api.services.je_creation import ExpectedJournalEntry, create_journal_entry
 
@@ -825,7 +833,9 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         # Serialized: create_journal_entry switches dealership on the shared client.
         with tekion_scope():
             client = get_client(session)
-            result = create_journal_entry(client, expected=expected, dry_run=False)
+            result = create_journal_entry(
+                client, expected=expected, dry_run=False, post=settings.oem_post
+            )
     except Exception as e:  # noqa: BLE001
         print(f"[PIPE] {doc.id} journal entry failed: {e}")
         reset_client()
@@ -874,7 +884,12 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         _fail(session, doc, EX_UNBALANCED, error=f"balance ${result.balance:.2f}")
         return
     if not result.saved:
-        _fail(session, doc, EX_TEKION_ERROR, error="draft was not saved")
+        _fail(
+            session,
+            doc,
+            EX_TEKION_ERROR,
+            error="the entry was not posted" if settings.oem_post else "draft was not saved",
+        )
         return
 
     doc.transaction_id = result.transaction_id or ""
