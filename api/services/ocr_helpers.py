@@ -507,6 +507,10 @@ _NOT_A_GRAND_TOTAL = (
 _GRAND_TOTAL_LABELS = (
     "grand total", "total amount due", "amount due", "balance due",
     "invoice total", "total due", "total amount", "net due", "please pay",
+    # Honda on Grand prints its total as "PAY THIS AMOUNT". Missing from this
+    # list, the total fell through to a guess that picked the -16.00 core
+    # return, and a $112.64 invoice was sent to Tekion as a $16 credit.
+    "pay this amount", "amount to pay", "total to pay",
 )
 
 
@@ -550,14 +554,72 @@ def _grand_total_raw(ocr: dict[str, Any]) -> Any:
     if found is not None:
         return found
 
+    # 4. No total line at all: add up what the invoice prints instead --
+    #    subtotal plus tax and freight -- before trusting a guess made
+    #    elsewhere. That guess (the _po_contract total) is built from the rows,
+    #    and on a parts invoice with a core return it took the core line.
+    rebuilt = _total_from_parts(totals)
+    if rebuilt is not None:
+        return rebuilt
+
     po_contract = ocr.get("_po_contract") or {}
     summary = ocr.get("summary") or {}
     return ocr.get("total") or po_contract.get("total") or summary.get("total") or 0
 
 
+def _total_from_parts(totals: list[dict[str, Any]]) -> float | None:
+    """Subtotal + tax + freight/shipping/handling, when a subtotal is printed.
+
+    Signed, so a subtotal printed "CR" gives a negative total and the invoice
+    still reads as a credit. None when there is no subtotal to start from.
+    """
+    def signed(value: Any) -> float:
+        amount = _parse_amount(value)
+        return -amount if _is_credit_value(value) else amount
+
+    subtotal = None
+    extras = 0.0
+    for entry in totals:
+        label = (entry.get("label") or "").strip().lower()
+        value = entry.get("value")
+        if not label or not re.search(r"\d", str(value or "")):
+            continue
+        if subtotal is None and ("subtotal" in label or "sub total" in label or "sub-total" in label):
+            subtotal = signed(value)
+        elif "tax" in label and "exempt" not in label:
+            extras += signed(value)
+        elif any(word in label for word in ("freight", "shipping", "handling", "delivery")):
+            extras += signed(value)
+    if subtotal is None:
+        return None
+    return round(subtotal + extras, 2)
+
+
 def get_total_amount(ocr: dict[str, Any]) -> float:
     """The amount owed on the invoice, tax included, as a positive figure."""
     return _parse_amount(_grand_total_raw(ocr))
+
+
+def has_printed_zero_total(ocr: dict[str, Any]) -> bool:
+    """Whether the invoice's total was READ, and reads zero.
+
+    get_total_amount returns 0.0 both for a total that says .00 and for one
+    that was never found, and the two need different answers: a Kia core
+    credit memo printed ".00CR" has nothing to post, while an unread total
+    needs a clearer scan. Only true when a total figure is actually present.
+    """
+    # _grand_total_raw skips zero values and falls back to a bare 0 when it
+    # finds nothing, so it cannot answer this: look for the total line itself.
+    if get_total_amount(ocr):
+        return False
+    for entry in ocr.get("totals") or []:
+        label = (entry.get("label") or "").strip().lower()
+        if "total" not in label or any(bad in label for bad in _NOT_A_GRAND_TOTAL):
+            continue
+        value = str(entry.get("value") or "").strip()
+        if re.search(r"\d", value) and _parse_amount(value) == 0.0:
+            return True
+    return False
 
 
 def is_credit_invoice(ocr: dict[str, Any]) -> bool:
@@ -719,6 +781,34 @@ def _note_annotations(ocr: dict[str, Any]) -> list[str]:
             else:
                 carry = line
     return annotations
+
+
+# The dealership's own code for the vendor, written or stamped on the invoice
+# as dealer number, dash, vendor number: "1707-310" is vendor 1707_310 in
+# Tekion. A whole note and nothing else, so a GL line ("#3142 $72.69"), a date
+# or a phone number never reads as one.
+_VENDOR_CODE_RE = re.compile(
+    r"^\s*(?:vendor|vend|v)?\s*#?\s*(\d{4})\s*[-_\u2013\u2014]\s*(\d{1,6})\s*$",
+    re.IGNORECASE,
+)
+
+
+def get_vendor_codes(ocr: dict[str, Any]) -> list[str]:
+    """Dealer-vendor codes written on the invoice, as "1707-310", in order.
+
+    From `vendor.id`, where the vision prompt asks for it, and from the
+    handwritten notes, where it lands when the model does not file it there.
+    Which dealer a code belongs to is checked by the caller: only one naming
+    the dealership being posted to is used.
+    """
+    raw = [str((ocr.get("vendor") or {}).get("id") or "")]
+    raw += [str(n) for n in (ocr.get("handwritten_notes") or [])]
+    codes: list[str] = []
+    for text in raw:
+        m = _VENDOR_CODE_RE.match(text)
+        if m and f"{m[1]}-{m[2]}" not in codes:
+            codes.append(f"{m[1]}-{m[2]}")
+    return codes
 
 
 def gl_notes(ocr: dict[str, Any]) -> list[dict[str, Any]]:

@@ -70,6 +70,16 @@ TABLES (most important — reproduce them faithfully):
 - ALSO populate the typed helpers where they apply: `line_items[]` for part/qty/price rows,
   `totals[]` for subtotal/tax/total/balance figures, `identifiers[]` for invoice/PO/control/account
   numbers and dates. These may duplicate data already in `tables[]` — that is fine and expected.
+- THE INVOICE NUMBER is everything printed in the invoice-number field, as one value: the
+  number, plus any short letter code printed with it in that field -- beside it on the same line
+  ("6101029 RI") or directly beneath it ("331937" with "HOM" under it is "331937 HOM"). Join the
+  parts with a single space, number first. Do not add text from outside the field. Report it the
+  same way every time, code included.
+
+THE VENDOR CODE (`vendor.id`): the dealership often writes or stamps its own code for the vendor
+  on the invoice: a dealer number, a dash, then a vendor number ("1707-310"). Copy it into
+  `vendor.id` exactly as written, and keep it in `handwritten_notes[]` too. Only that code -- never
+  the vendor's customer, account or remit-to numbers. null when there is none.
 
 NUMBERS & FAITHFULNESS:
 - Clean currency of symbols and commas into the string value where a number is expected

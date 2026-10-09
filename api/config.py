@@ -54,6 +54,24 @@ class Settings(BaseSettings):
     # which is the case on real S3 and therefore in production.
     s3_public_endpoint_url: str = ""
 
+    # Clean up each page (crop, enlarge, flatten the background, boost local
+    # contrast) before Gemini reads it -- see api/services/page_enhance.py.
+    # False sends the page as scanned, as before.
+    ocr_enhance: bool = True
+
+    # TESTING BRANCH (staging-no-preinvoice): Misc, Sublet and Vendor Stock
+    # read, check and show their GL lines but create NOTHING in Tekion -- no
+    # purchase order, no pre-invoice, no uploaded invoice. OEM and Vehicle
+    # still save their drafts. Set TEKION_PO_WRITES=true (or change this
+    # default) to reconnect; every guarded call is marked "TEKION_PO_WRITES".
+    tekion_po_writes: bool = False
+
+    # OEM stock orders: post the journal entry to Tekion (true) or leave it as
+    # a draft for a clerk to submit (false). Posting cannot be undone in
+    # Tekion, so the default is a draft. Production sets OEM_POST=true; staging
+    # leaves it false. The only difference between the two is this env value.
+    oem_post: bool = False
+
     # ── Frontend ──────────────────────────────────────────────────────────────
     frontend_url: str = "http://localhost:3000"
 

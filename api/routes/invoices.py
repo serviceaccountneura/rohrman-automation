@@ -8,7 +8,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 
 from api.models.schemas import UploadUrlRequest, UploadUrlResponse
-from api.services.s3_service import generate_download_url, generate_upload_url
+from api.services.s3_service import generate_download_url, generate_upload_url, viewable_key
 
 router = APIRouter(prefix="/api/invoices", tags=["invoices"])
 
@@ -34,7 +34,9 @@ def create_upload_url(req: UploadUrlRequest) -> UploadUrlResponse:
 @router.get("/{s3_key:path}")
 def get_download_url(s3_key: str) -> dict[str, str]:
     try:
-        url = generate_download_url(s3_key)
+        # The upright copy when the scan was turned: a page fed through the
+        # scanner sideways should not be shown sideways. The original is kept.
+        url = generate_download_url(viewable_key(s3_key))
         return {"download_url": url}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate download URL: {e}")

@@ -175,6 +175,10 @@ class JournalEntryResult:
     # How the debit account was decided: written on the invoice, classified, or
     # the SOP default. Worth surfacing -- the three are not equally trustworthy.
     debit_gl_source: str = ""
+    # GL accounts the entry needed that the dealership's chart does not have,
+    # e.g. "2420" written on a Kia invoice whose parts account is 2410.
+    # Terminal: nothing was built, so nothing was sent to Tekion.
+    accounts_not_in_chart: list[str] = field(default_factory=list)
     saved: bool = False
     # Whether it went in POSTED rather than as a draft. Separate from `saved`
     # because the two differ in what can still be undone.
@@ -685,10 +689,32 @@ def create_journal_entry(
     result.resolved_accounts = resolved
     result.discrepancies.extend(problems)
 
-    if len(resolved) < 2:
-        result.notes.append(
-            "Could not resolve both GL accounts for this dealership — nothing was built."
-        )
+    # An account the chart does not have -- the credit, the debit, or one named
+    # in a written block -- stops the entry with its number, rather than
+    # falling through to a balance check that reads "balance $0.00" and says
+    # nothing about why. A written account used to be skipped silently, which
+    # would have posted that line with no account at all.
+    # Once each: the same account can be both the debit and a written line.
+    missing = list(dict.fromkeys(
+        str(p.expected)
+        for p in problems
+        if p.found == "not in this dealership's chart"
+    ))
+    if missing or len(resolved) < 2:
+        result.accounts_not_in_chart = missing
+        dealership = expected.dealership_name or "this dealership"
+        if missing:
+            numbers = ", ".join(f"GL {n}" for n in missing)
+            result.notes.append(
+                f"{numbers} {'is' if len(missing) == 1 else 'are'} not in {dealership}'s "
+                "chart of accounts in Tekion, so nothing was posted. Check the account "
+                "written on the invoice, correct it, and run it again."
+            )
+        else:
+            result.notes.append(
+                f"Could not resolve both GL accounts for {dealership} — nothing was built."
+            )
+        print(f"[JE] {result.notes[-1]}")
         return result
 
     # Advisory: the UI warns when the control number is not a known vendor.

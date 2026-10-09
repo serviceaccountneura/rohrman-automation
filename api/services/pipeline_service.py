@@ -6,7 +6,7 @@ upload folder decides which Tekion flow runs:
     SUBLET         -> Sublet PO   + pre-invoice   (api/routes/tekion.py)
     MISCELLANEOUS  -> Misc PO     + pre-invoice   (api/routes/tekion.py)
     STOCK          -> Vendor stock order          (api/routes/tekion.py)
-    OEM            -> Journal entry, saved as draft (api/services/je_creation.py)
+    OEM            -> Journal entry, posted or saved as draft by OEM_POST (api/services/je_creation.py)
     VEHICLE_MANUFACTURING -> Vehicle purchase journal entry from a
                       per-manufacturer template (api/services/vmi_je_creation.py)
 
@@ -41,6 +41,7 @@ from uuid import UUID
 
 from sqlmodel import Session
 
+from api.config import settings
 from api.db import engine
 from api.models.db import Document
 from api.services import (
@@ -48,6 +49,7 @@ from api.services import (
     job_queue,
     misc_review,
     ocr_helpers,
+    page_orientation,
     po_reuse,
     s3_service,
 )
@@ -130,6 +132,12 @@ EX_TEKION_ERROR = "TEKION_ERROR"
 # Tekion answered, and the answer was no. Distinct from TEKION_ERROR because a
 # rejection is final — retrying re-runs OCR and asks the same question again.
 EX_TEKION_REJECTED = "TEKION_REJECTED"
+# The entry needs a GL account the dealership's chart does not have -- usually
+# one written on the invoice (2420 on a Kia memo whose parts account is 2410).
+EX_GL_NOT_IN_CHART = "GL_ACCOUNT_NOT_FOUND"
+# The invoice's printed total is zero, e.g. a core credit memo for .00CR.
+# Nothing to post, which is different from a total that could not be read.
+EX_ZERO_TOTAL = "ZERO_TOTAL"
 
 _SEVERITY = {
     EX_OCR_FAILED: "HIGH",
@@ -145,6 +153,8 @@ _SEVERITY = {
     EX_TEKION_ERROR: "HIGH",
     EX_TEKION_REJECTED: "HIGH",
     EX_SPLIT_FAILED: "HIGH",
+    EX_GL_NOT_IN_CHART: "HIGH",
+    EX_ZERO_TOTAL: "LOW",
 }
 
 # Only OCR is retried, and only because it is free of side effects: reading a
@@ -181,10 +191,18 @@ def _cleanup(doc: Document) -> None:
         return
     if not doc.source_path:
         return
-    try:
-        Path(doc.source_path).unlink(missing_ok=True)
-    except OSError:
-        pass
+    original = Path(doc.source_path)
+    # The upright and cleaned-up copies written beside it go too.
+    for path in (
+        original,
+        original.with_name(f"{original.stem}.upright{original.suffix}"),
+        original.with_name(f"{original.stem}.enhanced.png"),
+        original.with_name(f"{original.stem}.enhanced.pdf"),
+    ):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 # ── Entry point (called by the workers) ───────────────────────────────────────
@@ -235,11 +253,85 @@ def _resolve_source(doc: Document) -> str | None:
 
 
 
+def _upright_source(doc: Document, source: str | None, reading: bool) -> tuple[str | None, bool]:
+    """The file to work from, turned upright; and whether orientation is settled.
+
+    A fresh read checks every page (page_orientation.upright_file). When any
+    page was turned, the upright copy is stored beside the original in S3 --
+    the original stays as the record of what was received -- and the preview
+    serves it (see s3_service.viewable_key).
+
+    A re-run reads nothing, so it needs nothing turned. Tekion is always sent
+    the ORIGINAL file, never this one -- see _run. A split-out invoice is cut
+    from the original upload and is turned upright here like any other.
+
+    Returns (path, settled). `settled` False means orientation is unknown and
+    the reader should check each page itself.
+    """
+    if not source or not reading:
+        return source, False
+
+    upright_s3 = s3_service.upright_key(doc.s3_key) if doc.s3_key else ""
+
+    try:
+        path = page_orientation.upright_file(source)
+    except Exception as e:  # noqa: BLE001 - never block a document over this
+        print(f"[PIPE] {doc.id} could not check orientation ({e}); using the original")
+        return source, False
+    if path is None:
+        return source, True
+    if upright_s3:
+        try:
+            s3_service.upload_file(path, upright_s3)
+            print(f"[PIPE] {doc.id} stored upright copy at {upright_s3}")
+        except Exception as e:  # noqa: BLE001 - only the preview loses out
+            print(f"[PIPE] {doc.id} could not store the upright copy: {e}")
+    return path, True
+
+
+def _store_enhanced_copy(doc: Document, source: str, pages: list) -> None:
+    """Store what Gemini read -- the cleaned-up grayscale pages -- for the preview.
+
+    One page is kept as a PNG, shown pixel for pixel; several as a PDF. Beside
+    the original in S3 as <name>.enhanced.png / .pdf. Only the preview uses it:
+    the original stays the record, and it is the original that goes to Tekion.
+    Best-effort -- a failure costs the preview, nothing else.
+    """
+    if not pages or not doc.s3_key or not s3_service.is_configured():
+        return
+    try:
+        multi = len(pages) > 1
+        local = Path(source).with_name(f"{Path(source).stem}.enhanced.{'pdf' if multi else 'png'}")
+        if multi:
+            import io
+
+            import fitz
+
+            out = fitz.open()
+            for page in pages:
+                buf = io.BytesIO()
+                page.save(buf, format="PNG")
+                pdf_page = out.new_page(width=float(page.width), height=float(page.height))
+                pdf_page.insert_image(pdf_page.rect, stream=buf.getvalue())
+            out.save(str(local), garbage=4, deflate=True)
+            out.close()
+        else:
+            pages[0].save(local, format="PNG")
+        key = s3_service.enhanced_key(doc.s3_key, multi)
+        s3_service.upload_file(local, key)
+        local.unlink(missing_ok=True)
+        print(f"[PIPE] {doc.id} stored cleaned-up copy at {key}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[PIPE] {doc.id} could not store the cleaned-up copy: {e}")
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _split_batch(doc: Document, source: str, session: Session) -> bool:
+def _split_batch(
+    doc: Document, source: str, session: Session, original: str | None = None
+) -> bool:
     """Break a batch scan into one child document per invoice.
 
     Returns True when the document was split and this run is finished — the
@@ -283,7 +375,10 @@ def _split_batch(doc: Document, source: str, session: Session) -> bool:
         print(f"[SPLIT]   {seg}")
 
     try:
-        written = document_splitter.split_pdf(source, segments)
+        # Read from the upright file, cut from the original: the pages are in
+        # the same order, and each invoice keeps the file as it was received.
+        # Each one is turned upright on its own run, like any other upload.
+        written = document_splitter.split_pdf(original or source, segments)
     except Exception as e:  # noqa: BLE001
         print(f"[SPLIT] {doc.id} could not be split ({e}); processing as one document")
         return False
@@ -470,10 +565,19 @@ def _run(doc: Document, session: Session) -> None:
         _fail(session, doc, EX_FILE_MISSING, error=f"no readable source for {doc.file_name!r}")
         return
 
+    # ── 1a. Turn it upright ──────────────────────────────────────────────────
+    # Before splitting and before reading, so a sideways scan is upright for
+    # the batch split, Gemini and the preview.
+    # The file as uploaded. Tekion is sent this one -- not turned, not cleaned
+    # up -- and a batch is cut from it, so each invoice it splits into is the
+    # original too.
+    original = source
+    source, straightened = _upright_source(doc, source, reading=cached is None)
+
     # ── 1b. Split a batch scan before OCR ────────────────────────────────────
     # OCR describes one document, so several invoices in one file have to become
     # several documents first. Children are never re-segmented.
-    if cached is None and not doc.split_from and _split_batch(doc, source, session):
+    if cached is None and not doc.split_from and _split_batch(doc, source, session, original):
         return
 
     # ── 2. OCR ───────────────────────────────────────────────────────────────
@@ -482,12 +586,14 @@ def _run(doc: Document, session: Session) -> None:
         ocr = cached
     else:
         print(f"[PIPE] {doc.id} OCR starting ({doc.po_type} folder)")
+        enhanced_pages: list = []
         try:
-            ocr = extract_document(source)
+            ocr = extract_document(source, straighten=not straightened, pages_out=enhanced_pages)
         except Exception as e:  # noqa: BLE001
             print(f"[PIPE] OCR failed: {e}")
             _fail(session, doc, EX_OCR_FAILED, error=str(e))
             return
+        _store_enhanced_copy(doc, source, enhanced_pages)
         _cache_ocr(doc, ocr)
 
     # ── 3. Record what OCR found ─────────────────────────────────────────────
@@ -548,11 +654,11 @@ def _run(doc: Document, session: Session) -> None:
     elif doc.po_type == FOLDER_STOCK:
         # A vendor stock order is not created here — the PO already exists and
         # the invoice arrives afterwards to be attached to it.
-        _run_stock_pre_invoice(doc, ocr, session, source)
+        _run_stock_pre_invoice(doc, ocr, session, original)
     else:
         # `source` is handed on so the PO flow can attach the invoice PDF to the
         # pre-invoice — we already have the file, so there is no reason not to.
-        _run_purchase_order(doc, ocr, session, source)
+        _run_purchase_order(doc, ocr, session, original)
 
 
 # ── OEM -> Journal entry ──────────────────────────────────────────────────────
@@ -610,13 +716,14 @@ def _record_postings(
 
 
 def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> None:
-    """Parts Manufacture Ticket -> journal entry, posted.
+    """Parts Manufacture Ticket -> journal entry, posted or left as a draft.
 
-    Posted, not left as a draft: opening every draft and pressing Submit by hand
-    was the one step of the SOP the automation still left to the clerk. A posted
-    entry cannot be undone in the UI, so everything that could refuse it -- the
-    parts reconciliation, the balance check -- runs first, and nothing is sent
-    when either says no.
+    OEM_POST decides (settings.oem_post): production posts, staging saves a
+    draft. Posting saves the clerk opening every draft and pressing Submit, the
+    one step of the SOP the automation otherwise leaves to them. A posted entry
+    cannot be undone in the UI, so everything that could refuse it -- the parts
+    reconciliation, the balance check -- runs first, and nothing is sent when
+    either says no.
     """
     from api.routes.tekion import get_client, reset_client
     from api.services.je_creation import ExpectedJournalEntry, create_journal_entry
@@ -694,6 +801,16 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         )
         if not value
     ]
+    # A total that was READ as zero is not a missing total: a core credit memo
+    # can genuinely be .00CR. Say so, instead of "missing: invoice_amount".
+    if missing == ["invoice_amount"] and ocr_helpers.has_printed_zero_total(ocr):
+        _fail(
+            session,
+            doc,
+            EX_ZERO_TOTAL,
+            error="Invoice total is $0.00, so there is nothing to post to Tekion.",
+        )
+        return
     if missing:
         _fail(session, doc, EX_MISSING_FIELD, error=f"missing: {', '.join(missing)}")
         return
@@ -717,7 +834,7 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         with tekion_scope():
             client = get_client(session)
             result = create_journal_entry(
-                client, expected=expected, dry_run=False, post=True
+                client, expected=expected, dry_run=False, post=settings.oem_post
             )
     except Exception as e:  # noqa: BLE001
         print(f"[PIPE] {doc.id} journal entry failed: {e}")
@@ -752,11 +869,27 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
             error="; ".join(result.notes) or "invoice parts do not match the total",
         )
         return
+    # Also before `balanced`, for the same reason: nothing was built, so the
+    # balance is a meaningless $0.00. Name the account instead.
+    if result.accounts_not_in_chart or len(result.resolved_accounts or {}) < 2:
+        _fail(
+            session,
+            doc,
+            EX_GL_NOT_IN_CHART,
+            error=(result.notes[-1] if result.notes else "")
+            or "a GL account is not in this dealership's chart",
+        )
+        return
     if not result.balanced:
         _fail(session, doc, EX_UNBALANCED, error=f"balance ${result.balance:.2f}")
         return
     if not result.saved:
-        _fail(session, doc, EX_TEKION_ERROR, error="the entry was not posted")
+        _fail(
+            session,
+            doc,
+            EX_TEKION_ERROR,
+            error="the entry was not posted" if settings.oem_post else "draft was not saved",
+        )
         return
 
     doc.transaction_id = result.transaction_id or ""
@@ -970,7 +1103,9 @@ def _run_stock_pre_invoice(
     try:
         with tekion_scope():
             client = get_client(session)
-            result = pre_invoice_stock_order(client, expected, dry_run=False)
+            # TEKION_PO_WRITES off: the built-in dry run reads the PO and checks
+            # the amounts, then stops before attaching or posting anything.
+            result = pre_invoice_stock_order(client, expected, dry_run=not settings.tekion_po_writes)
     except Exception as e:  # noqa: BLE001
         print(f"[PIPE] {doc.id} stock pre-invoice failed: {e}")
         reset_client()
@@ -990,10 +1125,15 @@ def _run_stock_pre_invoice(
             session,
             doc,
             EX_AMOUNT_MISMATCH,
-            error="; ".join(str(d) for d in result.discrepancies),
+            # The plain-language notes when there are any; the raw comparison
+            # ("gl_lines: invoice says ..., PO says ...") only as a fallback.
+            error="; ".join(result.notes) or "; ".join(str(d) for d in result.discrepancies),
         )
         return
-    if not result.posted:
+    # A dry run (TEKION_PO_WRITES off) that matched the PO is a success here:
+    # everything up to the pre-invoice ran, and only the posting was skipped.
+    dry_run_ok = not settings.tekion_po_writes and result.matched
+    if not result.posted and not dry_run_ok:
         _fail(session, doc, EX_TEKION_ERROR, error="; ".join(result.notes) or "not posted")
         return
 
@@ -1025,7 +1165,10 @@ def _run_stock_pre_invoice(
     )
 
     job_queue.complete(session, doc)
-    print(f"[PIPE] {doc.id} -> PROCESSED (pre-invoiced PO {doc.po_number})")
+    if dry_run_ok:
+        print(f"[PIPE] {doc.id} -> PROCESSED (TEKION_PO_WRITES off: PO {doc.po_number} matched, nothing posted)")
+    else:
+        print(f"[PIPE] {doc.id} -> PROCESSED (pre-invoiced PO {doc.po_number})")
 
 
 # ── SUBLET / MISCELLANEOUS -> Purchase order ─────────────────────────────────
@@ -1333,6 +1476,7 @@ def _run_purchase_order(
     common = {
         "dealership_name": doc.dealership_name,
         "vendor_name": doc.vendor_name,
+        "vendor_codes": ocr_helpers.get_vendor_codes(ocr),
         "invoice_number": doc.invoice_number,
         "invoice_amount": total,
         "sales_tax": sales_tax,
@@ -1392,6 +1536,30 @@ def _run_purchase_order(
                     )
                 if problem:
                     _fail(session, doc, EX_TEKION_REJECTED, error=problem)
+                    return
+
+                # These lines come from the rows AS READ, not the reconciled
+                # ones, so nothing has yet made them add up. The purchase order
+                # is created first and the pre-invoice for the invoice total
+                # after it -- Tekion refuses a pre-invoice worth a different
+                # amount than its PO, leaving the PO behind as an orphan. Check
+                # before either is sent.
+                lines_total = round(
+                    sum((it.labor_amount or 0.0) + (it.parts_amount or 0.0) for it in items), 2
+                )
+                if round(abs(lines_total - expected_po_total), 2) > 0.01:
+                    _fail(
+                        session,
+                        doc,
+                        EX_AMOUNT_MISMATCH,
+                        error=(
+                            f"The repair order lines on this invoice add up to "
+                            f"${lines_total:,.2f}, but the invoice is "
+                            f"${expected_po_total:,.2f} before tax. Nothing was sent to "
+                            "Tekion — check the amounts read from each row, correct "
+                            "them, and run it again."
+                        ),
+                    )
                     return
 
                 req = CreateSubletPoRequest(**common, line_items=items)
@@ -1472,6 +1640,20 @@ def _run_purchase_order(
                 response = _create_stock_po(req, session)
 
         else:  # MISCELLANEOUS
+            # A credit row -- a core return read as qty -1 or price -16.00 --
+            # cannot be a purchase order line: Tekion refuses the whole order
+            # ("items[0].qty must be greater than or equal to 0"). The rows
+            # still add up, so itemising looked safe; post the single line for
+            # the total instead, as Misc already does when rows don't add up.
+            if any(
+                (item.get("qty") or 0) < 0 or (item.get("unitPrice") or 0) < 0
+                for item in line_items
+            ):
+                print(
+                    f"[PIPE] {doc.id} a line is a credit (core return or similar) — "
+                    f"using a single line for {expected_po_total}"
+                )
+                line_items = []
             misc_items = [
                 MiscLineItem(
                     part_name=item["description"] or "Misc purchase",
@@ -1518,6 +1700,37 @@ def _run_purchase_order(
                     )
                     for sp in ocr_helpers.get_gl_amount_splits(ocr)
                 ]
+
+            # The GL lines must add up to the invoice before anything is sent.
+            # Misc used to have a person approve every draft, and that was the
+            # only check; with the review gone (781c61f) a $112.64 invoice read
+            # as a $16 credit went to Tekion with a 2410 line of 112.64 against
+            # A/P of 16.00. Either total is accepted -- clerks split the whole
+            # invoice, or only the goods when tax is posted on its own.
+            if splits:
+                split_total = round(sum(float(sp.amount) for sp in splits), 2)
+                # Rounded before comparing: 112.64 - 112.63 is 0.0100000000005
+                # in floating point, which would refuse a one-cent difference.
+                if all(
+                    round(abs(split_total - target), 2) > 0.01
+                    for target in (round(total, 2), round(expected_po_total, 2))
+                ):
+                    before_tax = (
+                        f" (${expected_po_total:,.2f} before tax)" if sales_tax else ""
+                    )
+                    _fail(
+                        session,
+                        doc,
+                        EX_AMOUNT_MISMATCH,
+                        error=(
+                            f"The GL lines on this invoice add up to ${split_total:,.2f}, "
+                            f"but the invoice total read is ${total:,.2f}{before_tax}. "
+                            "Nothing was sent to Tekion. Check the total and the GL "
+                            "lines, correct them, and run it again."
+                        ),
+                    )
+                    return
+
             req = CreateMiscPoRequest(
                 **common,
                 line_items=misc_items,

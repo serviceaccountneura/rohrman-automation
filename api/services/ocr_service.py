@@ -25,6 +25,8 @@ if not os.environ.get("VERTEX_CREDENTIALS"):
 
 from google.genai import types  # noqa: E402
 
+from api.config import settings  # noqa: E402
+from api.services import page_enhance, page_orientation  # noqa: E402
 from api.services.ocr_helpers import to_flat_fields  # noqa: E402
 from normalize import to_po_contract  # noqa: E402
 from pipeline import get_client, load_pages, pil_to_part  # noqa: E402
@@ -35,17 +37,54 @@ VISION_MODEL = "gemini-3.6-flash"
 VISION_LOCATION = "global"
 
 
-def extract_document(file_path: str | Path) -> dict[str, Any]:
+def _load_for_reading(path: Path) -> list:
+    """The pages as images: PDFs at the enhancement step's 350 DPI when it is on."""
+    if settings.ocr_enhance and path.suffix.lower() == ".pdf":
+        import fitz
+        from PIL import Image
+
+        scale = page_enhance.DPI / 72.0
+        pages = []
+        with fitz.open(str(path)) as doc:
+            for page in doc:
+                pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+                pages.append(Image.frombytes("RGB", (pix.width, pix.height), pix.samples))
+        return pages
+    return load_pages(path)
+
+
+def extract_document(
+    file_path: str | Path,
+    straighten: bool = True,
+    pages_out: list | None = None,
+) -> dict[str, Any]:
     """Run vision-first extraction on a PDF/image file.
 
     Returns the structured JSON dict (same shape as vision_extract.py produces).
+
+    `straighten=False` skips the orientation check, for a file the pipeline
+    has already turned upright (see page_orientation.upright_file) -- checking
+    it again would cost about two seconds a page to learn nothing.
+
+    `pages_out`, when given, receives the cleaned-up pages exactly as Gemini
+    saw them, so the pipeline can store them for the preview.
     """
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
 
     client = get_client(location=VISION_LOCATION)
-    images = load_pages(path)
+    # Upright before reading: a sideways scan is where small print -- the
+    # invoice number, above all -- gets misread. See page_orientation.
+    images = [
+        page_orientation.upright(img, f"{path.name} page {i}") if straighten else img
+        for i, img in enumerate(_load_for_reading(path), start=1)
+    ]
+    # Then cleaned up for reading -- the copy Gemini sees, nothing else.
+    if settings.ocr_enhance:
+        images = page_enhance.enhance_pages(images)
+        if pages_out is not None:
+            pages_out.extend(images)
     parts = [pil_to_part(img) for img in images]
     parts.append(types.Part.from_text(text=VISION_PROMPT))
 
