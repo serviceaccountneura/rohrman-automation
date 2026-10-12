@@ -138,6 +138,12 @@ EX_GL_NOT_IN_CHART = "GL_ACCOUNT_NOT_FOUND"
 # The invoice's printed total is zero, e.g. a core credit memo for .00CR.
 # Nothing to post, which is different from a total that could not be read.
 EX_ZERO_TOTAL = "ZERO_TOTAL"
+# An OEM invoice with no GL account written on it. The account used to be
+# guessed from the parts, and on Honda credit memos marked "Credit # 2410" the
+# guess was 2430 -- posted, and not reversible. Every OEM invoice since 20 Sep
+# carried a handwritten account, so one without is a misread or a missing
+# annotation: either way a person decides, not a guess.
+EX_NO_GL_WRITTEN = "NO_GL_ACCOUNT_WRITTEN"
 
 _SEVERITY = {
     EX_OCR_FAILED: "HIGH",
@@ -155,6 +161,7 @@ _SEVERITY = {
     EX_SPLIT_FAILED: "HIGH",
     EX_GL_NOT_IN_CHART: "HIGH",
     EX_ZERO_TOTAL: "LOW",
+    EX_NO_GL_WRITTEN: "HIGH",
 }
 
 # Only OCR is retried, and only because it is free of side effects: reading a
@@ -761,6 +768,22 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
             f"[PIPE] {doc.id} OEM corrections applied: number={invoice_number!r} "
             f"date={invoice_date!r} splits={[(s['gl_account'], s['amount']) for s in gl_splits]}"
         )
+
+    # Never guess the account. A read that carries Gemini's posting lines and
+    # found none means nothing is written on the invoice, or it was missed;
+    # either way a person says where it goes. Reads from before posting_lines
+    # keep the old path.
+    if not gl_splits and ocr_helpers.has_posting_lines(ocr):
+        _fail(
+            session,
+            doc,
+            EX_NO_GL_WRITTEN,
+            error=(
+                "No GL account was found written on this invoice, so nothing was posted. "
+                "Add the account and amount on the correction form and run it again."
+            ),
+        )
+        return
 
     # A CREDIT invoice runs the whole entry the other way.
     #

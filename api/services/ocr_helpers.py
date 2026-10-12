@@ -871,6 +871,49 @@ def gl_notes(ocr: dict[str, Any]) -> list[dict[str, Any]]:
     return found
 
 
+# An account as Gemini gives it in posting_lines: digits with an optional
+# trailing letter ("2410V"), which _GL_PATTERN's word boundary would reject.
+_POSTING_ACCOUNT = re.compile(r"(?<![\dA-Za-z])(\d{4,5}[A-Za-z]?)(?![\dA-Za-z])")
+
+
+def has_posting_lines(ocr: dict[str, Any]) -> bool:
+    """Whether this read carries Gemini's own posting lines.
+
+    Reads made before `posting_lines` was asked for do not, and fall back to
+    the transcription rules in get_gl_amount_splits.
+    """
+    return isinstance(ocr.get("posting_lines"), list)
+
+
+def get_posting_lines(ocr: dict[str, Any]) -> list[dict[str, Any]]:
+    """The GL accounts written on the invoice and the signed amount each takes.
+
+    Decided by Gemini from the whole page (see `posting_lines` in the vision
+    prompt): negative is a credit, and the lines add up to the signed invoice
+    total. Used as given -- no hunting through notes, no sign rules. The
+    flows still check the lines against the invoice total and the chart of
+    accounts before anything is posted.
+    """
+    lines: list[dict[str, Any]] = []
+    for line in ocr.get("posting_lines") or []:
+        if not isinstance(line, dict):
+            continue
+        match = _POSTING_ACCOUNT.search(str(line.get("account") or ""))
+        account = match.group(1).upper() if match else ""
+        raw = str(line.get("amount") or "").replace("$", "").replace(",", "").strip()
+        amount = _parse_amount(raw)
+        if not account or not amount:
+            continue
+        if _is_credit_value(raw):
+            amount = -amount
+        lines.append({
+            "gl_account": account,
+            "amount": round(amount, 2),
+            "description": str(line.get("label") or "") or None,
+        })
+    return lines
+
+
 def get_gl_amount_splits(ocr: dict[str, Any]) -> list[dict[str, Any]]:
     """GL accounts written on the invoice WITH the amount each one takes.
 
@@ -888,7 +931,16 @@ def get_gl_amount_splits(ocr: dict[str, Any]) -> list[dict[str, Any]]:
     Returns [] when the invoice carries no amounts against its accounts, which
     is the older style where a code sits beside a row and the split has to be
     worked out from the rows themselves.
+
+    A read that carries Gemini's own `posting_lines` uses those and nothing
+    else: everything below is the transcription-matching for older reads. On a
+    Honda credit memo the clerk's "Credit # 2410 $2,890.20" came back only as a
+    note, gl_mappings stayed empty, this returned [], and the account was
+    guessed from the parts as 2430.
     """
+    if has_posting_lines(ocr):
+        return get_posting_lines(ocr)
+
     notes = gl_notes(ocr)
     claimed: set[int] = set()
 

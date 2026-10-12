@@ -91,6 +91,28 @@ THE INVOICE NUMBER AND THE INVOICE TOTAL -- decide these two yourself, from the 
     TOTAL 30.00, OPENING BALANCE 91.00, PAYMENT DUE 121.00: the invoice total is 30.00.
     A plain number, no "$" or commas. A credit (printed "CR", in brackets or with a minus) is
     negative: "-422.27". "" when no total can be read.
+  * `posting_lines`: where the clerk says this invoice is to be posted -- each General Ledger
+    account written or stamped on the invoice, with the amount that account takes. This is
+    what gets posted, so decide it from the whole page:
+    - One entry per account line the clerk wrote, in the order written. `account` = the account
+      number alone ("2410", "6777", "2410V"), without "#", "GL" or words.
+    - `amount` = a plain signed number. Positive = a charge to that account. Negative = a credit
+      to it: on a credit memo (its total printed "CR", in brackets or negative), and wherever the
+      clerk writes "Credit", "CR" or a minus by the line. On a credit memo every line is
+      negative unless the clerk marks one otherwise. A discount line on an ordinary invoice
+      ("#6777 -$271.19") is negative.
+    - An account written with no amount: if it is the only account, it takes the whole invoice
+      total, with the total's sign. Accounts written beside individual rows: one entry per
+      account, its amount the sum of the rows it is written beside.
+    - `label` = any word written with the line ("Tires", "Credit", "Freight"), else "".
+    - The lines normally add up to `invoice_total`, sign included. Copy what is written: never
+      invent, complete or "correct" an account. A dealer-vendor code ("1707-446"), a part number,
+      a PO number or a printed GL code in a parts table is not a posting line.
+    - [] when no account is written on the invoice.
+    Examples, as written -> `posting_lines`:
+      "Credit # 5003  $2,890.20" on a credit memo  -> [{"account":"5003","amount":"-2890.20","label":"Credit"}]
+      "GL# 5003 $20.00" and "GL# 9006 $10.00"      -> [{"account":"5003","amount":"20.00"}, {"account":"9006","amount":"10.00"}]
+      "#5003 $1,669.90" and "#8004 -$271.19"       -> [{"account":"5003","amount":"1669.90"}, {"account":"8004","amount":"-271.19"}]
 
 THE VENDOR CODE (`vendor.id`): the dealership often writes or stamps its own code for the vendor
   on the invoice: a dealer number, a dash, then a vendor number ("1707-310"). Copy it into
@@ -313,6 +335,11 @@ def build_response_schema() -> types.Schema:
         "invoice_number": _str(),
         "invoice_number_label": _str(),
         "invoice_total": _str(),
+        "posting_lines": _arr(_obj({
+            "account": _str(),
+            "amount": _str(),
+            "label": _str(),
+        })),
         "vendor": _obj({
             "id": _str(), "name": _str(), "address": _str(), "phone": _str(),
         }),
