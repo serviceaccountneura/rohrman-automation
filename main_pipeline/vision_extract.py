@@ -76,6 +76,22 @@ TABLES (most important — reproduce them faithfully):
   parts with a single space, number first. Do not add text from outside the field. Report it the
   same way every time, code included.
 
+THE INVOICE NUMBER AND THE INVOICE TOTAL -- decide these two yourself, from the whole page, and
+  put them in the top-level fields. Everything else stays a faithful transcription; these two are
+  your judgement of what the document means.
+  * `invoice_number`: the number this vendor uses to identify THIS bill, written as the rule above
+    says. When the page prints no invoice number, use the number that plays its part -- an
+    "Order #", "Document #" or "Ref #" printed in the header where an invoice number would be.
+    Never a customer, account, PO, phone or tracking number. "" when there is none.
+    `invoice_number_label`: the label printed beside the number you chose ("Invoice #", "Order #").
+  * `invoice_total`: the amount THIS invoice charges -- its own merchandise plus its own tax,
+    freight, shipping and handling. Not a merchandise-only line, not a subtotal, not an opening
+    or previous balance, and not a "payment due" or "balance due" that adds earlier balances to
+    this invoice. Example -- MERCHANDISE INVOICE TOTAL 20.00, SHIPPING & HANDLING 10.00, INVOICE
+    TOTAL 30.00, OPENING BALANCE 91.00, PAYMENT DUE 121.00: the invoice total is 30.00.
+    A plain number, no "$" or commas. A credit (printed "CR", in brackets or with a minus) is
+    negative: "-422.27". "" when no total can be read.
+
 THE VENDOR CODE (`vendor.id`): the dealership often writes or stamps its own code for the vendor
   on the invoice: a dealer number, a dash, then a vendor number ("1707-310"). Copy it into
   `vendor.id` exactly as written, and keep it in `handwritten_notes[]` too. Only that code -- never
@@ -294,6 +310,9 @@ def build_response_schema() -> types.Schema:
     label_value = _obj({"label": _str(), "value": _str()})
     return _obj({
         "document_type": _str(),
+        "invoice_number": _str(),
+        "invoice_number_label": _str(),
+        "invoice_total": _str(),
         "vendor": _obj({
             "id": _str(), "name": _str(), "address": _str(), "phone": _str(),
         }),

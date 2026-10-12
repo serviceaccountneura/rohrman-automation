@@ -190,6 +190,13 @@ def _clean_invoice_number(raw: str) -> str:
 
 
 def get_invoice_number(ocr: dict[str, Any]) -> str:
+    # Gemini's own answer first: it reads the page as a whole, so it knows the
+    # "Order #" is this vendor's invoice number where no invoice number is
+    # printed. The label rules below are for reads made before it was asked.
+    decided = _clean_invoice_number(str(ocr.get("invoice_number") or ""))
+    if decided:
+        return decided
+
     for id_entry in ocr.get("identifiers", []):
         label = (id_entry.get("label") or "").lower()
         if "invoice number" in label or "invoice #" in label or label == "invoice":
@@ -526,6 +533,17 @@ def _grand_total_raw(ocr: dict[str, Any]) -> Any:
     Shared by get_total_amount and is_credit_invoice, so the size of the total
     and whether it is a credit are read off the same figure.
     """
+    # Gemini's own answer first. It sees the layout, so it can tell the bill's
+    # total from a merchandise-only line, an opening balance or a payment due
+    # that adds earlier balances. Matching label words could not: "MERCHANDISE
+    # INVOICE TOTAL 20.00" contains "invoice total" and was taken for a $30.00
+    # invoice. The label rules below are the fallback for reads made before
+    # the model was asked, and for a total it could not give. Every flow still
+    # checks this figure against the GL lines or line items before posting.
+    decided = ocr.get("invoice_total")
+    if decided not in (None, "") and _parse_amount(decided):
+        return decided
+
     totals = ocr.get("totals") or []
 
     def raw_for(predicate) -> Any:
