@@ -1442,6 +1442,25 @@ def _run_purchase_order(
     sales_tax = ocr_helpers.get_sales_tax(ocr)
     line_items = ocr_helpers.get_raw_line_items(ocr)
 
+    # What a person corrected on "Re-run & manual edit" outranks what was read,
+    # as on OEM: the invoice number, and the GL accounts with their amounts
+    # (applied where the GL lines are chosen, below).
+    corrected = manual_overrides(doc) if doc.po_type == FOLDER_MISC else {}
+    if str(corrected.get("invoice_number") or "").strip():
+        doc.invoice_number = str(corrected["invoice_number"]).strip()
+    corrected_gl = [
+        {"gl_account": str(account).strip().upper(), "amount": amount, "description": None}
+        for account, amount in (
+            (a, signed_amount(v)) for a, v in (corrected.get("gl_annotations") or {}).items()
+        )
+        if str(account).strip() and amount is not None
+    ]
+    if corrected:
+        print(
+            f"[PIPE] {doc.id} Misc corrections applied: number={doc.invoice_number!r} "
+            f"gl={[(g['gl_account'], g['amount']) for g in corrected_gl]}"
+        )
+
     # ── MISC: posts straight away, like every other folder ────────────────
     #
     # Misc used to stop at AWAITING_REVIEW until a person approved the draft
@@ -1713,16 +1732,34 @@ def _run_purchase_order(
                 session.add(doc)
                 session.commit()
             else:
-                # Accounts and amounts written as a block outrank anything
-                # derived from the rows -- see get_gl_amount_splits.
+                # A person's corrections first, then what is written on the
+                # invoice -- see get_gl_amount_splits.
                 splits = [
                     GlSplitInput(
                         gl_account=sp["gl_account"],
                         amount=sp["amount"],
                         description=sp["description"],
                     )
-                    for sp in ocr_helpers.get_gl_amount_splits(ocr)
+                    for sp in (corrected_gl or ocr_helpers.get_gl_amount_splits(ocr))
                 ]
+                # Never guess the account, as on OEM. With nothing written, Misc
+                # used to fall back to accounts beside the rows and then to one
+                # chosen from the item descriptions. On staging 57 of 57 Misc
+                # invoices had their accounts written, so the guess only ever
+                # stood in for a miss. Reads from before posting_lines keep the
+                # old path.
+                if not splits and ocr_helpers.has_posting_lines(ocr):
+                    _fail(
+                        session,
+                        doc,
+                        EX_NO_GL_WRITTEN,
+                        error=(
+                            "No GL account was found written on this invoice, so nothing "
+                            "was posted. Add the account and amount on the correction "
+                            "form and run it again."
+                        ),
+                    )
+                    return
 
             # The GL lines must add up to the invoice before anything is sent.
             # Misc used to have a person approve every draft, and that was the
