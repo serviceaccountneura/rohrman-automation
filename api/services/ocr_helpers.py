@@ -190,6 +190,13 @@ def _clean_invoice_number(raw: str) -> str:
 
 
 def get_invoice_number(ocr: dict[str, Any]) -> str:
+    # Gemini's own answer first: it reads the page as a whole, so it knows the
+    # "Order #" is this vendor's invoice number where no invoice number is
+    # printed. The label rules below are for reads made before it was asked.
+    decided = _clean_invoice_number(str(ocr.get("invoice_number") or ""))
+    if decided:
+        return decided
+
     for id_entry in ocr.get("identifiers", []):
         label = (id_entry.get("label") or "").lower()
         if "invoice number" in label or "invoice #" in label or label == "invoice":
@@ -526,6 +533,17 @@ def _grand_total_raw(ocr: dict[str, Any]) -> Any:
     Shared by get_total_amount and is_credit_invoice, so the size of the total
     and whether it is a credit are read off the same figure.
     """
+    # Gemini's own answer first. It sees the layout, so it can tell the bill's
+    # total from a merchandise-only line, an opening balance or a payment due
+    # that adds earlier balances. Matching label words could not: "MERCHANDISE
+    # INVOICE TOTAL 20.00" contains "invoice total" and was taken for a $30.00
+    # invoice. The label rules below are the fallback for reads made before
+    # the model was asked, and for a total it could not give. Every flow still
+    # checks this figure against the GL lines or line items before posting.
+    decided = ocr.get("invoice_total")
+    if decided not in (None, "") and _parse_amount(decided):
+        return decided
+
     totals = ocr.get("totals") or []
 
     def raw_for(predicate) -> Any:
@@ -853,6 +871,49 @@ def gl_notes(ocr: dict[str, Any]) -> list[dict[str, Any]]:
     return found
 
 
+# An account as Gemini gives it in posting_lines: digits with an optional
+# trailing letter ("2410V"), which _GL_PATTERN's word boundary would reject.
+_POSTING_ACCOUNT = re.compile(r"(?<![\dA-Za-z])(\d{4,5}[A-Za-z]?)(?![\dA-Za-z])")
+
+
+def has_posting_lines(ocr: dict[str, Any]) -> bool:
+    """Whether this read carries Gemini's own posting lines.
+
+    Reads made before `posting_lines` was asked for do not, and fall back to
+    the transcription rules in get_gl_amount_splits.
+    """
+    return isinstance(ocr.get("posting_lines"), list)
+
+
+def get_posting_lines(ocr: dict[str, Any]) -> list[dict[str, Any]]:
+    """The GL accounts written on the invoice and the signed amount each takes.
+
+    Decided by Gemini from the whole page (see `posting_lines` in the vision
+    prompt): negative is a credit, and the lines add up to the signed invoice
+    total. Used as given -- no hunting through notes, no sign rules. The
+    flows still check the lines against the invoice total and the chart of
+    accounts before anything is posted.
+    """
+    lines: list[dict[str, Any]] = []
+    for line in ocr.get("posting_lines") or []:
+        if not isinstance(line, dict):
+            continue
+        match = _POSTING_ACCOUNT.search(str(line.get("account") or ""))
+        account = match.group(1).upper() if match else ""
+        raw = str(line.get("amount") or "").replace("$", "").replace(",", "").strip()
+        amount = _parse_amount(raw)
+        if not account or not amount:
+            continue
+        if _is_credit_value(raw):
+            amount = -amount
+        lines.append({
+            "gl_account": account,
+            "amount": round(amount, 2),
+            "description": str(line.get("label") or "") or None,
+        })
+    return lines
+
+
 def get_gl_amount_splits(ocr: dict[str, Any]) -> list[dict[str, Any]]:
     """GL accounts written on the invoice WITH the amount each one takes.
 
@@ -870,7 +931,16 @@ def get_gl_amount_splits(ocr: dict[str, Any]) -> list[dict[str, Any]]:
     Returns [] when the invoice carries no amounts against its accounts, which
     is the older style where a code sits beside a row and the split has to be
     worked out from the rows themselves.
+
+    A read that carries Gemini's own `posting_lines` uses those and nothing
+    else: everything below is the transcription-matching for older reads. On a
+    Honda credit memo the clerk's "Credit # 2410 $2,890.20" came back only as a
+    note, gl_mappings stayed empty, this returned [], and the account was
+    guessed from the parts as 2430.
     """
+    if has_posting_lines(ocr):
+        return get_posting_lines(ocr)
+
     notes = gl_notes(ocr)
     claimed: set[int] = set()
 
