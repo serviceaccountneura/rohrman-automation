@@ -6,7 +6,7 @@ upload folder decides which Tekion flow runs:
     SUBLET         -> Sublet PO   + pre-invoice   (api/routes/tekion.py)
     MISCELLANEOUS  -> Misc PO     + pre-invoice   (api/routes/tekion.py)
     STOCK          -> Vendor stock order          (api/routes/tekion.py)
-    OEM            -> Journal entry, saved as draft (api/services/je_creation.py)
+    OEM            -> Journal entry, posted or saved as draft by OEM_POST (api/services/je_creation.py)
     VEHICLE_MANUFACTURING -> Vehicle purchase journal entry from a
                       per-manufacturer template (api/services/vmi_je_creation.py)
 
@@ -141,6 +141,12 @@ EX_ZERO_TOTAL = "ZERO_TOTAL"
 # TESTING BRANCH: three readers voted on the invoice number and the handwritten
 # GL lines (api/services/confidence_read.py) and no two agreed on a value.
 EX_UNCLEAR_READING = "UNCLEAR_READING"
+# An OEM invoice with no GL account written on it. The account used to be
+# guessed from the parts, and on Honda credit memos marked "Credit # 2410" the
+# guess was 2430 -- posted, and not reversible. Every OEM invoice since 20 Sep
+# carried a handwritten account, so one without is a misread or a missing
+# annotation: either way a person decides, not a guess.
+EX_NO_GL_WRITTEN = "NO_GL_ACCOUNT_WRITTEN"
 
 _SEVERITY = {
     EX_OCR_FAILED: "HIGH",
@@ -159,6 +165,7 @@ _SEVERITY = {
     EX_GL_NOT_IN_CHART: "HIGH",
     EX_ZERO_TOTAL: "LOW",
     EX_UNCLEAR_READING: "HIGH",
+    EX_NO_GL_WRITTEN: "HIGH",
 }
 
 # Only OCR is retried, and only because it is free of side effects: reading a
@@ -816,7 +823,15 @@ def _record_postings(
 
 
 def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> None:
-    """Parts Manufacture Ticket -> journal entry, saved as a draft."""
+    """Parts Manufacture Ticket -> journal entry, posted or left as a draft.
+
+    OEM_POST decides (settings.oem_post): production posts, staging saves a
+    draft. Posting saves the clerk opening every draft and pressing Submit, the
+    one step of the SOP the automation otherwise leaves to them. A posted entry
+    cannot be undone in the UI, so everything that could refuse it -- the parts
+    reconciliation, the balance check -- runs first, and nothing is sent when
+    either says no.
+    """
     from api.routes.tekion import get_client, reset_client
     from api.services.je_creation import ExpectedJournalEntry, create_journal_entry
 
@@ -853,6 +868,22 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
             f"[PIPE] {doc.id} OEM corrections applied: number={invoice_number!r} "
             f"date={invoice_date!r} splits={[(s['gl_account'], s['amount']) for s in gl_splits]}"
         )
+
+    # Never guess the account. A read that carries Gemini's posting lines and
+    # found none means nothing is written on the invoice, or it was missed;
+    # either way a person says where it goes. Reads from before posting_lines
+    # keep the old path.
+    if not gl_splits and ocr_helpers.has_posting_lines(ocr):
+        _fail(
+            session,
+            doc,
+            EX_NO_GL_WRITTEN,
+            error=(
+                "No GL account was found written on this invoice, so nothing was posted. "
+                "Add the account and amount on the correction form and run it again."
+            ),
+        )
+        return
 
     # A CREDIT invoice runs the whole entry the other way.
     #
@@ -925,7 +956,9 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         # Serialized: create_journal_entry switches dealership on the shared client.
         with tekion_scope():
             client = get_client(session)
-            result = create_journal_entry(client, expected=expected, dry_run=False)
+            result = create_journal_entry(
+                client, expected=expected, dry_run=False, post=settings.oem_post
+            )
     except Exception as e:  # noqa: BLE001
         print(f"[PIPE] {doc.id} journal entry failed: {e}")
         reset_client()
@@ -974,7 +1007,12 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         _fail(session, doc, EX_UNBALANCED, error=f"balance ${result.balance:.2f}")
         return
     if not result.saved:
-        _fail(session, doc, EX_TEKION_ERROR, error="draft was not saved")
+        _fail(
+            session,
+            doc,
+            EX_TEKION_ERROR,
+            error="the entry was not posted" if settings.oem_post else "draft was not saved",
+        )
         return
 
     doc.transaction_id = result.transaction_id or ""
@@ -1504,6 +1542,25 @@ def _run_purchase_order(
     sales_tax = ocr_helpers.get_sales_tax(ocr)
     line_items = ocr_helpers.get_raw_line_items(ocr)
 
+    # What a person corrected on "Re-run & manual edit" outranks what was read,
+    # as on OEM: the invoice number, and the GL accounts with their amounts
+    # (applied where the GL lines are chosen, below).
+    corrected = manual_overrides(doc) if doc.po_type == FOLDER_MISC else {}
+    if str(corrected.get("invoice_number") or "").strip():
+        doc.invoice_number = str(corrected["invoice_number"]).strip()
+    corrected_gl = [
+        {"gl_account": str(account).strip().upper(), "amount": amount, "description": None}
+        for account, amount in (
+            (a, signed_amount(v)) for a, v in (corrected.get("gl_annotations") or {}).items()
+        )
+        if str(account).strip() and amount is not None
+    ]
+    if corrected:
+        print(
+            f"[PIPE] {doc.id} Misc corrections applied: number={doc.invoice_number!r} "
+            f"gl={[(g['gl_account'], g['amount']) for g in corrected_gl]}"
+        )
+
     # ── MISC: posts straight away, like every other folder ────────────────
     #
     # Misc used to stop at AWAITING_REVIEW until a person approved the draft
@@ -1775,16 +1832,34 @@ def _run_purchase_order(
                 session.add(doc)
                 session.commit()
             else:
-                # Accounts and amounts written as a block outrank anything
-                # derived from the rows -- see get_gl_amount_splits.
+                # A person's corrections first, then what is written on the
+                # invoice -- see get_gl_amount_splits.
                 splits = [
                     GlSplitInput(
                         gl_account=sp["gl_account"],
                         amount=sp["amount"],
                         description=sp["description"],
                     )
-                    for sp in ocr_helpers.get_gl_amount_splits(ocr)
+                    for sp in (corrected_gl or ocr_helpers.get_gl_amount_splits(ocr))
                 ]
+                # Never guess the account, as on OEM. With nothing written, Misc
+                # used to fall back to accounts beside the rows and then to one
+                # chosen from the item descriptions. On staging 57 of 57 Misc
+                # invoices had their accounts written, so the guess only ever
+                # stood in for a miss. Reads from before posting_lines keep the
+                # old path.
+                if not splits and ocr_helpers.has_posting_lines(ocr):
+                    _fail(
+                        session,
+                        doc,
+                        EX_NO_GL_WRITTEN,
+                        error=(
+                            "No GL account was found written on this invoice, so nothing "
+                            "was posted. Add the account and amount on the correction "
+                            "form and run it again."
+                        ),
+                    )
+                    return
 
             # The GL lines must add up to the invoice before anything is sent.
             # Misc used to have a person approve every draft, and that was the

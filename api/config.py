@@ -73,6 +73,11 @@ class Settings(BaseSettings):
     # it off.
     confidence_read: bool = True
     confidence_model: str = "gemini-2.5-pro"
+    # OEM stock orders: post the journal entry to Tekion (true) or leave it as
+    # a draft for a clerk to submit (false). Posting cannot be undone in
+    # Tekion, so the default is a draft. Production sets OEM_POST=true; staging
+    # leaves it false. The only difference between the two is this env value.
+    oem_post: bool = False
 
     # ── Frontend ──────────────────────────────────────────────────────────────
     frontend_url: str = "http://localhost:3000"
