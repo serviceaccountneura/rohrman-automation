@@ -353,7 +353,9 @@ def _gl_total_disagrees(ocr: dict[str, Any]) -> list[str]:
         voted = round(sum(float(ln["amount"]["final"]) for ln in lines), 2)
     except (TypeError, ValueError, KeyError):
         return []
-    if abs(voted - round(float(total), 2)) <= 0.01:
+    # Signed: a credit memo's lines are negative and so is its total.
+    signed_total = -round(float(total), 2) if ocr_helpers.is_credit_invoice(ocr) else round(float(total), 2)
+    if abs(voted - signed_total) <= 0.01:
         return []
     readings = []
     for ln in lines:
@@ -361,7 +363,7 @@ def _gl_total_disagrees(ocr: dict[str, Any]) -> list[str]:
         readings.append(", ".join(f"{name} {said[r]!r}" for r, name in (
             ("flash", "Gemini 3.6 Flash"), ("pro", "Gemini 2.5 Pro"), ("paddle", "PaddleOCR")) if said.get(r)))
     return [
-        f"GL amounts (${voted:,.2f}) against the invoice total (${float(total):,.2f}); "
+        f"GL amounts (${voted:,.2f}) against the invoice total (${signed_total:,.2f}); "
         f"the readers read {'; '.join(readings)}"
     ]
 
