@@ -342,6 +342,11 @@ def _gl_total_disagrees(ocr: dict[str, Any]) -> list[str]:
     [] when they match, when there are no handwritten GL lines, or when no
     total was read; otherwise one line saying both figures and what each
     reader read, for the UNCLEAR_READING message.
+
+    Compared on magnitude: ``get_total_amount`` is always positive, while a
+    credit memo's handwritten GL lines are negative (e.g. 2410 → −900 against
+    TOTAL CREDIT AMOUNT 900). Subtracting those as signed numbers treated a
+    correct Toyota credit as UNCLEAR_READING (−900 vs +900).
     """
     votes = (ocr.get("_confidence") or {}).get("votes") or {}
     lines = votes.get("gl_lines") or []
@@ -352,7 +357,7 @@ def _gl_total_disagrees(ocr: dict[str, Any]) -> list[str]:
         voted = round(sum(float(ln["amount"]["final"]) for ln in lines), 2)
     except (TypeError, ValueError, KeyError):
         return []
-    if abs(voted - round(float(total), 2)) <= 0.01:
+    if abs(abs(voted) - abs(round(float(total), 2))) <= 0.01:
         return []
     readings = []
     for ln in lines:
