@@ -1,20 +1,23 @@
-"""Three readers vote on the fields that decide where money goes.
+"""Five readers vote on the fields that decide where money goes.
 
 TESTING BRANCH (staging-test-gemini-2.5pro-confidence-score).
 
 The invoice number and every handwritten GL account and amount are read by
-three independent readers:
+five independent readers:
 
     Gemini 3.6 Flash   the main read of the whole invoice
     Gemini 2.5 Pro     this module's read, with a confidence per character,
                        and a box around each value on the page
-    PaddleOCR          a text-recognition model (not a language model) that
-                       reads the crops inside 2.5 Pro's boxes -- see paddle_ocr/
+    PaddleOCR          a text-recognition model that reads the crops inside
+                       2.5 Pro's boxes -- see paddle_ocr/
+    Tesseract          classical OCR on the same crops (also used elsewhere
+                       only for page orientation)
+    Docling            IBM Docling on those same crops (RapidOCR backend)
 
 A value two readers agree on is used. When no two agree, the document stops
 with UNCLEAR_READING for a person to check, rather than posting a guess.
 
-Why three: a single model can be completely sure of a misreading. On a Toyota
+Why a vote: a single model can be completely sure of a misreading. On a Toyota
 invoice 2.5 Pro read a handwritten 474.56 as 474.50 at 100% confidence; Flash
 read 474.56. The per-character confidence did not catch it -- disagreement did.
 
@@ -35,14 +38,20 @@ read carries on alone, without a vote.
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import io
 import json
 import math
 import os
 import re
+import shutil
+import subprocess
+import tempfile
+import threading
 import time
 import urllib.request
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any
 
 from google.genai import types
@@ -50,14 +59,19 @@ from google.genai import types
 from api.config import settings
 
 PROMPT = """You are reading a scanned vendor invoice that a dealership clerk has annotated by hand.
-Return only two things.
+Return three things.
 
 1. `invoice_number`: everything printed in the invoice-number field, as one value: the number,
    plus any short letter code printed with it in that field -- beside it on the same line
    ("6101029 RI") or directly beneath it ("331937" with "HOM" under it is "331937 HOM").
    Number first, parts joined by one space. "" when there is none.
 
-2. `gl_lines`: each General Ledger account the clerk wrote or stamped on the invoice with an
+2. `invoice_total`: the printed amount the dealership owes on this invoice -- the grand total /
+   amount due / pay-this-amount figure, tax included. As a plain number: no "$", no commas,
+   a decimal point before the cents. Leading "-" only when the invoice is a credit.
+   Not a subtotal, tax line, merchandise-only total, or opening balance. "" when there is none.
+
+3. `gl_lines`: each General Ledger account the clerk wrote or stamped on the invoice with an
    amount beside it, one entry per written line, in the order written:
    * `account`: the account number exactly as written, digits (and a trailing letter) only.
    * `amount`: the amount as written, as a plain number: no "$", no commas, a decimal point
@@ -70,9 +84,9 @@ Return only two things.
 For every value also give where it is on the page, so another reader can check it:
    * `page`: the page number it is on, starting at 1.
    * `box_2d`: [ymin, xmin, ymax, xmax] normalised to 0-1000, drawn tightly around that value
-     alone -- `invoice_number_box` around the invoice number, `account_box` around the
-     handwritten account (with its # sign), `amount_box` around the handwritten amount
-     (with its cents, raised or not).
+     alone -- `invoice_number_box` around the invoice number, `invoice_total_box` around the
+     printed total amount, `account_box` around the handwritten account (with its # sign),
+     `amount_box` around the handwritten amount (with its cents, raised or not).
 
 Read every digit from the page itself. Do not guess or complete a number from what is usual."""
 
@@ -87,6 +101,9 @@ def _schema() -> types.Schema:
             "invoice_number": s(type=t.STRING),
             "invoice_number_page": s(type=t.INTEGER),
             "invoice_number_box": box,
+            "invoice_total": s(type=t.STRING),
+            "invoice_total_page": s(type=t.INTEGER),
+            "invoice_total_box": box,
             "gl_lines": s(
                 type=t.ARRAY,
                 items=s(
@@ -103,7 +120,7 @@ def _schema() -> types.Schema:
                 ),
             ),
         },
-        required=["invoice_number", "gl_lines"],
+        required=["invoice_number", "invoice_total", "gl_lines"],
     )
 
 
@@ -121,8 +138,10 @@ def _value_spans(text: str) -> dict[str, Any]:
         return [m.span(1) for m in re.finditer(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', text)]
 
     inv = spans("invoice_number")
+    tot = spans("invoice_total")
     return {
         "invoice_number": inv[0] if inv else None,
+        "invoice_total": tot[0] if tot else None,
         "account": spans("account"),
         "amount": spans("amount"),
         "label": spans("label"),
@@ -180,17 +199,39 @@ def _crop(images: list, page: Any, box: Any):
     return crop
 
 
+def _png_b64(crop) -> str:
+    buf = io.BytesIO()
+    crop.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def _pack_crop_reads(results: list[dict | None], n_lines: int, seconds: float) -> dict[str, Any]:
+    """Invoice number/total + per-line account/amount dict from a flat crop-result list.
+
+    Crop order: invoice_number, invoice_total, then account/amount pairs per GL line.
+    """
+    return {
+        "invoice_number": results[0] if results else None,
+        "invoice_total": results[1] if len(results) > 1 else None,
+        "gl_lines": [
+            {
+                "account": results[2 + 2 * i] if 2 + 2 * i < len(results) else None,
+                "amount": results[3 + 2 * i] if 3 + 2 * i < len(results) else None,
+            }
+            for i in range(n_lines)
+        ],
+        "seconds": seconds,
+        "available": any(r is not None for r in results),
+    }
+
+
 def _paddle(crops: list) -> list[dict | None]:
     """PaddleOCR's reading of each crop, in order; None where it could not read."""
     url = os.environ.get("PADDLE_OCR_URL", "")
     usable = [c for c in crops if c is not None]
     if not url or not usable:
         return [None] * len(crops)
-    payload = []
-    for crop in usable:
-        buf = io.BytesIO()
-        crop.save(buf, format="PNG")
-        payload.append(base64.b64encode(buf.getvalue()).decode())
+    payload = [_png_b64(c) for c in usable]
     try:
         req = urllib.request.Request(
             f"{url}/read",
@@ -199,15 +240,234 @@ def _paddle(crops: list) -> list[dict | None]:
         )
         with urllib.request.urlopen(req, timeout=60) as resp:
             results = json.loads(resp.read()).get("results") or []
-    except Exception as e:  # noqa: BLE001 -- the vote goes ahead with two readers
+    except Exception as e:  # noqa: BLE001 -- the vote goes ahead with the other readers
         print(f"[OCR] PaddleOCR unavailable: {e}")
         return [None] * len(crops)
     it = iter(results)
     return [next(it, None) if c is not None else None for c in crops]
 
 
+def _tesseract_one(crop) -> dict | None:
+    """One crop through Tesseract (single text line). None if tesseract is missing."""
+    if shutil.which("tesseract") is None:
+        return None
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "crop.png"
+        crop.save(path)
+        try:
+            out = subprocess.run(
+                ["tesseract", str(path), "stdout", "--psm", "7"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+    text = (out.stdout or "").strip().splitlines()
+    value = (text[0] if text else "").strip()
+    if not value:
+        return None
+    return {"text": value, "score": None}
+
+
+def _tesseract(crops: list) -> list[dict | None]:
+    """Tesseract on each crop; None where it could not read."""
+    if shutil.which("tesseract") is None:
+        return [None] * len(crops)
+    out: list[dict | None] = []
+    for crop in crops:
+        if crop is None:
+            out.append(None)
+            continue
+        try:
+            out.append(_tesseract_one(crop))
+        except Exception as e:  # noqa: BLE001
+            print(f"[OCR] Tesseract crop failed: {e}")
+            out.append(None)
+    return out
+
+
+# Docling loads layout + RapidOCR models once; reuse across crops/jobs.
+# Pro boxes are tiny; RapidOCR's detector often returns empty on them unless
+# we upscale and OCR the full crop (FULL_PAGE), with a direct RapidOCR fallback.
+_DOCLING_MIN_LONG_SIDE = 400
+_docling_converter = None
+_docling_rapid = None
+_docling_lock = threading.Lock()
+_docling_failed = False
+
+
+def _prepare_docling_crop(crop):
+    """RGB crop, padded and enlarged so RapidOCR's detector can find text."""
+    from PIL import Image, ImageOps
+
+    img = crop.convert("RGB")
+    # Margin so strokes are not flush against the edge (detector often skips those).
+    img = ImageOps.expand(img, border=12, fill=(255, 255, 255))
+    w, h = img.size
+    long_side = max(w, h)
+    if long_side < _DOCLING_MIN_LONG_SIDE:
+        scale = _DOCLING_MIN_LONG_SIDE / long_side
+        img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.Resampling.LANCZOS)
+    return img
+
+
+def _get_docling_converter():
+    """Lazy DocumentConverter for IMAGE crops, or None if Docling is unusable."""
+    global _docling_converter, _docling_failed
+    if _docling_failed:
+        return None
+    if _docling_converter is not None:
+        return _docling_converter
+    with _docling_lock:
+        if _docling_failed:
+            return None
+        if _docling_converter is not None:
+            return _docling_converter
+        try:
+            from docling.datamodel.base_models import InputFormat
+            from docling.datamodel.pipeline_options import OcrMode, PdfPipelineOptions, RapidOcrOptions
+            from docling.document_converter import DocumentConverter, ImageFormatOption
+
+            opts = PdfPipelineOptions(do_ocr=True, do_table_structure=False)
+            # FULL_PAGE: do not wait for layout to propose OCR boxes on a tiny crop.
+            # scale=2: RapidOCR's detector needs more pixels on single-field crops.
+            opts.ocr_options = RapidOcrOptions(mode=OcrMode.FULL_PAGE, scale=2.0)
+            _docling_converter = DocumentConverter(
+                format_options={
+                    InputFormat.IMAGE: ImageFormatOption(pipeline_options=opts),
+                }
+            )
+        except Exception as e:  # noqa: BLE001
+            _docling_failed = True
+            print(f"[OCR] Docling unavailable: {e}")
+            return None
+        return _docling_converter
+
+
+def _get_docling_rapid():
+    """Same RapidOCR engine Docling uses, for a direct fallback on empty crops."""
+    global _docling_rapid
+    if _docling_rapid is not None:
+        return _docling_rapid
+    with _docling_lock:
+        if _docling_rapid is not None:
+            return _docling_rapid
+        try:
+            from rapidocr import RapidOCR
+
+            _docling_rapid = RapidOCR()
+        except Exception as e:  # noqa: BLE001
+            print(f"[OCR] Docling RapidOCR fallback unavailable: {e}")
+            return None
+        return _docling_rapid
+
+
+def _docling_extract_text(result) -> str:
+    """Plain text from a Docling ConversionResult."""
+    texts: list[str] = []
+    try:
+        for item, _level in result.document.iterate_items():
+            t = getattr(item, "text", None)
+            if t and str(t).strip():
+                texts.append(str(t).strip())
+    except Exception:  # noqa: BLE001
+        pass
+    if texts:
+        return " ".join(texts)
+    try:
+        md = result.document.export_to_markdown() or ""
+    except Exception:  # noqa: BLE001
+        return ""
+    lines = []
+    for ln in md.splitlines():
+        s = ln.strip()
+        if not s or s.startswith("<!--"):
+            continue
+        lines.append(s.lstrip("#").strip())
+    return " ".join(x for x in lines if x)
+
+
+def _rapidocr_direct(prepared) -> dict | None:
+    """Read one prepared crop with RapidOCR (Docling's OCR backend) directly."""
+    engine = _get_docling_rapid()
+    if engine is None:
+        return None
+    try:
+        import numpy as np
+
+        out = engine(np.asarray(prepared))
+        txts = getattr(out, "txts", None) or ()
+        scores = getattr(out, "scores", None) or ()
+        if not txts:
+            return None
+        text = " ".join(str(t).strip() for t in txts if str(t).strip())
+        if not text:
+            return None
+        score = float(scores[0]) if scores else None
+        return {"text": text, "score": score}
+    except Exception as e:  # noqa: BLE001
+        print(f"[OCR] Docling RapidOCR fallback failed: {e}")
+        return None
+
+
+def _docling_one(crop) -> dict | None:
+    """One crop through Docling; RapidOCR direct if Docling returns nothing."""
+    prepared = _prepare_docling_crop(crop)
+    converter = _get_docling_converter()
+    if converter is not None:
+        try:
+            from docling.datamodel.base_models import DocumentStream
+
+            buf = io.BytesIO()
+            prepared.save(buf, format="PNG")
+            buf.seek(0)
+            # Converter is not documented as thread-safe; serialize converts.
+            with _docling_lock:
+                result = converter.convert(DocumentStream(name="crop.png", stream=buf))
+            value = _docling_extract_text(result).strip()
+            if value:
+                first = value.splitlines()[0].strip() if "\n" in value else value
+                return {"text": first or value, "score": None}
+        except Exception as e:  # noqa: BLE001
+            print(f"[OCR] Docling crop failed: {e}")
+    return _rapidocr_direct(prepared)
+
+
+def _docling(crops: list) -> list[dict | None]:
+    """Docling on each crop; None where it could not read."""
+    # Probe once so a missing install shows as unavailable rather than N silent Nones.
+    if _get_docling_converter() is None and _get_docling_rapid() is None:
+        return [None] * len(crops)
+    out: list[dict | None] = []
+    for crop in crops:
+        if crop is None:
+            out.append(None)
+            continue
+        out.append(_docling_one(crop))
+    return out
+
+
+def _crop_readers(crops: list, n_lines: int) -> dict[str, dict[str, Any]]:
+    """Paddle, Tesseract and Docling on the same Pro boxes, in parallel."""
+    started = time.monotonic()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        fut_paddle = pool.submit(_paddle, crops)
+        fut_tess = pool.submit(_tesseract, crops)
+        fut_docling = pool.submit(_docling, crops)
+        paddle = fut_paddle.result()
+        tess = fut_tess.result()
+        docling = fut_docling.result()
+    # Each reader's wall time is roughly the parallel block; report that once so
+    # the log stays readable (individual engines share the same wait).
+    elapsed = round(time.monotonic() - started, 1)
+    return {
+        "paddle": _pack_crop_reads(paddle, n_lines, elapsed),
+        "tesseract": _pack_crop_reads(tess, n_lines, elapsed),
+        "docling": _pack_crop_reads(docling, n_lines, elapsed),
+    }
+
+
 def read(images: list, parts: list[types.Part], client: Any) -> dict[str, Any]:
-    """Invoice number and handwritten GL lines from 2.5 Pro and PaddleOCR.
+    """Invoice number and handwritten GL lines from 2.5 Pro and crop OCRs.
 
     `images` and `parts` are the page images exactly as the main read gets
     them -- PIL images for cropping, and the same images as request parts.
@@ -269,36 +529,42 @@ def read(images: list, parts: list[types.Part], client: Any) -> dict[str, Any]:
             "label": str(line.get("label") or ""),
         })
 
-    # PaddleOCR reads what 2.5 Pro boxed: the invoice number, then each line's
-    # account and amount.
-    crops = [_crop(images, parsed.get("invoice_number_page"), parsed.get("invoice_number_box"))]
+    # Crop OCRs read what 2.5 Pro boxed: invoice number, invoice total, then
+    # each line's account and amount.
+    crops = [
+        _crop(images, parsed.get("invoice_number_page"), parsed.get("invoice_number_box")),
+        _crop(images, parsed.get("invoice_total_page"), parsed.get("invoice_total_box")),
+    ]
     for line in raw_lines:
         crops.append(_crop(images, line.get("page"), line.get("account_box")))
         crops.append(_crop(images, line.get("page"), line.get("amount_box")))
-    paddle_started = time.monotonic()
-    paddle = _paddle(crops)
-    paddle_reads = {
-        "invoice_number": paddle[0],
-        "gl_lines": [
-            {"account": paddle[1 + 2 * i], "amount": paddle[2 + 2 * i]} for i in range(len(raw_lines))
-        ],
-        "seconds": round(time.monotonic() - paddle_started, 1),
-        "available": any(p is not None for p in paddle),
-    }
+    pro_done = time.monotonic()
+    crop_reads = _crop_readers(crops, len(raw_lines))
 
     return {
         "model": model,
-        "seconds": round(paddle_started - started, 1),
+        "seconds": round(pro_done - started, 1),
         "invoice_number": _field(str(parsed.get("invoice_number") or ""), spans["invoice_number"], tokens),
+        "invoice_total": _field(str(parsed.get("invoice_total") or ""), spans["invoice_total"], tokens),
         "gl_lines": lines,
-        "paddle": paddle_reads,
+        "paddle": crop_reads["paddle"],
+        "tesseract": crop_reads["tesseract"],
+        "docling": crop_reads["docling"],
     }
 
 
 # ── The vote ─────────────────────────────────────────────────────────────────
 
-READERS = ("flash", "pro", "paddle")
-READER_NAMES = {"flash": "Gemini 3.6 Flash", "pro": "Gemini 2.5 Pro", "paddle": "PaddleOCR"}
+READERS = ("flash", "pro", "paddle", "tesseract", "docling")
+READER_NAMES = {
+    "flash": "Gemini 3.6 Flash",
+    "pro": "Gemini 2.5 Pro",
+    "paddle": "PaddleOCR",
+    "tesseract": "Tesseract",
+    "docling": "Docling",
+}
+# Prefer Gemini's formatting when reporting the agreed value.
+_FINAL_PREFERRED = ("flash", "pro", "paddle", "tesseract", "docling")
 
 
 def _account_key(raw: str) -> str:
@@ -373,7 +639,7 @@ def _vote(kind: str, reads: dict[str, dict | None]) -> dict[str, Any]:
     agreed = len(best) >= 2
     final = ""
     if best:
-        source = next((r for r in ("flash", "pro", "paddle") if r in best), best[0])
+        source = next((r for r in _FINAL_PREFERRED if r in best), best[0])
         final = str(present[source]["value"]).strip()
         if kind == "account":
             final = _account_key(final)
@@ -403,31 +669,54 @@ def apply(doc: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
         for g in doc.get("gl_mappings") or []
     ]
     flash_invoice = ocr_helpers.get_invoice_number(doc)
-    second["flash"] = {"invoice_number": flash_invoice, "gl_lines": flash_lines}
+    flash_total_amt = ocr_helpers.get_total_amount(doc)
+    flash_total = f"{flash_total_amt:.2f}" if flash_total_amt else ""
+    second["flash"] = {
+        "invoice_number": flash_invoice,
+        "invoice_total": flash_total,
+        "gl_lines": flash_lines,
+    }
     second["unresolved"] = []
     if second.get("error"):
         second["votes"] = None
         return doc
 
     paddle = second.get("paddle") or {}
+    tesseract = second.get("tesseract") or {}
+    docling = second.get("docling") or {}
     pro_lines = second.get("gl_lines") or []
 
     def pro_read(field: dict) -> dict | None:
         return {"value": field.get("value", ""), "confidence": field.get("confidence")} if field else None
 
-    def paddle_read(p: dict | None) -> dict | None:
+    def crop_read(p: dict | None) -> dict | None:
         return {"value": p.get("text", ""), "score": p.get("score")} if p else None
+
+    def line_at(blob: dict, i: int) -> dict:
+        lines = blob.get("gl_lines") or []
+        return lines[i] if i < len(lines) else {}
 
     invoice_vote = _vote("invoice", {
         "flash": {"value": flash_invoice} if flash_invoice else None,
         "pro": pro_read(second.get("invoice_number") or {}),
-        "paddle": paddle_read(paddle.get("invoice_number")),
+        "paddle": crop_read(paddle.get("invoice_number")),
+        "tesseract": crop_read(tesseract.get("invoice_number")),
+        "docling": crop_read(docling.get("invoice_number")),
+    })
+
+    total_vote = _vote("amount", {
+        "flash": {"value": flash_total} if flash_total else None,
+        "pro": pro_read(second.get("invoice_total") or {}),
+        "paddle": crop_read(paddle.get("invoice_total")),
+        "tesseract": crop_read(tesseract.get("invoice_total")),
+        "docling": crop_read(docling.get("invoice_total")),
     })
 
     # Lines are matched by account where the readers agree on it, otherwise by
     # position; a line only one Gemini reader found still gets a slot.
     unmatched_flash = list(range(len(flash_lines)))
     line_votes = []
+    empty_readers = {r: None for r in READERS if r != "flash"}
     for i, pro in enumerate(pro_lines):
         match = next((j for j in unmatched_flash
                       if _agree("account", flash_lines[j]["account"], pro["account"]["value"])), None)
@@ -436,30 +725,39 @@ def apply(doc: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
         if match is not None:
             unmatched_flash.remove(match)
         flash = flash_lines[match] if match is not None else None
-        paddle_lines = paddle.get("gl_lines") or []
-        pad = paddle_lines[i] if i < len(paddle_lines) else {}
+        pad = line_at(paddle, i)
+        tess = line_at(tesseract, i)
+        dlg = line_at(docling, i)
         line_votes.append({
             "label": pro.get("label") or (flash or {}).get("label", ""),
             "account": _vote("account", {
                 "flash": {"value": flash["account"]} if flash else None,
                 "pro": pro_read(pro["account"]),
-                "paddle": paddle_read((pad or {}).get("account")),
+                "paddle": crop_read((pad or {}).get("account")),
+                "tesseract": crop_read((tess or {}).get("account")),
+                "docling": crop_read((dlg or {}).get("account")),
             }),
             "amount": _vote("amount", {
                 "flash": {"value": flash["amount"]} if flash else None,
                 "pro": pro_read(pro["amount"]),
-                "paddle": paddle_read((pad or {}).get("amount")),
+                "paddle": crop_read((pad or {}).get("amount")),
+                "tesseract": crop_read((tess or {}).get("amount")),
+                "docling": crop_read((dlg or {}).get("amount")),
             }),
         })
     for j in unmatched_flash:
         flash = flash_lines[j]
         line_votes.append({
             "label": flash["label"],
-            "account": _vote("account", {"flash": {"value": flash["account"]}, "pro": None, "paddle": None}),
-            "amount": _vote("amount", {"flash": {"value": flash["amount"]}, "pro": None, "paddle": None}),
+            "account": _vote("account", {"flash": {"value": flash["account"]}, **empty_readers}),
+            "amount": _vote("amount", {"flash": {"value": flash["amount"]}, **empty_readers}),
         })
 
-    second["votes"] = {"invoice_number": invoice_vote, "gl_lines": line_votes}
+    second["votes"] = {
+        "invoice_number": invoice_vote,
+        "invoice_total": total_vote,
+        "gl_lines": line_votes,
+    }
 
     def describe(vote: dict) -> str:
         said = [f"{READER_NAMES[r]} {vote['readers'][r]['value']!r}"
@@ -469,6 +767,8 @@ def apply(doc: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
     unresolved = []
     if invoice_vote["of"] and not invoice_vote["confident"]:
         unresolved.append(f"invoice number ({describe(invoice_vote)})")
+    if total_vote["of"] and not total_vote["confident"]:
+        unresolved.append(f"invoice total ({describe(total_vote)})")
     for n, line in enumerate(line_votes, start=1):
         for kind in ("account", "amount"):
             if not line[kind]["confident"]:
@@ -484,6 +784,9 @@ def apply(doc: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
             or "date" in str(i.get("label") or "").lower()
         ]
         doc["identifiers"] = [{"label": "Invoice Number", "value": invoice_vote["final"]}, *idents]
+
+    if total_vote["confident"] and total_vote["final"]:
+        doc["invoice_total"] = total_vote["final"]
 
     agreed_lines = [
         ln for ln in line_votes if ln["account"]["confident"] and ln["amount"]["confident"]

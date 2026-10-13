@@ -7,9 +7,11 @@ requires-python = ">=3.13"
 dependencies = [
     "alembic>=1.18.5",
     "boto3>=1.43.67",
+    "docling>=2.138.0",
     "fastapi[standard]>=0.140.13",
     "flask>=3.1.3",
     "google-genai>=2.12.1",
+    "onnxruntime>=1.31.0",
     "opencv-python-headless>=4.10",
     "passlib[argon2]>=1.7.4",
     "pillow>=12.3.0",

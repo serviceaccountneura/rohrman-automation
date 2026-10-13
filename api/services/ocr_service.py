@@ -143,14 +143,29 @@ def extract_document(
             votes = second.get("votes") or {}
             summary = [f"invoice {votes['invoice_number']['final'] or '?'} "
                        f"{votes['invoice_number']['agree']}/{votes['invoice_number']['of']}"]
+            if votes.get("invoice_total"):
+                tot = votes["invoice_total"]
+                summary.append(
+                    f"total {tot['final'] or '?'} {tot['agree']}/{tot['of']}"
+                )
             summary += [
                 f"#{ln['account']['final'] or '?'} {ln['account']['agree']}/{ln['account']['of']} "
                 f"{ln['amount']['final'] or '?'} {ln['amount']['agree']}/{ln['amount']['of']}"
                 for ln in votes.get("gl_lines") or []
             ]
+            def _crop_note(key: str, label: str) -> str:
+                blob = second.get(key) or {}
+                if blob.get("available"):
+                    return f"{label} {blob.get('seconds')}s"
+                return f"{label} unavailable"
+
+            crop_notes = ", ".join([
+                _crop_note("paddle", "PaddleOCR"),
+                _crop_note("tesseract", "Tesseract"),
+                _crop_note("docling", "Docling"),
+            ])
             print(
-                f"[OCR] vote (2.5 Pro {second.get('seconds')}s, PaddleOCR "
-                f"{'%ss' % second['paddle']['seconds'] if second['paddle']['available'] else 'unavailable'}): "
+                f"[OCR] vote (2.5 Pro {second.get('seconds')}s; {crop_notes}): "
                 + ", ".join(summary)
                 + (f" -- UNRESOLVED: {'; '.join(second['unresolved'])}" if second.get("unresolved") else "")
             )

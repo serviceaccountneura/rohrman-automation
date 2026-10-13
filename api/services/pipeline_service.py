@@ -362,8 +362,17 @@ def _gl_total_disagrees(ocr: dict[str, Any]) -> list[str]:
     readings = []
     for ln in lines:
         said = {r: (v or {}).get("value") for r, v in ln["amount"]["readers"].items() if v}
-        readings.append(", ".join(f"{name} {said[r]!r}" for r, name in (
-            ("flash", "Gemini 3.6 Flash"), ("pro", "Gemini 2.5 Pro"), ("paddle", "PaddleOCR")) if said.get(r)))
+        readings.append(", ".join(
+            f"{name} {said[r]!r}"
+            for r, name in (
+                ("flash", "Gemini 3.6 Flash"),
+                ("pro", "Gemini 2.5 Pro"),
+                ("paddle", "PaddleOCR"),
+                ("tesseract", "Tesseract"),
+                ("docling", "Docling"),
+            )
+            if said.get(r)
+        ))
     return [
         f"GL amounts (${voted:,.2f}) against the invoice total (${float(total):,.2f}); "
         f"the readers read {'; '.join(readings)}"
