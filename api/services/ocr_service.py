@@ -80,21 +80,32 @@ def extract_document(
         page_orientation.upright(img, f"{path.name} page {i}") if straighten else img
         for i, img in enumerate(_load_for_reading(path), start=1)
     ]
-    # Then cleaned up for reading -- the copy Gemini sees, nothing else.
+    # VLM enhance for Gemini; a parallel OCR finish (same geometry) for crop
+    # readers. Preview stores what Gemini saw.
+    ocr_images: list | None = None
     if settings.ocr_enhance:
-        images = page_enhance.enhance_pages(images)
+        if settings.confidence_read:
+            images, ocr_images = page_enhance.enhance_pages_pair(images)
+        else:
+            images = page_enhance.enhance_pages(images)
         if pages_out is not None:
             pages_out.extend(images)
     parts = [pil_to_part(img) for img in images]
 
-    # The confidence read runs alongside the main one, on the same pages, so
-    # it adds no time unless it is the slower of the two.
+    # The confidence read runs alongside the main one. Pro boxes on VLM pages;
+    # Paddle / Tesseract / Docling crop the OCR-finished pages.
     second_read = None
     if settings.confidence_read:
         from concurrent.futures import ThreadPoolExecutor
 
         pool = ThreadPoolExecutor(max_workers=1)
-        second_read = pool.submit(confidence_read.read, list(images), list(parts), client)
+        second_read = pool.submit(
+            confidence_read.read,
+            list(images),
+            list(parts),
+            client,
+            list(ocr_images) if ocr_images is not None else None,
+        )
         pool.shutdown(wait=False)
 
     parts.append(types.Part.from_text(text=VISION_PROMPT))

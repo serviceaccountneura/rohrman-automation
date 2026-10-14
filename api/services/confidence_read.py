@@ -173,14 +173,30 @@ def _field(value: str, span: tuple[int, int] | None, tokens: list[dict]) -> dict
 
 # ── PaddleOCR ────────────────────────────────────────────────────────────────
 
-# The recognition model reads a line about 48 px high, so a crop from the
-# enlarged, cleaned-up page is shrunk first: the same reading, a fraction of
-# the bytes sent and the memory used.
-_CROP_MAX_SIDE = 1000
+# Crop OCRs: upscale small Pro boxes so recognition has enough pixels, then
+# shrink only if a crop is huge. Field kind drives margins / prep / cleanup.
+_CROP_MAX_SIDE = 1200
+_CROP_MIN_LONG_SIDE = {
+    "invoice": 360,
+    "total": 360,
+    "account": 420,
+    "amount": 480,
+}
+_CROP_PAD = {
+    # (vertical_frac, horizontal_frac) around Pro's box.
+    "invoice": (0.25, 0.06),
+    "total": (0.30, 0.10),
+    "account": (0.35, 0.20),
+    "amount": (0.40, 0.22),
+}
 
 
-def _crop(images: list, page: Any, box: Any):
-    """The region 2.5 Pro boxed, with a margin so no stroke is cut off. None if unusable."""
+def _crop(images: list, page: Any, box: Any, kind: str = "invoice"):
+    """The region 2.5 Pro boxed, with a margin so no stroke is cut off. None if unusable.
+
+    ``images`` should be the OCR-finished pages (same geometry as the VLM
+    pages Pro boxed on). See page_enhance.enhance_pages_pair.
+    """
     try:
         img = images[max(int(page or 1), 1) - 1]
         y0, x0, y1, x1 = [min(max(float(v), 0.0), 1000.0) / 1000 for v in box]
@@ -189,14 +205,49 @@ def _crop(images: list, page: Any, box: Any):
     if y1 <= y0 or x1 <= x0:
         return None
     w, h = img.size
-    ph, pw = (y1 - y0) * 0.2, (x1 - x0) * 0.08
+    ph, pw = _CROP_PAD.get(kind, (0.25, 0.10))
+    ph, pw = (y1 - y0) * ph, (x1 - x0) * pw
     left, top = int(max(x0 - pw, 0) * w), int(max(y0 - ph, 0) * h)
     right, bottom = int(min(x1 + pw, 1) * w), int(min(y1 + ph, 1) * h)
     if right - left < 8 or bottom - top < 8:
         return None
     crop = img.crop((left, top, right, bottom)).convert("RGB")
-    crop.thumbnail((_CROP_MAX_SIDE, _CROP_MAX_SIDE))
-    return crop
+    return _prep_ocr_crop(crop, kind)
+
+
+def _prep_ocr_crop(crop, kind: str):
+    """Field-aware crop polish before Paddle / Tesseract / Docling."""
+    import cv2
+    import numpy as np
+    from PIL import Image, ImageOps
+
+    img = ImageOps.expand(crop.convert("RGB"), border=10, fill=(255, 255, 255))
+    w, h = img.size
+    target = _CROP_MIN_LONG_SIDE.get(kind, 400)
+    long_side = max(w, h)
+    if long_side < target:
+        scale = target / long_side
+        img = img.resize(
+            (max(1, round(w * scale)), max(1, round(h * scale))),
+            Image.Resampling.LANCZOS,
+        )
+    if max(img.size) > _CROP_MAX_SIDE:
+        img.thumbnail((_CROP_MAX_SIDE, _CROP_MAX_SIDE))
+
+    arr = np.array(img.convert("L"))
+    # Printed totals / invoice numbers: light adaptive binary lifts gray fills.
+    # Handwritten account / amount: keep continuous grayscale so strokes survive.
+    if kind in ("invoice", "total"):
+        block = 31 if min(arr.shape[:2]) < 400 else 41
+        if block % 2 == 0:
+            block += 1
+        arr = cv2.adaptiveThreshold(
+            arr, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, block, 11
+        )
+    else:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+        arr = clahe.apply(arr)
+    return Image.fromarray(arr).convert("RGB")
 
 
 def _png_b64(crop) -> str:
@@ -205,23 +256,87 @@ def _png_b64(crop) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def _pack_crop_reads(results: list[dict | None], n_lines: int, seconds: float) -> dict[str, Any]:
+def _clean_ocr_text(kind: str, text: str) -> str:
+    """Strip labels / noise engines pick up around the real value."""
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    if kind == "invoice":
+        # Drop printed labels ("Invoice Number:", "eNumbe r:") then keep the
+        # longest invoice-like token. Join a split tail ("800923912 59A") but
+        # do not glue a lone label digit ("2 …8009…").
+        cleaned = re.sub(
+            r"(?i)\b(invoice|inv|number|no|num|#)\b[:.\s]*",
+            " ",
+            raw,
+        )
+        text = cleaned.upper()
+        text = re.sub(r"(\d{5,})\s+(\d{1,3}[A-Z]?)\b", r"\1\2", text)
+        tokens = re.findall(r"[A-Z]{0,4}\d{5,}[A-Z0-9]*", text)
+        if tokens:
+            return max(tokens, key=len)
+        return re.sub(r"[^A-Z0-9]", "", text)
+    if kind == "total" or kind == "amount":
+        # Raised cents often come back as "$ 26 22" → 26.22.
+        raised = re.search(r"\$\s*(\d{1,6})\s+(\d{2})\b", raw)
+        if raised:
+            return f"{raised.group(1)}.{raised.group(2)}"
+        # Prefer $…N.NN, then any N.NN, so "56 $361.56" does not glue.
+        money = re.findall(r"\$\s*(\d{1,3}(?:,\d{3})*\.\d{2}|\d+\.\d{2})", raw)
+        if money:
+            return money[-1].replace(",", "")
+        dotted = re.findall(r"\d+\.\d{2}", raw)
+        if dotted:
+            return dotted[-1]
+        whole = re.findall(r"\$\s*(\d{1,3}(?:,\d{3})*)\b", raw)
+        if whole:
+            return whole[-1].replace(",", "")
+        digits = re.sub(r"[^\d.]", "", raw)
+        return digits
+    if kind == "account":
+        m = re.search(r"#?\s*(\d{3,6}[A-Za-z]?)", raw)
+        return m.group(1).upper() if m else re.sub(r"[^\dA-Za-z]", "", raw)
+    return raw
+
+
+def _annotate_crop_result(result: dict | None, kind: str) -> dict | None:
+    if not result:
+        return None
+    cleaned = _clean_ocr_text(kind, result.get("text", ""))
+    if not cleaned:
+        return None
+    out = dict(result)
+    out["text"] = cleaned
+    return out
+
+
+def _pack_crop_reads(
+    results: list[dict | None],
+    n_lines: int,
+    seconds: float,
+    kinds: list[str] | None = None,
+) -> dict[str, Any]:
     """Invoice number/total + per-line account/amount dict from a flat crop-result list.
 
     Crop order: invoice_number, invoice_total, then account/amount pairs per GL line.
     """
+    kinds = kinds or (["invoice", "total"] + ["account", "amount"] * n_lines)
+    cleaned = [
+        _annotate_crop_result(r, kinds[i] if i < len(kinds) else "invoice")
+        for i, r in enumerate(results)
+    ]
     return {
-        "invoice_number": results[0] if results else None,
-        "invoice_total": results[1] if len(results) > 1 else None,
+        "invoice_number": cleaned[0] if cleaned else None,
+        "invoice_total": cleaned[1] if len(cleaned) > 1 else None,
         "gl_lines": [
             {
-                "account": results[2 + 2 * i] if 2 + 2 * i < len(results) else None,
-                "amount": results[3 + 2 * i] if 3 + 2 * i < len(results) else None,
+                "account": cleaned[2 + 2 * i] if 2 + 2 * i < len(cleaned) else None,
+                "amount": cleaned[3 + 2 * i] if 3 + 2 * i < len(cleaned) else None,
             }
             for i in range(n_lines)
         ],
         "seconds": seconds,
-        "available": any(r is not None for r in results),
+        "available": any(r is not None for r in cleaned),
     }
 
 
@@ -247,38 +362,59 @@ def _paddle(crops: list) -> list[dict | None]:
     return [next(it, None) if c is not None else None for c in crops]
 
 
-def _tesseract_one(crop) -> dict | None:
-    """One crop through Tesseract (single text line). None if tesseract is missing."""
+_TESS_WHITELIST = {
+    "invoice": "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-",
+    "total": "0123456789.$,-",
+    "account": "0123456789#ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+    "amount": "0123456789.$,-CR",
+}
+
+
+def _tesseract_one(crop, kind: str = "invoice") -> dict | None:
+    """One crop through Tesseract. Tries a couple of PSMs; keeps the denser read."""
     if shutil.which("tesseract") is None:
         return None
+    whitelist = _TESS_WHITELIST.get(kind, _TESS_WHITELIST["invoice"])
+    candidates: list[str] = []
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "crop.png"
         crop.save(path)
-        try:
-            out = subprocess.run(
-                ["tesseract", str(path), "stdout", "--psm", "7"],
-                capture_output=True, text=True, timeout=30,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return None
-    text = (out.stdout or "").strip().splitlines()
-    value = (text[0] if text else "").strip()
-    if not value:
+        for psm in ("7", "8", "13"):
+            try:
+                out = subprocess.run(
+                    [
+                        "tesseract", str(path), "stdout",
+                        "--psm", psm,
+                        "-c", f"tessedit_char_whitelist={whitelist}",
+                    ],
+                    capture_output=True, text=True, timeout=30,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            value = (out.stdout or "").strip().splitlines()
+            text = (value[0] if value else "").strip()
+            if text:
+                candidates.append(text)
+    if not candidates:
         return None
-    return {"text": value, "score": None}
+    # Prefer the candidate that cleans to the richest field value.
+    best = max(candidates, key=lambda t: len(_clean_ocr_text(kind, t) or t))
+    return {"text": best, "score": None}
 
 
-def _tesseract(crops: list) -> list[dict | None]:
+def _tesseract(crops: list, kinds: list[str] | None = None) -> list[dict | None]:
     """Tesseract on each crop; None where it could not read."""
     if shutil.which("tesseract") is None:
         return [None] * len(crops)
+    kinds = kinds or ["invoice"] * len(crops)
     out: list[dict | None] = []
-    for crop in crops:
+    for i, crop in enumerate(crops):
         if crop is None:
             out.append(None)
             continue
+        kind = kinds[i] if i < len(kinds) else "invoice"
         try:
-            out.append(_tesseract_one(crop))
+            out.append(_tesseract_one(crop, kind))
         except Exception as e:  # noqa: BLE001
             print(f"[OCR] Tesseract crop failed: {e}")
             out.append(None)
@@ -446,12 +582,17 @@ def _docling(crops: list) -> list[dict | None]:
     return out
 
 
+def _crop_kinds(n_lines: int) -> list[str]:
+    return ["invoice", "total"] + [k for _ in range(n_lines) for k in ("account", "amount")]
+
+
 def _crop_readers(crops: list, n_lines: int) -> dict[str, dict[str, Any]]:
     """Paddle, Tesseract and Docling on the same Pro boxes, in parallel."""
+    kinds = _crop_kinds(n_lines)
     started = time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         fut_paddle = pool.submit(_paddle, crops)
-        fut_tess = pool.submit(_tesseract, crops)
+        fut_tess = pool.submit(_tesseract, crops, kinds)
         fut_docling = pool.submit(_docling, crops)
         paddle = fut_paddle.result()
         tess = fut_tess.result()
@@ -460,20 +601,28 @@ def _crop_readers(crops: list, n_lines: int) -> dict[str, dict[str, Any]]:
     # the log stays readable (individual engines share the same wait).
     elapsed = round(time.monotonic() - started, 1)
     return {
-        "paddle": _pack_crop_reads(paddle, n_lines, elapsed),
-        "tesseract": _pack_crop_reads(tess, n_lines, elapsed),
-        "docling": _pack_crop_reads(docling, n_lines, elapsed),
+        "paddle": _pack_crop_reads(paddle, n_lines, elapsed, kinds),
+        "tesseract": _pack_crop_reads(tess, n_lines, elapsed, kinds),
+        "docling": _pack_crop_reads(docling, n_lines, elapsed, kinds),
     }
 
 
-def read(images: list, parts: list[types.Part], client: Any) -> dict[str, Any]:
+def read(
+    images: list,
+    parts: list[types.Part],
+    client: Any,
+    ocr_images: list | None = None,
+) -> dict[str, Any]:
     """Invoice number and handwritten GL lines from 2.5 Pro and crop OCRs.
 
-    `images` and `parts` are the page images exactly as the main read gets
-    them -- PIL images for cropping, and the same images as request parts.
+    `images` / `parts` are the VLM-finished pages Gemini and 2.5 Pro see.
+    `ocr_images`, when given, are the OCR-finished pages with the same
+    geometry -- crop readers use those so gray-on-gray print is binarised.
+    Falls back to `images` when no OCR finish was produced (enhance off).
     """
     started = time.monotonic()
     model = settings.confidence_model
+    crop_pages = ocr_images if ocr_images is not None else images
     try:
         resp = client.models.generate_content(
             model=model,
@@ -529,15 +678,14 @@ def read(images: list, parts: list[types.Part], client: Any) -> dict[str, Any]:
             "label": str(line.get("label") or ""),
         })
 
-    # Crop OCRs read what 2.5 Pro boxed: invoice number, invoice total, then
-    # each line's account and amount.
+    # Crop OCRs read what 2.5 Pro boxed, from the OCR-finished pages.
     crops = [
-        _crop(images, parsed.get("invoice_number_page"), parsed.get("invoice_number_box")),
-        _crop(images, parsed.get("invoice_total_page"), parsed.get("invoice_total_box")),
+        _crop(crop_pages, parsed.get("invoice_number_page"), parsed.get("invoice_number_box"), "invoice"),
+        _crop(crop_pages, parsed.get("invoice_total_page"), parsed.get("invoice_total_box"), "total"),
     ]
     for line in raw_lines:
-        crops.append(_crop(images, line.get("page"), line.get("account_box")))
-        crops.append(_crop(images, line.get("page"), line.get("amount_box")))
+        crops.append(_crop(crop_pages, line.get("page"), line.get("account_box"), "account"))
+        crops.append(_crop(crop_pages, line.get("page"), line.get("amount_box"), "amount"))
     pro_done = time.monotonic()
     crop_reads = _crop_readers(crops, len(raw_lines))
 
@@ -599,7 +747,9 @@ def _amount_cents(raw: str) -> set[int]:
 
 
 def _invoice_key(raw: str) -> str:
-    return re.sub(r"[^A-Z0-9]", "", str(raw or "").upper())
+    """Normalise an invoice reading; prefer the invoice-like token over labels."""
+    cleaned = _clean_ocr_text("invoice", raw)
+    return re.sub(r"[^A-Z0-9]", "", (cleaned or str(raw or "")).upper())
 
 
 def _agree(kind: str, a: str, b: str) -> bool:
@@ -612,7 +762,9 @@ def _agree(kind: str, a: str, b: str) -> bool:
             len(kb) == len(ka) + 1 and kb == "1" + ka
         )
     if kind == "amount":
-        return bool(_amount_cents(a) & _amount_cents(b))
+        # Clean first so "56 $361.56" / "$361" compare on the money token.
+        ca, cb = _clean_ocr_text("amount", a), _clean_ocr_text("amount", b)
+        return bool(_amount_cents(ca or a) & _amount_cents(cb or b))
     ka, kb = _invoice_key(a), _invoice_key(b)
     if not ka or not kb:
         return False
@@ -620,7 +772,12 @@ def _agree(kind: str, a: str, b: str) -> bool:
         return True
     # PaddleOCR's crop can take in part of the printed label ("er: 99100200901").
     longer, shorter = (ka, kb) if len(ka) > len(kb) else (kb, ka)
-    return len(shorter) >= 4 and longer.endswith(shorter) and longer[: -len(shorter)].isalpha()
+    if len(shorter) >= 4 and longer.endswith(shorter) and longer[: -len(shorter)].isalpha():
+        return True
+    # One reader glued a leading digit from the label ("2NUMBER8009…").
+    if len(shorter) >= 6 and shorter in longer:
+        return True
+    return False
 
 
 def _vote(kind: str, reads: dict[str, dict | None]) -> dict[str, Any]:
