@@ -64,29 +64,37 @@ Return three things.
 1. `invoice_number`: everything printed in the invoice-number field, as one value: the number,
    plus any short letter code printed with it in that field -- beside it on the same line
    ("6101029 RI") or directly beneath it ("331937" with "HOM" under it is "331937 HOM").
-   Number first, parts joined by one space. "" when there is none.
+   Number first, parts joined by one space. When the page prints no invoice number, the number
+   that plays its part -- an "Order #", "Document #" or "Ref #" in the header. Never a customer,
+   account, PO, phone or tracking number. "" when there is none.
 
 2. `invoice_total`: the printed amount the dealership owes on this invoice -- the grand total /
    amount due / pay-this-amount figure, tax included. As a plain number: no "$", no commas,
    a decimal point before the cents. Leading "-" only when the invoice is a credit.
    Not a subtotal, tax line, merchandise-only total, or opening balance. "" when there is none.
 
-3. `gl_lines`: each General Ledger account the clerk wrote or stamped on the invoice with an
-   amount beside it, one entry per written line, in the order written:
-   * `account`: the account number exactly as written, digits (and a trailing letter) only.
-   * `amount`: the amount as written, as a plain number: no "$", no commas, a decimal point
-     before the cents (raised or underlined cents become decimals), and a leading "-" only when
-     a minus is written in front of the amount.
-   * `label`: any word written beside the account ("Tires", "Freight"), or "".
-   Printed GL codes in a line-item table are not clerk annotations: leave them out.
-   [] when nothing is written.
+3. `gl_lines`: where the clerk says this invoice is to be posted -- each General Ledger account
+   written or stamped on the invoice, with the amount it takes, one entry per account line, in
+   the order written:
+   * `account`: the account number alone, digits (and a trailing letter) only.
+   * `amount`: a plain signed number: no "$", no commas, a decimal point before the cents (raised
+     or underlined cents become decimals). Positive = a charge to the account. Negative = a credit
+     to it: on a credit memo (its total printed "CR", in brackets or negative), and wherever the
+     clerk writes "Credit", "CR" or a minus by the line. On a credit memo every line is negative
+     unless the clerk marks one otherwise.
+   * An account written with no amount: if it is the only account, it takes the invoice total;
+     accounts written beside individual rows take the sum of their rows.
+   * `label`: any word written with the line ("Tires", "Credit", "Freight"), or "".
+   A dealer-vendor code ("1707-446"), a part number, a PO number or a printed GL code in a
+   line-item table is not a posting line. [] when no account is written.
 
 For every value also give where it is on the page, so another reader can check it:
    * `page`: the page number it is on, starting at 1.
    * `box_2d`: [ymin, xmin, ymax, xmax] normalised to 0-1000, drawn tightly around that value
      alone -- `invoice_number_box` around the invoice number, `invoice_total_box` around the
      printed total amount, `account_box` around the handwritten account (with its # sign),
-     `amount_box` around the handwritten amount (with its cents, raised or not).
+     `amount_box` around the handwritten amount (with its cents, raised or not) -- or, for an
+     account written with no amount, around the printed figure it takes.
 
 Read every digit from the page itself. Do not guess or complete a number from what is usual."""
 
@@ -184,7 +192,11 @@ _CROP_MIN_LONG_SIDE = {
 }
 _CROP_PAD = {
     # (vertical_frac, horizontal_frac) around Pro's box.
-    "invoice": (0.25, 0.06),
+    # The invoice number's box is often drawn too tight and cuts the number
+    # ("er: 8009299" for 80092991314A), so it is widened well past it; the
+    # printed label it then takes in is allowed for in _agree. Much wider and
+    # PaddleOCR starts reading the neighbouring text instead ("Taeb").
+    "invoice": (0.25, 0.30),
     "total": (0.30, 0.10),
     "account": (0.35, 0.20),
     "amount": (0.40, 0.22),
@@ -678,7 +690,8 @@ def read(
             "label": str(line.get("label") or ""),
         })
 
-    # Crop OCRs read what 2.5 Pro boxed, from the OCR-finished pages.
+    # Crop OCRs read what 2.5 Pro boxed, from the OCR-finished pages: the
+    # invoice number, the invoice total, then each line's account and amount.
     crops = [
         _crop(crop_pages, parsed.get("invoice_number_page"), parsed.get("invoice_number_box"), "invoice"),
         _crop(crop_pages, parsed.get("invoice_total_page"), parsed.get("invoice_total_box"), "total"),
@@ -746,10 +759,23 @@ def _amount_cents(raw: str) -> set[int]:
     return options
 
 
-def _invoice_key(raw: str) -> str:
-    """Normalise an invoice reading; prefer the invoice-like token over labels."""
+def _is_negative(raw: str) -> bool:
+    cents = _amount_cents(raw)
+    return bool(cents) and min(cents) < 0
+
+
+def _invoice_text(raw: str) -> str:
+    """An invoice reading with labels stripped, as printed: letters stay letters."""
     cleaned = _clean_ocr_text("invoice", raw)
     return re.sub(r"[^A-Z0-9]", "", (cleaned or str(raw or "")).upper())
+
+
+def _invoice_key(raw: str) -> str:
+    """For comparing readings only. Letter O and zero, and letter I and one,
+    are one character here: Honda prints "080OAR46377", and two readers that
+    differ only there ("0800AR46377") are reading the same print. The value
+    kept is still Flash's own, as read."""
+    return _invoice_text(raw).replace("O", "0").replace("I", "1")
 
 
 def _agree(kind: str, a: str, b: str) -> bool:
@@ -763,21 +789,27 @@ def _agree(kind: str, a: str, b: str) -> bool:
         )
     if kind == "amount":
         # Clean first so "56 $361.56" / "$361" compare on the money token.
+        # Then by size. The sign is not always written: "Credit # 2410
+        # $2,890.20" on a credit memo is -2,890.20 to both Gemini readers,
+        # which know the invoice is a credit, and 2890.20 to PaddleOCR, which
+        # reads only the crop. _vote takes the sign from the Gemini readers.
         ca, cb = _clean_ocr_text("amount", a), _clean_ocr_text("amount", b)
-        return bool(_amount_cents(ca or a) & _amount_cents(cb or b))
+        sizes_a = {abs(x) for x in _amount_cents(ca or a)}
+        sizes_b = {abs(x) for x in _amount_cents(cb or b)}
+        return bool(sizes_a & sizes_b)
     ka, kb = _invoice_key(a), _invoice_key(b)
     if not ka or not kb:
         return False
     if ka == kb:
         return True
     # PaddleOCR's crop can take in part of the printed label ("er: 99100200901").
-    longer, shorter = (ka, kb) if len(ka) > len(kb) else (kb, ka)
-    if len(shorter) >= 4 and longer.endswith(shorter) and longer[: -len(shorter)].isalpha():
+    # The label is checked as printed: _invoice_key turns its O and I into digits.
+    (longer, raw), shorter = ((ka, a), kb) if len(ka) > len(kb) else ((kb, b), ka)
+    label = _invoice_text(raw)[: len(longer) - len(shorter)]
+    if len(shorter) >= 4 and longer.endswith(shorter) and label.isalpha():
         return True
     # One reader glued a leading digit from the label ("2NUMBER8009…").
-    if len(shorter) >= 6 and shorter in longer:
-        return True
-    return False
+    return len(shorter) >= 6 and shorter in longer
 
 
 def _vote(kind: str, reads: dict[str, dict | None]) -> dict[str, Any]:
@@ -794,6 +826,13 @@ def _vote(kind: str, reads: dict[str, dict | None]) -> dict[str, Any]:
         if len(group) > len(best):
             best = group
     agreed = len(best) >= 2
+    if agreed and kind == "amount":
+        # The Gemini readers in the agreeing group must agree on the sign too:
+        # the same figure as a charge to one and a credit to the other is not
+        # agreement on what to post.
+        signs = {_is_negative(present[r]["value"]) for r in best if r in ("flash", "pro")}
+        if len(signs) > 1:
+            agreed = False
     final = ""
     if best:
         source = next((r for r in _FINAL_PREFERRED if r in best), best[0])
@@ -820,10 +859,11 @@ def apply(doc: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
     """
     from api.services import ocr_helpers
 
+    # Flash's own answer: its posting lines, signed (ocr_helpers.get_posting_lines).
     flash_lines = [
-        {"account": str(g.get("gl_account") or ""), "amount": str(g.get("amount") or ""),
-         "label": str(g.get("mapped_description") or "")}
-        for g in doc.get("gl_mappings") or []
+        {"account": str(g["gl_account"]), "amount": f"{g['amount']:.2f}",
+         "label": str(g.get("description") or "")}
+        for g in ocr_helpers.get_gl_amount_splits(doc)
     ]
     flash_invoice = ocr_helpers.get_invoice_number(doc)
     flash_total_amt = ocr_helpers.get_total_amount(doc)
@@ -934,13 +974,11 @@ def apply(doc: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
 
     # What two readers agreed on goes into the main read. A value they did not
     # agree on keeps Flash's reading there -- the document stops anyway.
+    # get_invoice_number and get_gl_amount_splits read the model's own answers
+    # first (`invoice_number`, `posting_lines`), so that is where the agreed
+    # values go.
     if invoice_vote["confident"] and invoice_vote["final"] != flash_invoice:
-        idents = [
-            i for i in (doc.get("identifiers") or [])
-            if "invoice" not in str(i.get("label") or "").lower()
-            or "date" in str(i.get("label") or "").lower()
-        ]
-        doc["identifiers"] = [{"label": "Invoice Number", "value": invoice_vote["final"]}, *idents]
+        doc["invoice_number"] = invoice_vote["final"]
 
     if total_vote["confident"] and total_vote["final"]:
         doc["invoice_total"] = total_vote["final"]
@@ -949,18 +987,9 @@ def apply(doc: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
         ln for ln in line_votes if ln["account"]["confident"] and ln["amount"]["confident"]
     ]
     if agreed_lines and len(agreed_lines) == len(line_votes):
-        doc["gl_mappings"] = [
-            {"gl_account": ln["account"]["final"], "amount": ln["amount"]["final"],
-             "mapped_description": ln["label"] or None}
+        doc["posting_lines"] = [
+            {"account": ln["account"]["final"], "amount": ln["amount"]["final"],
+             "label": ln["label"] or ""}
             for ln in agreed_lines
-        ]
-        # The sign is also read from the notes (ocr_helpers.gl_notes), so the
-        # GL lines there are replaced too; every other note is kept.
-        kept = [
-            n for n in doc.get("handwritten_notes") or []
-            if not any(ocr_helpers._NOTE_GL_LINE.match(x) for x in ocr_helpers.note_lines(n))
-        ]
-        doc["handwritten_notes"] = kept + [
-            f"#{ln['account']['final']} {ln['amount']['final']}" for ln in agreed_lines
         ]
     return doc
