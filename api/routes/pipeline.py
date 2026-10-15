@@ -398,15 +398,11 @@ def decide_purchase_order(
     payload: PoDecisionRequest,
     session: Annotated[Session, Depends(get_session)],
 ) -> PipelineStatusResponse:
-    """Say whether to invoice the existing purchase order or raise a new one.
+    """Confirm pre-invoicing the existing purchase order (legacy PO_DECISION).
 
-    The document is held in PO_DECISION because it names a PO that already
-    exists in Tekion, and posting against an order somebody else raised is not
-    a call the pipeline makes on its own.
-
-    The choice applies to THIS run only. A later upload of the same invoice is
-    asked again rather than inheriting a decision made about different
-    paperwork.
+    New Sublet/Misc uploads no longer stop here -- they reuse the named PO
+    automatically. This endpoint remains for documents already held in
+    PO_DECISION before that change. Creating a new PO is no longer offered.
     """
     doc = session.get(Document, job_queue.resolve_id(session, document_id))
     if doc is None:
@@ -416,13 +412,20 @@ def decide_purchase_order(
             status_code=409,
             detail=f"Document is {doc.status}, not awaiting a purchase order decision",
         )
+    if payload.choice != "existing":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Creating a new purchase order is turned off for Sublet and "
+                "Miscellaneous. Use the existing Tekion PO, or raise a PO in "
+                "Tekion yourself and re-upload the invoice."
+            ),
+        )
 
-    choice = (
-        po_reuse.CHOICE_EXISTING
-        if payload.choice == "existing"
-        else po_reuse.CHOICE_NEW
+    return _to_status(
+        job_queue.resolve_po_decision(session, doc, po_reuse.CHOICE_EXISTING),
+        session=session,
     )
-    return _to_status(job_queue.resolve_po_decision(session, doc, choice), session=session)
 
 
 @router.post("/jobs/{document_id}/rerun", response_model=PipelineStatusResponse)
