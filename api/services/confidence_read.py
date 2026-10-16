@@ -1,18 +1,18 @@
-"""Five readers vote on the fields that decide where money goes.
+"""Three readers vote on the fields that decide where money goes.
 
 TESTING BRANCH (staging-test-gemini-2.5pro-confidence-score).
 
-The invoice number and every handwritten GL account and amount are read by
-five independent readers:
+The invoice number, the invoice total and every handwritten GL account and
+amount are read by three independent readers:
 
     Gemini 3.6 Flash   the main read of the whole invoice
     Gemini 2.5 Pro     this module's read, with a confidence per character,
                        and a box around each value on the page
-    PaddleOCR          a text-recognition model that reads the crops inside
-                       2.5 Pro's boxes -- see paddle_ocr/
-    Tesseract          classical OCR on the same crops (also used elsewhere
-                       only for page orientation)
-    Docling            IBM Docling on those same crops (RapidOCR backend)
+    Docling            IBM Docling on the crops inside 2.5 Pro's boxes
+                       (RapidOCR backend)
+
+Tesseract is not a voter; it only detects page orientation
+(page_orientation.py). PaddleOCR is not used.
 
 A value two readers agree on is used. When no two agree, the document stops
 with UNCLEAR_READING for a person to check, rather than posting a guess.
@@ -37,21 +37,13 @@ read carries on alone, without a vote.
 """
 from __future__ import annotations
 
-import base64
-import concurrent.futures
 import io
 import json
 import math
-import os
 import re
-import shutil
-import subprocess
-import tempfile
 import threading
 import time
-import urllib.request
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
 from typing import Any
 
 from google.genai import types
@@ -179,9 +171,9 @@ def _field(value: str, span: tuple[int, int] | None, tokens: list[dict]) -> dict
     return out
 
 
-# ── PaddleOCR ────────────────────────────────────────────────────────────────
+# ── Crops for Docling ────────────────────────────────────────────────────────
 
-# Crop OCRs: upscale small Pro boxes so recognition has enough pixels, then
+# Crop OCR: upscale small Pro boxes so recognition has enough pixels, then
 # shrink only if a crop is huge. Field kind drives margins / prep / cleanup.
 _CROP_MAX_SIDE = 1200
 _CROP_MIN_LONG_SIDE = {
@@ -195,7 +187,7 @@ _CROP_PAD = {
     # The invoice number's box is often drawn too tight and cuts the number
     # ("er: 8009299" for 80092991314A), so it is widened well past it; the
     # printed label it then takes in is allowed for in _agree. Much wider and
-    # PaddleOCR starts reading the neighbouring text instead ("Taeb").
+    # the crop OCR starts reading the neighbouring text instead ("Taeb").
     "invoice": (0.25, 0.30),
     "total": (0.30, 0.10),
     "account": (0.35, 0.20),
@@ -228,7 +220,7 @@ def _crop(images: list, page: Any, box: Any, kind: str = "invoice"):
 
 
 def _prep_ocr_crop(crop, kind: str):
-    """Field-aware crop polish before Paddle / Tesseract / Docling."""
+    """Field-aware crop polish before Docling."""
     import cv2
     import numpy as np
     from PIL import Image, ImageOps
@@ -260,12 +252,6 @@ def _prep_ocr_crop(crop, kind: str):
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
         arr = clahe.apply(arr)
     return Image.fromarray(arr).convert("RGB")
-
-
-def _png_b64(crop) -> str:
-    buf = io.BytesIO()
-    crop.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode()
 
 
 def _clean_ocr_text(kind: str, text: str) -> str:
@@ -350,87 +336,6 @@ def _pack_crop_reads(
         "seconds": seconds,
         "available": any(r is not None for r in cleaned),
     }
-
-
-def _paddle(crops: list) -> list[dict | None]:
-    """PaddleOCR's reading of each crop, in order; None where it could not read."""
-    url = os.environ.get("PADDLE_OCR_URL", "")
-    usable = [c for c in crops if c is not None]
-    if not url or not usable:
-        return [None] * len(crops)
-    payload = [_png_b64(c) for c in usable]
-    try:
-        req = urllib.request.Request(
-            f"{url}/read",
-            data=json.dumps({"images": payload}).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            results = json.loads(resp.read()).get("results") or []
-    except Exception as e:  # noqa: BLE001 -- the vote goes ahead with the other readers
-        print(f"[OCR] PaddleOCR unavailable: {e}")
-        return [None] * len(crops)
-    it = iter(results)
-    return [next(it, None) if c is not None else None for c in crops]
-
-
-_TESS_WHITELIST = {
-    "invoice": "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-",
-    "total": "0123456789.$,-",
-    "account": "0123456789#ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
-    "amount": "0123456789.$,-CR",
-}
-
-
-def _tesseract_one(crop, kind: str = "invoice") -> dict | None:
-    """One crop through Tesseract. Tries a couple of PSMs; keeps the denser read."""
-    if shutil.which("tesseract") is None:
-        return None
-    whitelist = _TESS_WHITELIST.get(kind, _TESS_WHITELIST["invoice"])
-    candidates: list[str] = []
-    with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "crop.png"
-        crop.save(path)
-        for psm in ("7", "8", "13"):
-            try:
-                out = subprocess.run(
-                    [
-                        "tesseract", str(path), "stdout",
-                        "--psm", psm,
-                        "-c", f"tessedit_char_whitelist={whitelist}",
-                    ],
-                    capture_output=True, text=True, timeout=30,
-                )
-            except (OSError, subprocess.SubprocessError):
-                continue
-            value = (out.stdout or "").strip().splitlines()
-            text = (value[0] if value else "").strip()
-            if text:
-                candidates.append(text)
-    if not candidates:
-        return None
-    # Prefer the candidate that cleans to the richest field value.
-    best = max(candidates, key=lambda t: len(_clean_ocr_text(kind, t) or t))
-    return {"text": best, "score": None}
-
-
-def _tesseract(crops: list, kinds: list[str] | None = None) -> list[dict | None]:
-    """Tesseract on each crop; None where it could not read."""
-    if shutil.which("tesseract") is None:
-        return [None] * len(crops)
-    kinds = kinds or ["invoice"] * len(crops)
-    out: list[dict | None] = []
-    for i, crop in enumerate(crops):
-        if crop is None:
-            out.append(None)
-            continue
-        kind = kinds[i] if i < len(kinds) else "invoice"
-        try:
-            out.append(_tesseract_one(crop, kind))
-        except Exception as e:  # noqa: BLE001
-            print(f"[OCR] Tesseract crop failed: {e}")
-            out.append(None)
-    return out
 
 
 # Docling loads layout + RapidOCR models once; reuse across crops/jobs.
@@ -599,24 +504,12 @@ def _crop_kinds(n_lines: int) -> list[str]:
 
 
 def _crop_readers(crops: list, n_lines: int) -> dict[str, dict[str, Any]]:
-    """Paddle, Tesseract and Docling on the same Pro boxes, in parallel."""
+    """Docling on the Pro boxes."""
     kinds = _crop_kinds(n_lines)
     started = time.monotonic()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-        fut_paddle = pool.submit(_paddle, crops)
-        fut_tess = pool.submit(_tesseract, crops, kinds)
-        fut_docling = pool.submit(_docling, crops)
-        paddle = fut_paddle.result()
-        tess = fut_tess.result()
-        docling = fut_docling.result()
-    # Each reader's wall time is roughly the parallel block; report that once so
-    # the log stays readable (individual engines share the same wait).
+    docling = _docling(crops)
     elapsed = round(time.monotonic() - started, 1)
-    return {
-        "paddle": _pack_crop_reads(paddle, n_lines, elapsed, kinds),
-        "tesseract": _pack_crop_reads(tess, n_lines, elapsed, kinds),
-        "docling": _pack_crop_reads(docling, n_lines, elapsed, kinds),
-    }
+    return {"docling": _pack_crop_reads(docling, n_lines, elapsed, kinds)}
 
 
 def read(
@@ -708,24 +601,20 @@ def read(
         "invoice_number": _field(str(parsed.get("invoice_number") or ""), spans["invoice_number"], tokens),
         "invoice_total": _field(str(parsed.get("invoice_total") or ""), spans["invoice_total"], tokens),
         "gl_lines": lines,
-        "paddle": crop_reads["paddle"],
-        "tesseract": crop_reads["tesseract"],
         "docling": crop_reads["docling"],
     }
 
 
 # ── The vote ─────────────────────────────────────────────────────────────────
 
-READERS = ("flash", "pro", "paddle", "tesseract", "docling")
+READERS = ("flash", "pro", "docling")
 READER_NAMES = {
     "flash": "Gemini 3.6 Flash",
     "pro": "Gemini 2.5 Pro",
-    "paddle": "PaddleOCR",
-    "tesseract": "Tesseract",
     "docling": "Docling",
 }
 # Prefer Gemini's formatting when reporting the agreed value.
-_FINAL_PREFERRED = ("flash", "pro", "paddle", "tesseract", "docling")
+_FINAL_PREFERRED = ("flash", "pro", "docling")
 
 
 def _account_key(raw: str) -> str:
@@ -739,7 +628,7 @@ def _amount_cents(raw: str) -> set[int]:
 
     A reading with a decimal point means one thing. Without one it may be
     whole dollars ("339") or have its cents raised with the point left out --
-    PaddleOCR reads a handwritten $225^95 as "$22595" -- so both count.
+    a crop OCR reads a handwritten $225^95 as "$22595" -- so both count.
     """
     text = str(raw or "").strip()
     negative = text.startswith("-") or text.startswith("(") or "CR" in text.upper()
@@ -783,7 +672,7 @@ def _agree(kind: str, a: str, b: str) -> bool:
         ka, kb = _account_key(a), _account_key(b)
         if not ka or not kb:
             return False
-        # PaddleOCR reads a handwritten "#" as "1": "#2410" comes back "12410".
+        # A crop OCR reads a handwritten "#" as "1": "#2410" comes back "12410".
         return ka == kb or (len(ka) == len(kb) + 1 and ka == "1" + kb) or (
             len(kb) == len(ka) + 1 and kb == "1" + ka
         )
@@ -791,7 +680,7 @@ def _agree(kind: str, a: str, b: str) -> bool:
         # Clean first so "56 $361.56" / "$361" compare on the money token.
         # Then by size. The sign is not always written: "Credit # 2410
         # $2,890.20" on a credit memo is -2,890.20 to both Gemini readers,
-        # which know the invoice is a credit, and 2890.20 to PaddleOCR, which
+        # which know the invoice is a credit, and 2890.20 to Docling, which
         # reads only the crop. _vote takes the sign from the Gemini readers.
         ca, cb = _clean_ocr_text("amount", a), _clean_ocr_text("amount", b)
         sizes_a = {abs(x) for x in _amount_cents(ca or a)}
@@ -802,7 +691,7 @@ def _agree(kind: str, a: str, b: str) -> bool:
         return False
     if ka == kb:
         return True
-    # PaddleOCR's crop can take in part of the printed label ("er: 99100200901").
+    # A crop can take in part of the printed label ("er: 99100200901").
     # The label is checked as printed: _invoice_key turns its O and I into digits.
     (longer, raw), shorter = ((ka, a), kb) if len(ka) > len(kb) else ((kb, b), ka)
     label = _invoice_text(raw)[: len(longer) - len(shorter)]
@@ -817,7 +706,7 @@ def _vote(kind: str, reads: dict[str, dict | None]) -> dict[str, Any]:
 
     `reads` maps each reader to {"value": ..., and its own score} or None
     when that reader had nothing. The winning value is reported in the form
-    the Gemini readers write it ("225.95", not PaddleOCR's "$22595").
+    the Gemini readers write it ("225.95", not a crop OCR's "$22595").
     """
     present = {r: v for r, v in reads.items() if v and str(v.get("value") or "").strip()}
     best: list[str] = []
@@ -878,8 +767,6 @@ def apply(doc: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
         second["votes"] = None
         return doc
 
-    paddle = second.get("paddle") or {}
-    tesseract = second.get("tesseract") or {}
     docling = second.get("docling") or {}
     pro_lines = second.get("gl_lines") or []
 
@@ -896,16 +783,12 @@ def apply(doc: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
     invoice_vote = _vote("invoice", {
         "flash": {"value": flash_invoice} if flash_invoice else None,
         "pro": pro_read(second.get("invoice_number") or {}),
-        "paddle": crop_read(paddle.get("invoice_number")),
-        "tesseract": crop_read(tesseract.get("invoice_number")),
         "docling": crop_read(docling.get("invoice_number")),
     })
 
     total_vote = _vote("amount", {
         "flash": {"value": flash_total} if flash_total else None,
         "pro": pro_read(second.get("invoice_total") or {}),
-        "paddle": crop_read(paddle.get("invoice_total")),
-        "tesseract": crop_read(tesseract.get("invoice_total")),
         "docling": crop_read(docling.get("invoice_total")),
     })
 
@@ -922,23 +805,17 @@ def apply(doc: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
         if match is not None:
             unmatched_flash.remove(match)
         flash = flash_lines[match] if match is not None else None
-        pad = line_at(paddle, i)
-        tess = line_at(tesseract, i)
         dlg = line_at(docling, i)
         line_votes.append({
             "label": pro.get("label") or (flash or {}).get("label", ""),
             "account": _vote("account", {
                 "flash": {"value": flash["account"]} if flash else None,
                 "pro": pro_read(pro["account"]),
-                "paddle": crop_read((pad or {}).get("account")),
-                "tesseract": crop_read((tess or {}).get("account")),
                 "docling": crop_read((dlg or {}).get("account")),
             }),
             "amount": _vote("amount", {
                 "flash": {"value": flash["amount"]} if flash else None,
                 "pro": pro_read(pro["amount"]),
-                "paddle": crop_read((pad or {}).get("amount")),
-                "tesseract": crop_read((tess or {}).get("amount")),
                 "docling": crop_read((dlg or {}).get("amount")),
             }),
         })

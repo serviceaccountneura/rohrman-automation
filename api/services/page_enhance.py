@@ -6,7 +6,7 @@ The lead's preprocess_to_vlm_context.py steps are split here:
   background normalisation + CLAHE. Tuned so Gemini can read digits that sit
   in shaded header bars (Honda on Grand: 331937 vs 551937/531937).
 * **OCR finish** (``enhance_for_ocr``) -- same crop and upscale, then denoise,
-  flatten shading, and mild CLAHE so Paddle / Tesseract / Docling see clear
+  flatten shading, and mild CLAHE so Docling sees clear
   strokes without the hard binarisation that erased handwriting.
 
 Geometry is shared on purpose: 2.5 Pro boxes fields on the VLM pages; crop
@@ -95,7 +95,7 @@ def enhance_for_ocr(image: Image.Image, upscale: float = UPSCALE_FACTOR) -> Imag
 
     Denoise + background flatten lift shaded/gray print; mild CLAHE keeps
     handwritten strokes continuous (full-page adaptive binary was destroying
-    GL amount crops). Returned as RGB for Paddle / Tesseract / Docling.
+    GL amount crops). Returned as RGB for Docling.
     """
     bgr = _crop_and_upscale(image, upscale)
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -161,7 +161,7 @@ def enhance_pages_pair(
 ) -> tuple[list[Image.Image], list[Image.Image]]:
     """VLM pages and OCR pages with identical crop / scale / any final shrink.
 
-    Pro boxes on the VLM list; Paddle / Tesseract / Docling crop the OCR list.
+    Pro boxes on the VLM list; Docling crops the OCR list.
     """
     upscale = _choose_upscale(images)
     if upscale is not None:

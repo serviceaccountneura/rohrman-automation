@@ -93,7 +93,7 @@ def extract_document(
     parts = [pil_to_part(img) for img in images]
 
     # The confidence read runs alongside the main one. Pro boxes on VLM pages;
-    # Paddle / Tesseract / Docling crop the OCR-finished pages.
+    # Docling crops the OCR-finished pages.
     second_read = None
     if settings.confidence_read:
         from concurrent.futures import ThreadPoolExecutor
@@ -170,11 +170,7 @@ def extract_document(
                     return f"{label} {blob.get('seconds')}s"
                 return f"{label} unavailable"
 
-            crop_notes = ", ".join([
-                _crop_note("paddle", "PaddleOCR"),
-                _crop_note("tesseract", "Tesseract"),
-                _crop_note("docling", "Docling"),
-            ])
+            crop_notes = _crop_note("docling", "Docling")
             print(
                 f"[OCR] vote (2.5 Pro {second.get('seconds')}s; {crop_notes}): "
                 + ", ".join(summary)

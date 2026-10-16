@@ -369,8 +369,6 @@ def _gl_total_disagrees(ocr: dict[str, Any]) -> list[str]:
             for r, name in (
                 ("flash", "Gemini 3.6 Flash"),
                 ("pro", "Gemini 2.5 Pro"),
-                ("paddle", "PaddleOCR"),
-                ("tesseract", "Tesseract"),
                 ("docling", "Docling"),
             )
             if said.get(r)
@@ -379,6 +377,21 @@ def _gl_total_disagrees(ocr: dict[str, Any]) -> list[str]:
         f"GL amounts (${voted:,.2f}) against the invoice total (${signed_total:,.2f}); "
         f"the readers read {'; '.join(readings)}"
     ]
+
+
+def _unresolved_reading(doc: Document, ocr: dict[str, Any]) -> list[str]:
+    """What the readers did not settle on this read; [] when the vote is clean.
+
+    Two readers can share a misreading: on a Toyota invoice two readers both
+    read a handwritten 474.56 as 474.50 and outvoted Flash. The printed total
+    settles it. Not for vehicle invoices, whose handwritten amounts are
+    holdback and fees rather than a split of the total. Recorded with the
+    vote, so the confidence page shows it too.
+    """
+    second = ocr.get("_confidence")
+    if second and second.get("votes") and not second.get("unresolved") and doc.po_type != FOLDER_VMI:
+        second["unresolved"] = _gl_total_disagrees(ocr)
+    return (second or {}).get("unresolved") or []
 
 
 def _store_confidence(doc: Document, ocr: dict[str, Any]) -> None:
@@ -687,14 +700,23 @@ def _run(doc: Document, session: Session) -> None:
             print(f"[PIPE] OCR failed: {e}")
             _fail(session, doc, EX_OCR_FAILED, error=str(e))
             return
-        # Two readers can share a misreading: on a Toyota invoice 2.5 Pro and
-        # PaddleOCR both read a handwritten 474.56 as 474.50 and outvoted Flash.
-        # The printed total settles it. Not for vehicle invoices, whose
-        # handwritten amounts are holdback and fees rather than a split of the
-        # total. Recorded with the vote, so the confidence page shows it too.
-        second = ocr.get("_confidence")
-        if second and second.get("votes") and not second.get("unresolved") and doc.po_type != FOLDER_VMI:
-            second["unresolved"] = _gl_total_disagrees(ocr)
+        unresolved = _unresolved_reading(doc, ocr)
+        if unresolved:
+            # One retry only: a disagreement is often one reader's off read,
+            # and every read is a full set of Gemini calls.
+            print(f"[PIPE] {doc.id} readers disagreed ({'; '.join(unresolved)}); reading once more")
+            retry_pages: list = []
+            try:
+                retry = extract_document(source, straighten=not straightened, pages_out=retry_pages)
+            except Exception as e:  # noqa: BLE001 - the first read still stands
+                print(f"[PIPE] {doc.id} retry read failed ({e}); keeping the first read")
+            else:
+                retry_unresolved = _unresolved_reading(doc, retry)
+                print(
+                    f"[PIPE] {doc.id} retry read "
+                    + (f"still disagrees: {'; '.join(retry_unresolved)}" if retry_unresolved else "resolved")
+                )
+                ocr, enhanced_pages = retry, retry_pages
         _store_enhanced_copy(doc, source, enhanced_pages)
         _cache_ocr(doc, ocr)
         _store_confidence(doc, ocr)
@@ -750,8 +772,8 @@ def _run(doc: Document, session: Session) -> None:
         return
 
     # ── 4c. The readers disagree (testing branch) ────────────────────────────
-    # Gemini 3.6 Flash, Gemini 2.5 Pro and PaddleOCR each read the invoice
-    # number and the handwritten GL lines. A value no two of them agree on is
+    # Gemini 3.6 Flash, Gemini 2.5 Pro and Docling each read the invoice
+    # number, the invoice total and the handwritten GL lines. A value no two of them agree on is
     # a guess, so stop before Tekion and let a person look. Only on a fresh
     # read: running it again -- with corrections or without -- is a person
     # saying they have checked it.

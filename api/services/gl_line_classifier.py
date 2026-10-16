@@ -194,7 +194,7 @@ class Classification:
         """
         if merge:
             return [
-                {
+                {``````
                     "gl_account_id": f"{dealer_id}_{account}",
                     "amount": amount,
                     "description": None,
@@ -234,7 +234,7 @@ def classify_line_items(
     priced = [
         (i, item)
         for i, item in enumerate(line_items)
-        if float(item.get("totalPrice") or item.get("total_price") or 0) != 0
+        if float(item.get("totalPr                                                                                                                                          ice") or item.get("total_price") or 0) != 0
     ]
     if not priced:
         result.notes.append("No priced line items were read from the invoice.")
