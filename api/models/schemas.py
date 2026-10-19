@@ -576,6 +576,7 @@ class DocumentsByType(BaseModel):
     own page listed the documents. Add the field whenever a folder is added.
     """
 
+    PO_INVOICE: int = 0
     SUBLET: int = 0
     MISCELLANEOUS: int = 0
     STOCK: int = 0

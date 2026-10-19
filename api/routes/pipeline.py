@@ -64,7 +64,7 @@ def tekion_writes() -> dict[str, object]:
     """
     return {
         "poWrites": settings.tekion_po_writes,
-        "folders": ["SUBLET", "MISCELLANEOUS", "STOCK"],
+        "folders": ["PO_INVOICE", "SUBLET", "MISCELLANEOUS", "STOCK"],
         "postFolders": ["OEM"] if settings.oem_post else [],
         "draftFolders": ["VEHICLE_MANUFACTURING"] + ([] if settings.oem_post else ["OEM"]),
     }
@@ -86,7 +86,10 @@ async def process_upload(
     session: Annotated[Session, Depends(get_session)],
     current_user: CurrentUserDep,
     file: UploadFile = File(...),
-    folder: str = Form(..., description="SUBLET | MISCELLANEOUS | STOCK | OEM | VEHICLE_MANUFACTURING"),
+    folder: str = Form(
+        ...,
+        description="PO_INVOICE | SUBLET | MISCELLANEOUS | STOCK | OEM | VEHICLE_MANUFACTURING",
+    ),
     dealership_name: str = Form("", description="Dealership the invoice belongs to"),
 ) -> PipelineAcceptedResponse:
     """Upload an invoice into a folder and queue it for processing."""

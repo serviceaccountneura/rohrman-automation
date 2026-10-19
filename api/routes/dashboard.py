@@ -266,7 +266,13 @@ def list_documents(
     query = _for_dealership(select(Document), dealership_name)
 
     if po_type:
-        query = query.where(Document.po_type == po_type)
+        # Unified inbox: after Tekion routing, docs are typed Sublet/Misc/Stock.
+        types = (
+            ["PO_INVOICE", "SUBLET", "MISCELLANEOUS", "STOCK"]
+            if po_type == "PO_INVOICE"
+            else [po_type]
+        )
+        query = query.where(Document.po_type.in_(types))  # type: ignore[union-attr]
     if status:
         query = query.where(Document.status == status)
 
@@ -275,7 +281,12 @@ def list_documents(
         select(func.count()).select_from(Document), dealership_name
     )
     if po_type:
-        count_query = count_query.where(Document.po_type == po_type)
+        types = (
+            ["PO_INVOICE", "SUBLET", "MISCELLANEOUS", "STOCK"]
+            if po_type == "PO_INVOICE"
+            else [po_type]
+        )
+        count_query = count_query.where(Document.po_type.in_(types))  # type: ignore[union-attr]
     if status:
         count_query = count_query.where(Document.status == status)
     total = session.exec(count_query).one()

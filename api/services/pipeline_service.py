@@ -3,11 +3,9 @@
 One document goes in, one `documents` row tracks it the whole way, and the
 upload folder decides which Tekion flow runs:
 
-    SUBLET         -> pre-invoice an existing Sublet PO   (api/routes/tekion.py)
-    MISCELLANEOUS  -> pre-invoice an existing Misc PO     (api/routes/tekion.py)
-    STOCK          -> Vendor stock order                  (api/routes/tekion.py)
-    # Sublet/Misc no longer CREATE purchase orders: parts raise the PO in
-    # Tekion first; we only match the number on the invoice and pre-invoice it.
+    PO_INVOICE     -> look up existing Tekion PO by number; route from
+                      orderType to Sublet / Misc / Stock pre-invoice
+                      (legacy SUBLET / MISCELLANEOUS / STOCK uploads alias here)
     OEM            -> Journal entry, posted or saved as draft by OEM_POST (api/services/je_creation.py)
     VEHICLE_MANUFACTURING -> Vehicle purchase journal entry from a
                       per-manufacturer template (api/services/vmi_je_creation.py)
@@ -15,10 +13,10 @@ upload folder decides which Tekion flow runs:
 None of those flows are reimplemented here — this module calls the existing
 functions unchanged.
 
-THE FOLDER IS AUTHORITATIVE
-    The folder the user uploaded into selects the pipeline, always. OCR's own
-    `document_type` is recorded as `ocr_document_type` so a disagreement is
-    visible for review, but it never changes routing and never blocks.
+THE FOLDER IS AUTHORITATIVE (with one exception)
+    OEM and Vehicle folders always select those flows. The PO_INVOICE inbox
+    looks up the Tekion PO and sets the concrete type from orderType. OCR's
+    own `document_type` never changes routing.
 
 RUNS AS A QUEUE JOB
     `run_job()` is called by the workers in api/services/worker.py, which claim
@@ -63,6 +61,9 @@ from api.services.tekion_lock import dealer_scope, tekion_scope
 FOLDER_SUBLET = "SUBLET"
 FOLDER_MISC = "MISCELLANEOUS"
 FOLDER_STOCK = "STOCK"
+# One inbox for Sublet / Misc / Vendor Stock: the Tekion PO's orderType decides
+# which pre-invoice path runs. OEM and Vehicle stay separate (journal entries).
+FOLDER_PO_INVOICE = "PO_INVOICE"
 FOLDER_OEM = "OEM"
 # Vehicle manufacturer invoices (Kia, Ford, Honda, Toyota). A journal entry
 # like OEM, but built from a per-manufacturer template rather than the invoice
@@ -70,15 +71,22 @@ FOLDER_OEM = "OEM"
 # receivables. See api/services/vmi_je_creation.py.
 FOLDER_VMI = "VEHICLE_MANUFACTURING"
 
-VALID_FOLDERS = {FOLDER_SUBLET, FOLDER_MISC, FOLDER_STOCK, FOLDER_OEM, FOLDER_VMI}
+# Concrete types after Tekion lookup; PO_INVOICE is only the upload bucket.
+_PO_INVOICE_TYPES = {FOLDER_SUBLET, FOLDER_MISC, FOLDER_STOCK}
 
-# Aliases so the frontend can send the friendlier folder names.
+VALID_FOLDERS = {FOLDER_PO_INVOICE, FOLDER_OEM, FOLDER_VMI} | _PO_INVOICE_TYPES
+
+# Aliases so the frontend can send the friendlier folder names. Legacy Sublet /
+# Misc / Stock uploads land in the unified inbox and are re-typed from Tekion.
 _FOLDER_ALIASES = {
-    "MISC": FOLDER_MISC,
-    "MISCELLANEOUS": FOLDER_MISC,
-    "SUBLET": FOLDER_SUBLET,
-    "STOCK": FOLDER_STOCK,
-    "VENDOR_STOCK": FOLDER_STOCK,
+    "PO_INVOICE": FOLDER_PO_INVOICE,
+    "PURCHASE_ORDER": FOLDER_PO_INVOICE,
+    "EXISTING_PO": FOLDER_PO_INVOICE,
+    "MISC": FOLDER_PO_INVOICE,
+    "MISCELLANEOUS": FOLDER_PO_INVOICE,
+    "SUBLET": FOLDER_PO_INVOICE,
+    "STOCK": FOLDER_PO_INVOICE,
+    "VENDOR_STOCK": FOLDER_PO_INVOICE,
     "OEM": FOLDER_OEM,
     "PARTS_STMT": FOLDER_OEM,
     "MANUFACTURER": FOLDER_OEM,
@@ -347,7 +355,7 @@ def _gl_total_disagrees(ocr: dict[str, Any]) -> list[str]:
     reader read, for the UNCLEAR_READING message.
     """
     votes = (ocr.get("_confidence") or {}).get("votes") or {}
-    lines = votes.get("gl_lines") or []
+    lines = votes.get("gl_xlines") or []
     total = ocr_helpers.get_total_amount(ocr)
     if not lines or not total:
         return []
@@ -763,14 +771,17 @@ def _run(doc: Document, session: Session) -> None:
         _run_vehicle_journal_entry(doc, ocr, session)
     elif doc.po_type == FOLDER_OEM:
         _run_journal_entry(doc, ocr, session)
-    elif doc.po_type == FOLDER_STOCK:
-        # A vendor stock order is not created here — the PO already exists and
-        # the invoice arrives afterwards to be attached to it.
-        _run_stock_pre_invoice(doc, ocr, session, original)
+    elif doc.po_type in (FOLDER_PO_INVOICE, *_PO_INVOICE_TYPES):
+        # Unified PO inbox (and legacy Sublet/Misc/Stock uploads): look up the
+        # Tekion PO, set the concrete type from orderType, then pre-invoice.
+        _run_po_invoice(doc, ocr, session, original)
     else:
-        # `source` is handed on so the PO flow can attach the invoice PDF to the
-        # pre-invoice — we already have the file, so there is no reason not to.
-        _run_purchase_order(doc, ocr, session, original)
+        _fail(
+            session,
+            doc,
+            EX_MISSING_FIELD,
+            error=f"Unknown folder {doc.po_type!r}; nothing was posted.",
+        )
 
 
 # ── OEM -> Journal entry ──────────────────────────────────────────────────────
@@ -1302,30 +1313,61 @@ def _run_stock_pre_invoice(
 # ── SUBLET / MISCELLANEOUS -> Purchase order ─────────────────────────────────
 
 
+def _run_po_invoice(
+    doc: Document,
+    ocr: dict[str, Any],
+    session: Session,
+    source_path: str | None,
+) -> None:
+    """Pre-invoice against an existing Tekion PO (Sublet / Misc / Stock).
+
+    The upload folder is a single inbox. Tekion's ``orderType`` / ``universalId``
+    pick the concrete path after lookup.
+    """
+    existing_po, stop = _resolve_existing_po(doc, ocr, session)
+    if stop:
+        return
+    if not existing_po:
+        _fail(
+            session,
+            doc,
+            EX_PO_NOT_FOUND,
+            error=(
+                "No existing Tekion purchase order to pre-invoice against. "
+                "Create the PO in Tekion first, then upload this invoice."
+            ),
+        )
+        return
+
+    if doc.po_type == FOLDER_STOCK:
+        _run_stock_pre_invoice(doc, ocr, session, source_path)
+        return
+    _run_purchase_order(doc, ocr, session, source_path, existing_po=existing_po)
+
+
 def _resolve_existing_po(
     doc: Document,
     ocr: dict[str, Any],
     session: Session,
 ) -> tuple[dict[str, Any] | None, bool]:
-    """Find the Tekion purchase order this Sublet/Misc invoice must post against.
+    """Find the Tekion purchase order this invoice must post against.
 
     Returns (existing_po, stop). `existing_po` is the PO to pre-invoice;
     `stop` means this run is over (failed) and the caller must not create or
     post anything.
 
-    Sublet and Misc no longer create purchase orders. Parts raise the PO in
-    Tekion first; we only match the number on the invoice and pre-invoice it
-    (same shape as STOCK). There is no "create a new one" path.
+    Parts raise the PO in Tekion first; we only match the number on the invoice
+    and pre-invoice it. There is no "create a new one" path.
 
       1. A PO number must be readable on the invoice.
       2. That PO must exist at THIS dealership (exact match).
       3. It must be able to take this invoice (not closed / not already
          carrying this invoice number).
-      4. Otherwise reuse it immediately -- no PO_DECISION hold.
+      4. ``doc.po_type`` is set from Tekion's orderType (Sublet / Misc / Stock).
     """
     from api.routes.tekion import _resolve_dealer, get_client
 
-    if doc.po_type not in (FOLDER_SUBLET, FOLDER_MISC):
+    if doc.po_type not in (FOLDER_PO_INVOICE, *_PO_INVOICE_TYPES):
         return None, False
 
     # Consume any leftover choice from documents held before create-PO was
@@ -1342,9 +1384,9 @@ def _resolve_existing_po(
             doc,
             EX_TEKION_REJECTED,
             error=(
-                "Creating a new purchase order is turned off for Sublet and "
-                "Miscellaneous. Raise the PO in Tekion first, then upload the "
-                "invoice so it can be pre-invoiced against that PO."
+                "Creating a new purchase order is turned off. Raise the PO in "
+                "Tekion first, then upload the invoice so it can be pre-invoiced "
+                "against that PO."
             ),
         )
         return None, True
@@ -1357,9 +1399,9 @@ def _resolve_existing_po(
             EX_PO_NOT_FOUND,
             error=(
                 "No purchase order number could be read from the invoice. "
-                "Sublet and Miscellaneous invoices are pre-invoiced against an "
-                "existing Tekion PO — create the PO in Tekion first, or correct "
-                "the PO number on the document and run it again."
+                "These invoices are pre-invoiced against an existing Tekion PO — "
+                "create the PO in Tekion first, or correct the PO number on the "
+                "document and run it again."
             ),
         )
         return None, True
@@ -1383,7 +1425,25 @@ def _resolve_existing_po(
         )
         return None, True
 
+    routed = po_reuse.pipeline_folder_for(found)
+    if not routed:
+        _fail(
+            session,
+            doc,
+            EX_TEKION_REJECTED,
+            error=(
+                f"PO {found.po_number} has Tekion type "
+                f"{found.order_type or found.universal_id or 'unknown'!r}, which "
+                "this inbox does not handle. Use the OEM or Vehicle folder for "
+                "journal-entry invoices."
+            ),
+        )
+        return None, True
+
+    doc.po_type = routed
     doc.po_number = found.po_number or po_number
+    if not doc.vendor_name and found.vendor_name:
+        doc.vendor_name = found.vendor_name
     session.add(doc)
     session.commit()
 
@@ -1392,7 +1452,10 @@ def _resolve_existing_po(
         _fail(session, doc, blocked_code, error=blocked)
         return None, True
 
-    print(f"[PIPE] {doc.id} reusing {po_reuse.describe(found)} (no PO created)")
+    print(
+        f"[PIPE] {doc.id} reusing {po_reuse.describe(found)} "
+        f"as {routed} (no PO created)"
+    )
     return po_reuse.as_pre_invoice_po(found), False
 
 
@@ -1520,12 +1583,15 @@ def _run_purchase_order(
     ocr: dict[str, Any],
     session: Session,
     source_path: str | None = None,
+    existing_po: dict[str, Any] | None = None,
 ) -> None:
     """Build the typed PO request from OCR and hand it to the existing flow.
 
     `source_path` is the invoice file. The PO flow uploads it to Tekion's media
     service and attaches it to the pre-invoice, which is the same thing a clerk
     does by hand after creating the PO.
+
+    `existing_po` is the Tekion PO already looked up by ``_run_po_invoice``.
     """
     from fastapi import HTTPException
 
@@ -1544,6 +1610,18 @@ def _run_purchase_order(
     total = ocr_helpers.get_total_amount(ocr)
     sales_tax = ocr_helpers.get_sales_tax(ocr)
     line_items = ocr_helpers.get_raw_line_items(ocr)
+    # Prefer Tekion's PO amount when OCR could not read a total.
+    if not total and existing_po and existing_po.get("totalAmount") is not None:
+        try:
+            total = float(existing_po["totalAmount"])
+        except (TypeError, ValueError):
+            total = None
+    if not doc.vendor_name and existing_po:
+        vd = existing_po.get("vendorDetails") or {}
+        if vd.get("vendorName"):
+            doc.vendor_name = str(vd["vendorName"])
+            session.add(doc)
+            session.commit()
 
     # What a person corrected on "Re-run & manual edit" outranks what was read,
     # as on OEM: the invoice number, and the GL accounts with their amounts
@@ -1630,12 +1708,11 @@ def _run_purchase_order(
         "invoice_file_path": source_path,
     }
 
-    existing_po, stop = _resolve_existing_po(doc, ocr, session)
-    if stop:
-        return
+    if existing_po is None:
+        existing_po, stop = _resolve_existing_po(doc, ocr, session)
+        if stop:
+            return
     if not existing_po:
-        # Sublet/Misc only pre-invoice; create-PO paths below are unreachable
-        # after _resolve_existing_po always requires a live Tekion PO.
         _fail(
             session,
             doc,
@@ -1858,26 +1935,13 @@ def _run_purchase_order(
                     )
                     for sp in (corrected_gl or ocr_helpers.get_gl_amount_splits(ocr))
                 ]
-                # Never guess the account, as on OEM. With nothing written, Misc
-                # used to fall back to accounts beside the rows and then to one
-                # chosen from the item descriptions. On staging 57 of 57 Misc
-                # invoices had their accounts written, so the guess only ever
-                # stood in for a miss. Reads from before posting_lines keep the
-                # old path.
-                if not splits and ocr_helpers.has_posting_lines(ocr):
-                    _fail(
-                        session,
-                        doc,
-                        EX_NO_GL_WRITTEN,
-                        error=(
-                            "No GL account was found written on this invoice, so nothing "
-                            "was posted. Add the account and amount on the correction "
-                            "form and run it again."
-                        ),
-                    )
-                    return
+                # Prefer handwritten / corrected splits when present. Otherwise
+                # Tekion supplies GL via preInvoicing/postings (and the Misc PO
+                # lines as fallback) inside _create_misc_po -- no need to fail
+                # for a missing annotation on an existing-PO upload.
 
             # The GL lines must add up to the invoice before anything is sent.
+            # Skipped when empty: Tekion postings will define them.
             # Misc used to have a person approve every draft, and that was the
             # only check; with the review gone (781c61f) a $112.64 invoice read
             # as a $16 credit went to Tekion with a 2410 line of 112.64 against

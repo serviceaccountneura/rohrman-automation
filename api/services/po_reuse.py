@@ -239,4 +239,69 @@ def as_pre_invoice_po(found: FoundPo) -> dict[str, Any]:
     po["poNumber"] = po_number
     po["universalId"] = universal
     po["status"] = found.status or str(po.get("status") or "")
+    po["orderType"] = found.order_type or str(po.get("orderType") or "")
     return po
+
+
+def pipeline_folder_for(found: FoundPo) -> str | None:
+    """Map Tekion's PO type onto our pipeline folder, or None if unknown.
+
+    Prefers ``orderType``, then the prefix of ``universalId``
+    (``MISCELLANEOUS%10950`` → MISCELLANEOUS). That is what lets one upload
+    folder accept Sublet, Misc and Vendor Stock invoices without the clerk
+    sorting them first.
+    """
+    raw = (found.order_type or "").strip().upper()
+    if not raw and found.universal_id:
+        raw = str(found.universal_id).split("%", 1)[0].strip().upper()
+    if raw in {"MISCELLANEOUS", "MISC"}:
+        return "MISCELLANEOUS"
+    if raw == "SUBLET":
+        return "SUBLET"
+    if raw in {"NON_OEM_STOCK_ORDER", "PARTS", "STOCK"}:
+        return "STOCK"
+    return None
+
+
+def vendor_from_po(po: dict[str, Any]) -> dict[str, str] | None:
+    """Vendor fields Tekion already has on the PO, ready for pre-invoice."""
+    vd = po.get("vendorDetails") or {}
+    vendor_id = vd.get("vendorId") or vd.get("id")
+    if not vendor_id:
+        return None
+    site = vd.get("vendorSiteId") or vendor_id
+    return {
+        "id": str(vendor_id),
+        "siteId": str(site),
+        "name": str(vd.get("vendorName") or ""),
+        "displayId": str(vd.get("vendorDisplayId") or ""),
+        "phone": str(vd.get("vendorPhone") or ""),
+        "email": str(vd.get("vendorEmail") or ""),
+    }
+
+
+def misc_gl_splits_from_po(po: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expense GL lines from a Misc PO's ``miscItemPurchaseDetails``.
+
+    Used when the invoice has no handwritten splits and Tekion's
+    ``preInvoicing/postings`` call comes back empty.
+    """
+    splits: list[dict[str, Any]] = []
+    for ln in po.get("miscItemPurchaseDetails") or []:
+        gl = str(ln.get("glAccountId") or "").strip()
+        if not gl:
+            continue
+        try:
+            amount = float(ln.get("grossTotalPrice") if ln.get("grossTotalPrice") is not None else ln.get("price") or 0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        if not amount:
+            continue
+        splits.append(
+            {
+                "gl_account_id": gl,
+                "amount": round(amount, 2),
+                "description": str(ln.get("item") or "") or None,
+            }
+        )
+    return splits
