@@ -355,6 +355,10 @@ def list_exceptions(
         default=None,
         description="Filter by exception type (VENDOR_NOT_FOUND, PO_MISMATCH, etc.)",
     ),
+    exception_category: str | None = Query(
+        default=None,
+        description="PO | JE | DUPLICATE | OTHER — Parts vs AP vs duplicate buckets.",
+    ),
     document_type: str | None = Query(
         default=None,
         description="Filter by document type (AP_INVOICE, PARTS_TICKET, etc.)",
@@ -363,40 +367,60 @@ def list_exceptions(
     page_size: int = Query(default=20, ge=1, le=100),
     dealership_name: str | None = DealershipQuery,
 ) -> ExceptionListResponse:
-    """Paginated list of exception documents, optionally filtered by severity, exception_type, and/or document_type."""
+    """Exceptions + held duplicates, optionally filtered by category / type."""
+    from api.services.exception_category import category_for
+
+    # Held duplicates sit in status=DUPLICATE (not EXCEPTION) so Parts / AP can
+    # still see them under the Duplicate bucket on this page.
     query = _for_dealership(
-        select(Document).where(Document.status == "EXCEPTION"), dealership_name
-    )
-
-    if severity:
-        query = query.where(Document.severity == severity)
-    if exception_type:
-        query = query.where(Document.exception_type == exception_type)
-    if document_type:
-        query = query.where(Document.document_type == document_type)
-
-    # Total count
-    count_query = _for_dealership(
-        select(func.count())
-        .select_from(Document)
-        .where(Document.status == "EXCEPTION"),
+        select(Document).where(Document.status.in_(["EXCEPTION", "DUPLICATE"])),
         dealership_name,
     )
-    if severity:
-        count_query = count_query.where(Document.severity == severity)
-    if exception_type:
-        count_query = count_query.where(Document.exception_type == exception_type)
-    if document_type:
-        count_query = count_query.where(Document.document_type == document_type)
-    total = session.exec(count_query).one()
+    query = query.where(Document.deleted_at.is_(None))  # type: ignore[union-attr]
 
-    # Paginated results
+    # Only apply string filters — never truthy FastAPI Query() sentinel objects.
+    sev = severity.strip() if isinstance(severity, str) and severity.strip() else None
+    etype = (
+        exception_type.strip()
+        if isinstance(exception_type, str) and exception_type.strip()
+        else None
+    )
+    dtype = (
+        document_type.strip()
+        if isinstance(document_type, str) and document_type.strip()
+        else None
+    )
+    if sev:
+        query = query.where(Document.severity == sev)
+    if etype:
+        query = query.where(Document.exception_type == etype)
+    if dtype:
+        query = query.where(Document.document_type == dtype)
+
+    docs_all = list(
+        session.exec(query.order_by(Document.created_at.desc())).all()  # type: ignore[union-attr]
+    )
+
+    # Category is derived (not a DB column), so filter / count in Python.
+    cat_filter = (exception_category or "").strip().upper() or None
+    categorized: list[tuple[Document, str]] = []
+    by_category: dict[str, int] = {
+        "PO": 0,
+        "JE": 0,
+        "DUPLICATE": 0,
+        "WAITING": 0,
+        "OTHER": 0,
+    }
+    for doc in docs_all:
+        cat = category_for(doc.exception_type, status=doc.status)
+        by_category[cat] = by_category.get(cat, 0) + 1
+        if cat_filter and cat != cat_filter:
+            continue
+        categorized.append((doc, cat))
+
+    total = len(categorized)
     offset = (page - 1) * page_size
-    docs = session.exec(
-        query.order_by(Document.created_at.desc())  # type: ignore[union-attr]
-        .offset(offset)
-        .limit(page_size)
-    ).all()
+    page_docs = categorized[offset : offset + page_size]
 
     items = [
         ExceptionListItem(
@@ -406,16 +430,19 @@ def list_exceptions(
             vin=doc.vin,
             po_number=doc.po_number,
             ro_number=doc.ro_number,
-            exception_type=doc.exception_type,
-            severity=doc.severity,
+            exception_type=doc.exception_type
+            or ("DUPLICATE_DOCUMENT" if doc.status == "DUPLICATE" else None),
+            exception_category=cat,
+            severity=doc.severity or ("LOW" if doc.status == "DUPLICATE" else None),
             detected_on=doc.created_at,
             document_type=doc.document_type,
             status=doc.status,
+            duplicate_of=doc.duplicate_of,
         )
-        for doc in docs
+        for doc, cat in page_docs
     ]
 
-    total_pages = (total + page_size - 1) // page_size
+    total_pages = (total + page_size - 1) // page_size if page_size else 0
 
     return ExceptionListResponse(
         items=items,
@@ -423,6 +450,7 @@ def list_exceptions(
         page=page,
         page_size=page_size,
         total_pages=total_pages,
+        by_category=by_category,
     )
 
 

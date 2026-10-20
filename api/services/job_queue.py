@@ -439,12 +439,20 @@ def restore(session: Session, doc: Document) -> Document:
 def find_duplicate(session: Session, doc: Document) -> Document | None:
     """An earlier document that already produced this same work.
 
-    Two checks, cheapest first:
+    Checks, cheapest first:
       1. identical file bytes (same SHA-256) — a straight re-upload
-      2. same dealership + invoice number + folder — the same invoice rescanned
+      2. same dealership + folder + exact invoice number
+      3. same dealership + folder + near-duplicate invoice number (letter
+         prefix/suffix variants: BLK123 vs 123, …RI vs bare digits)
 
     Only PROCESSED rows count: a previous failure should not block a retry.
     """
+    from api.services.exception_category import (
+        invoice_digits,
+        invoices_are_near_duplicates,
+    )
+    from sqlalchemy import func
+
     if doc.file_hash:
         same_file = session.exec(
             select(Document).where(
@@ -461,19 +469,41 @@ def find_duplicate(session: Session, doc: Document) -> Document | None:
         if same_file:
             return same_file
 
-    if doc.invoice_number and doc.dealership_name:
-        same_invoice = session.exec(
-            select(Document).where(
-                Document.invoice_number == doc.invoice_number,
-                Document.dealership_name == doc.dealership_name,
-                Document.po_type == doc.po_type,
-                Document.deleted_at.is_(None),  # type: ignore[union-attr]
-                Document.id != doc.id,
-                Document.status == STATUS_PROCESSED,
-            )
-        ).first()
-        if same_invoice:
-            return same_invoice
+    if not (doc.invoice_number and doc.dealership_name):
+        return None
+
+    same_invoice = session.exec(
+        select(Document).where(
+            Document.invoice_number == doc.invoice_number,
+            Document.dealership_name == doc.dealership_name,
+            Document.po_type == doc.po_type,
+            Document.deleted_at.is_(None),  # type: ignore[union-attr]
+            Document.id != doc.id,
+            Document.status == STATUS_PROCESSED,
+        )
+    ).first()
+    if same_invoice:
+        return same_invoice
+
+    # Near-duplicate: shared digit core, different letter wrap (Parts typed
+    # BLK123 on one PO and 123 on another / SNS dropped RI).
+    core = invoice_digits(doc.invoice_number)
+    if not core:
+        return None
+    digit_col = func.regexp_replace(Document.invoice_number, "[^0-9]", "", "g")
+    candidates = session.exec(
+        select(Document).where(
+            Document.dealership_name == doc.dealership_name,
+            Document.po_type == doc.po_type,
+            Document.deleted_at.is_(None),  # type: ignore[union-attr]
+            Document.id != doc.id,
+            Document.status == STATUS_PROCESSED,
+            digit_col == core,
+        )
+    ).all()
+    for other in candidates:
+        if invoices_are_near_duplicates(doc.invoice_number, other.invoice_number):
+            return other
 
     return None
 

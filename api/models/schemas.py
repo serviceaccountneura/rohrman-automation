@@ -643,10 +643,13 @@ class ExceptionListItem(BaseModel):
     po_number: str
     ro_number: str
     exception_type: str | None
+    # PO | JE | DUPLICATE | OTHER — Parts vs AP vs duplicate buckets.
+    exception_category: str = "OTHER"
     severity: str | None
     detected_on: datetime
     document_type: str
     status: str
+    duplicate_of: UUID | None = None
 
 
 class ExceptionListResponse(BaseModel):
@@ -655,6 +658,8 @@ class ExceptionListResponse(BaseModel):
     page: int
     page_size: int
     total_pages: int
+    # Counts per category across the filtered set (before pagination).
+    by_category: dict[str, int] = {}
 
 
 class ExceptionTypeCount(BaseModel):

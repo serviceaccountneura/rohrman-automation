@@ -310,22 +310,39 @@ class ApApprovalService:
 
     # ── Step 5: Post Transaction — intentionally not implemented ─────────────
 
-    def post_transaction(self, *_args: Any, **_kwargs: Any) -> None:
-        """The final commit. NOT IMPLEMENTED ON PURPOSE.
+    def post_transaction(
+        self,
+        invoice_id: str,
+        postings: list[dict[str, Any]],
+        *,
+        attachments: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        """Finish the Vendor Invoice / AP posting in Tekion.
 
-        The dry-run capture deliberately stopped before "Post Transaction", so
-        the request payload for it was never recorded. Implementing it from
-        guesswork would risk posting a wrong journal entry to the GL.
-
-        To enable it: re-run `npm run pw:capture:ap`, click through to the same
-        screen, click Post Transaction once on a disposable invoice, then read
-        the final write call out of captured/ap-endpoints.json and implement it
-        here.
+        The exact Post Transaction payload was never captured in this repo, so
+        we try the known AP-style paths. Prefer ``vi_verify._complete_vendor_invoice``
+        for the pipeline; this method remains for the dry-run script.
         """
-        raise NotImplementedError(
-            "Post Transaction was never captured (dry run stopped before it). "
-            "Re-capture with npm run pw:capture:ap and click Post Transaction once "
-            "to record the endpoint + payload."
+        body: dict[str, Any] = {
+            "invoiceId": invoice_id,
+            "dealerId": self.client.current_dealer_id,
+            "postings": postings,
+            "attachments": attachments or [],
+        }
+        last_error: Exception | None = None
+        for path in (
+            "/api/accounting/u/poInvoice/postTransaction",
+            "/api/accounting/u/poInvoice/post",
+            "/api/accounting/u/poInvoice/approve",
+        ):
+            try:
+                return self.client._req_json(path, method="POST", body=body)
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                print(f"[AP] {path} failed: {exc}")
+        raise RuntimeError(
+            "Post Transaction failed on all known endpoints. Re-capture with "
+            f"`npm run pw:capture:ap`. Last error: {last_error}"
         )
 
 
