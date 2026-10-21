@@ -303,7 +303,13 @@ class ApApprovalService:
             is_ap_line = bool((p.get("metaData") or {}).get("apPostingLine"))
             if not is_ap_line:
                 line["description"] = expected.reference_number
-                if expected.po_type == "SUBLET" and expected.ro_number:
+                gid = str(p.get("glAccountId") or "")
+                acct = gid.split("_")[-1] if gid else ""
+                # Sublet GL 2460 → Control = RO #. All other expense GLs →
+                # Control stays as clerk set (verify enforces vendor name).
+                if acct == "2460" and expected.ro_number:
+                    line["refText"] = expected.ro_number
+                elif expected.po_type == "SUBLET" and expected.ro_number:
                     line["refText"] = expected.ro_number
             prepared.append(line)
         return prepared

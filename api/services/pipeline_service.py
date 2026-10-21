@@ -165,8 +165,10 @@ EX_NO_GL_WRITTEN = "NO_GL_ACCOUNT_WRITTEN"
 # Vendor Invoice verify flow (no PO create / no pre-invoice): OCR vs Tekion VI.
 EX_INVOICE_NUMBER_MISMATCH = "INVOICE_NUMBER_MISMATCH"
 EX_PRE_INVOICE_MISSING = "PRE_INVOICE_MISSING"
-# Expense GL starting with 7 needs control + description on the VI / JE screen.
+# Expense GL Control must be PO vendor (or RO for Sublet 2460); 7xxx need description.
 EX_JE_CONTROL_REQUIRED = "JE_CONTROL_REQUIRED"
+EX_VENDOR_MISMATCH = "VENDOR_MISMATCH"
+EX_INVOICE_DATE_MISMATCH = "INVOICE_DATE_MISMATCH"
 
 _SEVERITY = {
     EX_OCR_FAILED: "HIGH",
@@ -190,6 +192,8 @@ _SEVERITY = {
     EX_INVOICE_NUMBER_MISMATCH: "HIGH",
     EX_PRE_INVOICE_MISSING: "HIGH",
     EX_JE_CONTROL_REQUIRED: "HIGH",
+    EX_VENDOR_MISMATCH: "HIGH",
+    EX_INVOICE_DATE_MISMATCH: "HIGH",
 }
 
 # Only OCR is retried, and only because it is free of side effects: reading a
@@ -807,6 +811,11 @@ def _record_postings(
     lines: list[dict[str, Any]],
     reference: str = "",
     balance: float | None = None,
+    vi_match: dict[str, Any] | None = None,
+    invoice_amount: float | None = None,
+    tekion_amount: float | None = None,
+    invoice_date: str | None = None,
+    tekion_invoice_date: str | None = None,
 ) -> None:
     """Record the accounting lines this document put into Tekion.
 
@@ -822,6 +831,9 @@ def _record_postings(
 
     Written on failures too. A refused entry is exactly when someone wants to
     see which lines were built and where they stopped adding up.
+
+    ``vi_match`` holds the Vendor Invoice header comparison (PO #, vendor,
+    invoice #, amount, date) for the three-way match UI.
     """
     clean = [
         {
@@ -837,16 +849,25 @@ def _record_postings(
     credit = round(sum(-l["amount"] for l in clean if l["amount"] < 0), 2)
     debit = round(sum(l["amount"] for l in clean if l["amount"] > 0), 2)
 
-    doc.posting_details = json.dumps(
-        {
-            "lines": clean,
-            "creditTotal": credit,
-            "debitTotal": debit,
-            "balance": round(debit - credit, 2) if balance is None else round(balance, 2),
-            "reference": reference,
-        },
-        default=str,
-    )[:8000]
+    payload: dict[str, Any] = {
+        "lines": clean,
+        "creditTotal": credit,
+        "debitTotal": debit,
+        "balance": round(debit - credit, 2) if balance is None else round(balance, 2),
+        "reference": reference,
+    }
+    if vi_match:
+        payload["viMatch"] = vi_match
+    if invoice_amount is not None:
+        payload["invoiceAmount"] = round(float(invoice_amount), 2)
+    if tekion_amount is not None:
+        payload["tekionAmount"] = round(float(tekion_amount), 2)
+    if invoice_date:
+        payload["invoiceDate"] = invoice_date
+    if tekion_invoice_date:
+        payload["tekionInvoiceDate"] = tekion_invoice_date
+
+    doc.posting_details = json.dumps(payload, default=str)[:8000]
     session.add(doc)
     session.commit()
 
@@ -981,12 +1002,20 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         gl_splits=gl_splits,
     )
 
+    # Same local/S3 restore path the VI verify flow uses for PDF attach.
+    source_path = _resolve_source(doc)
+
     try:
         # Serialized: create_journal_entry switches dealership on the shared client.
         with tekion_scope():
             client = get_client(session)
             result = create_journal_entry(
-                client, expected=expected, dry_run=False, post=settings.oem_post
+                client,
+                expected=expected,
+                dry_run=False,
+                post=settings.oem_post,
+                attachment_file_path=source_path,
+                attachment_file_name=doc.file_name or None,
             )
     except Exception as e:  # noqa: BLE001
         print(f"[PIPE] {doc.id} journal entry failed: {e}")
@@ -1296,6 +1325,8 @@ def _run_vi_verify(
         dealership_name=doc.dealership_name,
         po_type=doc.po_type or FOLDER_MISC,
         ro_number=doc.ro_number or ocr_helpers.get_control_number(ocr) or None,
+        vendor_name=doc.vendor_name or ocr_helpers.get_vendor_name(ocr) or None,
+        invoice_date=ocr_helpers.get_invoice_date(ocr) or None,
         reference_number=invoice_number,
         invoice_file_path=source_path,
         invoice_file_name=doc.file_name or None,
@@ -1314,6 +1345,20 @@ def _run_vi_verify(
         _fail(session, doc, EX_TEKION_ERROR, error=str(e))
         return
 
+    # Always stash match + GL lines so the detail three-way panel has real $.
+    if result.gl_lines_for_doc or result.match:
+        _record_postings(
+            doc,
+            session,
+            lines=result.gl_lines_for_doc or [],
+            reference=result.po_number or po_number,
+            vi_match=result.match or None,
+            invoice_amount=float(total),
+            tekion_amount=result.tekion_amount,
+            invoice_date=result.invoice_date or expected.invoice_date,
+            tekion_invoice_date=result.tekion_invoice_date,
+        )
+
     if not result.ok:
         code = result.code or EX_TEKION_ERROR
         # Map VI codes onto pipeline constants (same string values).
@@ -1322,13 +1367,6 @@ def _run_vi_verify(
 
     doc.po_number = result.po_number or po_number
     doc.vendor_name = result.vendor_name or doc.vendor_name
-    if result.gl_lines_for_doc:
-        _record_postings(
-            doc,
-            session,
-            lines=result.gl_lines_for_doc,
-            reference=result.po_number or po_number,
-        )
 
     job_queue.complete(session, doc)
     if not settings.tekion_po_writes:

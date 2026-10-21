@@ -535,6 +535,8 @@ class TekionApiClient:
         file_path: str,
         mime_type: str | None = None,
         display_name: str | None = None,
+        module_name: str | None = None,
+        service_name: str | None = None,
     ) -> str:
         """Upload a document to Tekion's media service.
 
@@ -547,14 +549,20 @@ class TekionApiClient:
         filename — the caller usually holds the bytes in a temp file, and
         "tmp8h24mg32.jpg" means nothing to whoever opens the PO later.
 
+        `module_name` / `service_name` tag the upload for the destination
+        screen. Journal Entry capture (oem-je) sends ACCOUNTING / Journal Entry;
+        PO / Vendor Invoice uploads leave them unset.
+
         Flow:
           1. POST /api/media-v3/u/v2/initiate-upload → get presigned S3 URL + mediaId
           2. PUT the file directly to S3
           3. Poll GET /api/media-v3/u/upload-status/{mediaId} until COMPLETED
           4. POST /api/media-v3/u/v2/presignedurls → confirm upload
 
-        Returns the mediaId (used in preInvoice attachments).
+        Returns the mediaId (used in preInvoice / JE assetAttachmentDto).
         """
+        from urllib.parse import urlencode
+
         file_name = display_name or os.path.basename(file_path)
         # Tekion only previews PDFs. Convert anything else first, and keep the
         # converted file alive until the upload finishes.
@@ -565,22 +573,29 @@ class TekionApiClient:
 
         # Step 1: Initiate upload
         print(f"[API] Uploading {file_name} ({content_length} bytes)...")
+        initiate_body: dict[str, Any] = {
+            "generateThumbnail": False,
+            "folderName": "",
+            "globalMedia": False,
+            "stripMetadata": False,
+            "hlsVideoEnabled": False,
+            "moduleType": "CDMS",
+            "compressionEnabled": False,
+            "mimeType": mime_type,
+            "fileName": file_name,
+            "contentLength": content_length,
+            "fragment": False,
+        }
+        # Captured on the JE attach screen — without these Tekion still accepts
+        # the upload, but the draft's assetAttachmentDto is how the file shows.
+        if module_name:
+            initiate_body["moduleName"] = module_name
+        if service_name:
+            initiate_body["serviceName"] = service_name
         res = self._req_json(
             "/api/media-v3/u/v2/initiate-upload",
             method="POST",
-            body={
-                "generateThumbnail": False,
-                "folderName": "",
-                "globalMedia": False,
-                "stripMetadata": False,
-                "hlsVideoEnabled": False,
-                "moduleType": "CDMS",
-                "compressionEnabled": False,
-                "mimeType": mime_type,
-                "fileName": file_name,
-                "contentLength": content_length,
-                "fragment": False,
-            },
+            body=initiate_body,
         )
         upload_data = (res.get("data") or {})
         s3_url = upload_data.get("url", "")
@@ -614,9 +629,19 @@ class TekionApiClient:
                 raise Exception(f"Upload failed for mediaId={media_id}")
             time.sleep(1)
 
-        # Step 4: Confirm via presignedurls
+        # Step 4: Confirm via presignedurls (JE capture adds module query params)
+        confirm_path = "/api/media-v3/u/v2/presignedurls"
+        if module_name or service_name:
+            qs = urlencode(
+                {
+                    "attachment": "false",
+                    **({"moduleName": module_name} if module_name else {}),
+                    **({"serviceName": service_name} if service_name else {}),
+                }
+            )
+            confirm_path = f"{confirm_path}?{qs}"
         self._req_json(
-            "/api/media-v3/u/v2/presignedurls",
+            confirm_path,
             method="POST",
             body=[media_id],
         )

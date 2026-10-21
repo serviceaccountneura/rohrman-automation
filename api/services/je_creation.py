@@ -12,17 +12,20 @@ reproducing what a clerk does on Accounting -> Journal Entry -> Create New:
     3. Lines -- exactly two, and they must net to $0.00:
          line 1: GL 3000 TRADE CREDITORS  CREDIT  control = MMYY of the acct date
          line 2: GL 2410 PARTS INV        DEBIT
-    4. Submit
-         -> POST /api/accounting/u/v2/transaction/dealer/{dealerId}/post
-       Save as Draft is still here and still works
-         -> POST /api/accounting/u/v2/transaction/dealer/{dealerId}/draft
+    4. Attach the invoice PDF (media-v3 upload), then Submit or Save as Draft
+         -> POST /api/media-v3/u/v2/initiate-upload  (moduleName=ACCOUNTING)
+         -> PUT  S3 presigned URL
+         -> GET  /api/media-v3/u/upload-status/{mediaId}
+         -> POST /api/media-v3/u/v2/presignedurls
+         -> POST /api/accounting/u/v2/transaction/dealer/{dealerId}/draft|post
+            with assetAttachmentDto.attachments[{id, mediaId, name, fileSize, …}]
 
 Only three values come off the Parts Ticket PDF: invoice number, invoice date,
 invoice amount. Everything else is either fixed by the SOP (journal 76, GL 3000)
 or derived (control number, the balancing line).
 
-Endpoints were captured from a live session with `npm run pw:capture:je` and
-analysed with `npm run pw:analyze:je` (captured/je-endpoints.json).
+Endpoints were captured from a live session with `npm run pw:capture:je` /
+`npm run pw:capture:oem-je` and analysed with the matching analyze scripts.
 
 PAYLOAD NOTES (captured, not guessed -- these differ from the rest of the repo)
     * `amount` is in DOLLARS, not cents. Every other Tekion flow in this project
@@ -35,14 +38,13 @@ PAYLOAD NOTES (captured, not guessed -- these differ from the rest of the repo)
     * `journalId` is "{dealerId}_{journalNumber}", and `documentTypeId` is
       "{dealerId}_document_type_5" for "S - Payable Invoice".
     * `scheduledTime` carries the accounting date, as epoch-ms in a STRING.
+    * PDF attach: `assetAttachmentDto.attachments` lists media ids from
+      media-v3 (captured oem-je). Empty `{}` or `{attachments: []}` means no
+      file on the JE.
 
 INTEGRATION NOTE
-    Nothing here imports the PO routes, and nothing here touches the database.
-    The entry to create is described by an `ExpectedJournalEntry`, which for now
-    is a hardcoded sample (HARDCODED_EXPECTED) taken from the Toyota Parts
-    Ticket. To connect this to the OCR flow later, build an
-    ExpectedJournalEntry from the extraction contract and pass it to
-    `create_journal_entry()` -- no other change is required.
+    The pipeline builds an `ExpectedJournalEntry` from OCR and passes the local
+    invoice path as `attachment_file_path` so the draft/post carries the PDF.
 
 SAFETY
     `create_journal_entry()` runs read-only by default; every write is gated
@@ -54,11 +56,18 @@ SAFETY
 """
 from __future__ import annotations
 
+import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from api.services.tekion_client import TekionApiClient
+
+# media-v3 tags from the OEM JE attach capture (captureOemJe / oem-je-endpoints).
+_JE_MEDIA_MODULE = "ACCOUNTING"
+_JE_MEDIA_SERVICE = "Journal Entry"
 
 # ── The captured writes ───────────────────────────────────────────────────────
 # POST /api/accounting/u/v2/transaction/dealer/{dealerId}/draft  -> 200, DRAFT
@@ -202,6 +211,8 @@ class JournalEntryResult:
     resolved_accounts: dict[str, dict[str, Any]] = field(default_factory=dict)
     postings: list[dict[str, Any]] = field(default_factory=list)
     payload: dict[str, Any] = field(default_factory=dict)
+    # media-v3 id when the invoice PDF was attached to the draft/post.
+    attachment_media_id: str | None = None
     discrepancies: list[Discrepancy] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -538,21 +549,43 @@ class JournalEntryService:
         return credit_total, debit_total, round(debit_total - credit_total, 2)
 
     @staticmethod
+    def build_attachment(
+        media_id: str,
+        *,
+        name: str,
+        file_size: int,
+        uploaded_time_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """One row of assetAttachmentDto.attachments (captured oem-je draft)."""
+        uploaded = uploaded_time_ms if uploaded_time_ms is not None else int(time.time() * 1000)
+        return {
+            "id": media_id,
+            "mediaId": media_id,
+            "uploadedTime": uploaded,
+            "name": name,
+            "fileSize": file_size,
+        }
+
+    @staticmethod
     def build_payload(
         expected: ExpectedJournalEntry,
         postings: list[dict[str, Any]],
         accounting_date_ms: int,
         dealer_id: str,
         transaction_amount: float,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Assemble the Save as Draft body, matching the captured request.
 
         Description, Reference (refId) and refText all carry the invoice number,
-        per the SOP.
+        per the SOP. When `attachments` is set, the PDF shows on the JE in Tekion.
         """
         wire_postings = [
             {k: v for k, v in p.items() if not k.startswith("_")} for p in postings
         ]
+        attachment_dto: dict[str, Any] = (
+            {"attachments": attachments} if attachments else {}
+        )
         return {
             "transactionType": "GENERAL",
             "postings": wire_postings,
@@ -567,7 +600,7 @@ class JournalEntryService:
             "franchiseId": dealer_id,
             # Epoch-ms as a string is what the UI sends.
             "scheduledTime": str(accounting_date_ms),
-            "assetAttachmentDto": {},
+            "assetAttachmentDto": attachment_dto,
         }
 
     # ── Step 4: Save as Draft ────────────────────────────────────────────────
@@ -608,6 +641,8 @@ def create_journal_entry(
     dealership_name: str | None = None,
     dry_run: bool = True,
     post: bool = False,
+    attachment_file_path: str | None = None,
+    attachment_file_name: str | None = None,
 ) -> JournalEntryResult:
     """Run the Parts Manufacture Ticket SOP and write the entry.
 
@@ -618,6 +653,8 @@ def create_journal_entry(
         dry_run: when True (default) nothing is written to Tekion.
         post: submit the entry instead of leaving it as a draft. Not reversible,
             so it is off unless the caller asks for it.
+        attachment_file_path: local invoice PDF/image to attach on the JE.
+        attachment_file_name: display name in Tekion (defaults to the path basename).
     """
     expected = expected or HARDCODED_EXPECTED
     svc = JournalEntryService(client)
@@ -743,19 +780,64 @@ def create_journal_entry(
         )
         return result
 
+    # ── Attach PDF (upload happens only when writing) ────────────────────────
+    attachments: list[dict[str, Any]] | None = None
+    attach_path = (attachment_file_path or "").strip()
+    attach_name = (attachment_file_name or "").strip() or (
+        Path(attach_path).name if attach_path else ""
+    )
+    if attach_path and not Path(attach_path).is_file():
+        result.notes.append(
+            f"Attachment path {attach_path!r} is missing — JE will save without a PDF."
+        )
+        print(f"[JE] {result.notes[-1]}")
+        attach_path = ""
+
     result.payload = svc.build_payload(
         expected,
         result.postings,
         result.accounting_date_ms,
         result.dealer_id,
         result.debit_total,
+        attachments=None,
     )
 
     # ── Step 4/5: write it ───────────────────────────────────────────────────
     what = "Submit" if post else "Save as Draft"
     if dry_run:
+        if attach_path:
+            result.notes.append(
+                f"Dry run - would attach {attach_name or attach_path} then {what}."
+            )
         result.notes.append(f"Dry run - stopped before {what}. Nothing was written.")
     else:
+        if attach_path:
+            print(f"[JE] Uploading attachment {attach_name!r}…")
+            media_id = client.upload_document(
+                attach_path,
+                display_name=attach_name or None,
+                module_name=_JE_MEDIA_MODULE,
+                service_name=_JE_MEDIA_SERVICE,
+            )
+            result.attachment_media_id = media_id
+            file_size = os.path.getsize(attach_path)
+            attachments = [
+                svc.build_attachment(
+                    media_id,
+                    name=attach_name or Path(attach_path).name,
+                    file_size=file_size,
+                )
+            ]
+            result.payload = svc.build_payload(
+                expected,
+                result.postings,
+                result.accounting_date_ms,
+                result.dealer_id,
+                result.debit_total,
+                attachments=attachments,
+            )
+            result.notes.append(f"Attached invoice mediaId={media_id}")
+
         txn = (
             svc.submit(result.payload, result.dealer_id)
             if post

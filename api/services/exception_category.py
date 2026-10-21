@@ -40,6 +40,8 @@ _PO_CODES = frozenset(
         "NO_GL_ACCOUNT_WRITTEN",
         "INVOICE_NUMBER_MISMATCH",
         "AMOUNT_MISMATCH",
+        "INVOICE_DATE_MISMATCH",
+        "VENDOR_MISMATCH",
         "PO_CLOSED",
         "PO_ALREADY_INVOICED",
         "MISSING_FIELD",
