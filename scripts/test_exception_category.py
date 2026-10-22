@@ -25,7 +25,9 @@ def test_categories() -> None:
     assert category_for("PO_NOT_FOUND") == CATEGORY_WAITING
     assert category_for("AMOUNT_MISMATCH") == CATEGORY_PO
     assert category_for("INVOICE_NUMBER_MISMATCH") == CATEGORY_PO
+    assert category_for("PO_NUMBER_MISMATCH") == CATEGORY_PO
     assert category_for("JE_CONTROL_REQUIRED") == CATEGORY_JE
+    assert category_for("UNBALANCED_ENTRY") == CATEGORY_JE
     assert category_for("DUPLICATE_INVOICE") == CATEGORY_DUPLICATE
     assert category_for("DUPLICATE_DOCUMENT") == CATEGORY_DUPLICATE
     assert category_for(None, status="DUPLICATE") == CATEGORY_DUPLICATE

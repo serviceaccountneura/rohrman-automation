@@ -169,6 +169,7 @@ EX_PRE_INVOICE_MISSING = "PRE_INVOICE_MISSING"
 EX_JE_CONTROL_REQUIRED = "JE_CONTROL_REQUIRED"
 EX_VENDOR_MISMATCH = "VENDOR_MISMATCH"
 EX_INVOICE_DATE_MISMATCH = "INVOICE_DATE_MISMATCH"
+EX_PO_NUMBER_MISMATCH = "PO_NUMBER_MISMATCH"
 
 _SEVERITY = {
     EX_OCR_FAILED: "HIGH",
@@ -194,6 +195,7 @@ _SEVERITY = {
     EX_JE_CONTROL_REQUIRED: "HIGH",
     EX_VENDOR_MISMATCH: "HIGH",
     EX_INVOICE_DATE_MISMATCH: "HIGH",
+    EX_PO_NUMBER_MISMATCH: "HIGH",
 }
 
 # Only OCR is retried, and only because it is free of side effects: reading a
@@ -769,7 +771,13 @@ def _run(doc: Document, session: Session) -> None:
     # a guess, so stop before Tekion and let a person look. Only on a fresh
     # read: running it again -- with corrections or without -- is a person
     # saying they have checked it.
-    unresolved = (ocr.get("_confidence") or {}).get("unresolved") or []
+    #
+    # PO_INVOICE (VI verify): clerks are not writing GL on the PDF for now —
+    # expense GLs come from the Tekion pre-invoice. Ignore GL-line reader
+    # disagreements so a phantom "ELM1" / amount vote does not block verify.
+    unresolved = list((ocr.get("_confidence") or {}).get("unresolved") or [])
+    if doc.po_type in (FOLDER_PO_INVOICE, *_PO_INVOICE_TYPES):
+        unresolved = [u for u in unresolved if not str(u).startswith("GL line ")]
     if cached is None and unresolved:
         _fail(
             session,
@@ -1292,18 +1300,12 @@ def _run_vi_verify(
     from api.routes.tekion import get_client, reset_client
     from api.services.vi_verify import ViVerifyInput, verify_vendor_invoice
 
-    po_number = doc.po_number or ocr_helpers.get_po_number(ocr)
+    # PO # is optional here — verify finds the VI by invoice number first.
+    # doc.po_number is usually filled by _resolve_existing_po via that VI.
+    po_number = doc.po_number or ocr_helpers.get_po_number(ocr) or ""
     invoice_number = doc.invoice_number or ocr_helpers.get_invoice_number(ocr)
     total = ocr_helpers.get_total_amount(ocr)
 
-    if not po_number:
-        _fail(
-            session,
-            doc,
-            EX_PO_NOT_FOUND,
-            error="No purchase order number could be read from the invoice",
-        )
-        return
     if not invoice_number or total is None:
         _fail(
             session,
@@ -1313,7 +1315,8 @@ def _run_vi_verify(
         )
         return
 
-    doc.po_number = po_number
+    if po_number:
+        doc.po_number = po_number
     doc.invoice_number = invoice_number
     session.add(doc)
     session.commit()
@@ -1393,12 +1396,19 @@ def _resolve_existing_po(
     Parts raise and pre-invoice the PO in Tekion first. We only look it up.
     An invoice number already on the PO is expected (verify flow), not a block.
 
-      1. A PO number must be readable on the invoice.
-      2. That PO must exist at THIS dealership (exact match).
-      3. It must not be closed / cancelled / voided.
-      4. ``doc.po_type`` is set from Tekion's orderType (Sublet / Misc / Stock).
+      1. Prefer Vendor Invoice lookup by **invoice number** (Pre Invoice list),
+         then take the linked PO # — OCR often lacks PO # or misreads a date.
+      2. Fall back to PO # printed on the invoice when VI search finds nothing.
+      3. That PO must exist at THIS dealership.
+      4. It must not be closed / cancelled / voided.
+      5. ``doc.po_type`` is set from Tekion's orderType (Sublet / Misc / Stock).
     """
     from api.routes.tekion import _resolve_dealer, get_client
+    from api.services.ap_approval import ApApprovalService
+    from api.services.vi_verify import (
+        _po_num_from_vi_hit,
+        find_pre_invoice_by_invoice_number,
+    )
 
     if doc.po_type not in (FOLDER_PO_INVOICE, *_PO_INVOICE_TYPES):
         return None, False
@@ -1424,38 +1434,73 @@ def _resolve_existing_po(
         )
         return None, True
 
-    po_number = ocr_helpers.get_po_number(ocr)
-    if not po_number:
+    ocr_po_number = ocr_helpers.get_po_number(ocr)
+    invoice_number = ocr_helpers.get_invoice_number(ocr)
+    if not invoice_number and not ocr_po_number:
         _fail(
             session,
             doc,
-            EX_PO_NOT_FOUND,
+            EX_MISSING_FIELD,
             error=(
-                "No purchase order number could be read from the invoice. "
-                "These invoices are verified against an existing Tekion PO — "
-                "create and pre-invoice the PO in Tekion first, or correct the "
-                "PO number on the document and run it again."
+                "No invoice number or purchase order number could be read from "
+                "the document. Pre-invoice in Tekion with the invoice #, then "
+                "upload a clearer scan."
             ),
         )
         return None, True
 
     # The lookup is per-dealership, so the switch has to happen first.
+    found = None
     with tekion_scope():
         client = get_client(session)
         _resolve_dealer(client, doc.dealership_name)
-        found = po_reuse.look_up(client, po_number)
+
+        # Invoice-first: Pre Invoice list → linked PO #.
+        if invoice_number:
+            hit = find_pre_invoice_by_invoice_number(
+                ApApprovalService(client), invoice_number
+            )
+            if hit:
+                via_inv = _po_num_from_vi_hit(hit)
+                if via_inv:
+                    found = po_reuse.look_up(client, via_inv)
+                    if found:
+                        print(
+                            f"[PIPE] {doc.id} resolved PO {found.po_number} via "
+                            f"Vendor Invoice {invoice_number!r}"
+                        )
+
+        # Fall back to OCR PO # when VI search did not resolve a PO.
+        if found is None and ocr_po_number:
+            found = po_reuse.look_up(client, ocr_po_number)
 
     if found is None:
-        _fail(
-            session,
-            doc,
-            EX_PO_NOT_FOUND,
-            error=(
-                f"PO {po_number} was not found in Tekion at this dealership. "
-                "Nothing was posted. Create or fix the purchase order in Tekion, "
-                "then run this invoice again."
-            ),
-        )
+        if invoice_number:
+            _fail(
+                session,
+                doc,
+                EX_PRE_INVOICE_MISSING,
+                error=(
+                    f"No pre-invoiced Vendor Invoice found in Tekion for "
+                    f"{invoice_number!r}"
+                    + (
+                        f" (OCR also had PO {ocr_po_number!r}, not found)."
+                        if ocr_po_number
+                        else ". Create and pre-invoice the PO in Tekion first."
+                    )
+                ),
+            )
+        else:
+            _fail(
+                session,
+                doc,
+                EX_PO_NOT_FOUND,
+                error=(
+                    f"PO {ocr_po_number} was not found in Tekion at this dealership. "
+                    "Nothing was posted. Create or fix the purchase order in Tekion, "
+                    "then run this invoice again."
+                ),
+            )
         return None, True
 
     routed = po_reuse.pipeline_folder_for(found)

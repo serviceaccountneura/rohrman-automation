@@ -19,8 +19,9 @@ from api.services.vi_verify import (
     CODE_INVOICE_NUMBER_MISMATCH,
     CODE_JE_CONTROL,
     CODE_NO_GL,
-    CODE_PO_NOT_FOUND,
+    CODE_PO_NUMBER_MISMATCH,
     CODE_PRE_INVOICE_MISSING,
+    CODE_UNBALANCED,
     CODE_VENDOR_MISMATCH,
     ViVerifyInput,
     verify_vendor_invoice,
@@ -126,15 +127,62 @@ def _vendor_postings(ref: str = "SCHAUMBURG KIA", acct: str = "2410") -> list[di
     ]
 
 
-def test_po_not_found() -> None:
-    r = verify_vendor_invoice(client=_client(None), expected=_input(), dry_run=True)
-    assert not r.ok and r.code == CODE_PO_NOT_FOUND
-
-
-def test_pre_invoice_missing() -> None:
-    po = _po(invoice_status="NOT_PRE_INVOICED", invoice_numbers=[])
-    r = verify_vendor_invoice(client=_client(po), expected=_input(), dry_run=True)
+def test_pre_invoice_missing_no_vi() -> None:
+    """Primary lookup is by invoice number on the Pre Invoice list."""
+    r = verify_vendor_invoice(client=_client(None, hit=None), expected=_input(), dry_run=True)
     assert not r.ok and r.code == CODE_PRE_INVOICE_MISSING
+
+
+def test_ocr_po_mismatch_is_hard_fail() -> None:
+    """3-way PO #: OCR must match Tekion PO / Pre Invoice when OCR has a PO #."""
+    client = _client(_po(), hit=_hit(), postings=_vendor_postings())
+    r = verify_vendor_invoice(
+        client=client,
+        expected=_input(po_number="071526"),  # OCR garbage (looks like a date)
+        dry_run=True,
+    )
+    assert not r.ok and r.code == CODE_PO_NUMBER_MISMATCH
+    assert r.match.get("poNumber", {}).get("invoice") == "071526"
+    assert r.match.get("poNumber", {}).get("preInvoice") == "36137"
+
+
+def test_finds_vi_when_ocr_po_blank() -> None:
+    """Blank OCR PO is OK — VI + PO legs still must agree."""
+    client = _client(_po(), hit=_hit(), postings=_vendor_postings())
+    r = verify_vendor_invoice(
+        client=client,
+        expected=_input(po_number=""),
+        dry_run=True,
+    )
+    assert r.ok, r.message
+    assert r.po_number == "36137"
+
+
+def test_po_total_mismatch() -> None:
+    r = verify_vendor_invoice(
+        client=_client(
+            _po(total=99.99),
+            hit=_hit(),
+            postings=_vendor_postings(),
+        ),
+        expected=_input(invoice_amount=53.23),
+        dry_run=True,
+    )
+    assert not r.ok and r.code == CODE_AMOUNT_MISMATCH
+    assert r.match.get("amount", {}).get("po") == 99.99
+    assert r.match.get("amount", {}).get("preInvoice") == 53.23
+
+
+def test_po_vendor_vs_vi_mismatch() -> None:
+    po = _po()
+    po["vendorDetails"] = {"vendorName": "OTHER PO VENDOR", "vendorId": "1"}
+    r = verify_vendor_invoice(
+        client=_client(po, hit=_hit(), postings=_vendor_postings()),
+        expected=_input(),
+        dry_run=True,
+    )
+    assert not r.ok and r.code == CODE_VENDOR_MISMATCH
+    assert "OTHER PO VENDOR" in r.message
 
 
 def test_amount_mismatch() -> None:
@@ -146,13 +194,14 @@ def test_amount_mismatch() -> None:
     assert not r.ok and r.code == CODE_AMOUNT_MISMATCH
 
 
-def test_invoice_number_mismatch() -> None:
+def test_invoice_number_not_on_pre_invoice_list() -> None:
+    """Search returns a different invoice # → treat as missing pre-invoice."""
     r = verify_vendor_invoice(
         client=_client(_po(), hit=_hit(invoiceNumber="OTHER-999"), postings=[]),
         expected=_input(),
         dry_run=True,
     )
-    assert not r.ok and r.code == CODE_INVOICE_NUMBER_MISMATCH
+    assert not r.ok and r.code == CODE_PRE_INVOICE_MISSING
 
 
 def test_vendor_mismatch() -> None:
@@ -192,52 +241,92 @@ def test_missing_gl() -> None:
     assert not r.ok and r.code == CODE_NO_GL
 
 
-def test_control_must_be_vendor_name() -> None:
+def test_je_unbalanced_fails() -> None:
+    """PO_INVOICE JE screen: Balance must be $0.00 (same as OEM)."""
+    postings = [
+        {
+            "glAccountId": "1707_2410",
+            "amount": 53.23,
+            "description": "parts",
+            "refText": "SCHAUMBURG KIA",
+        },
+        # Credit short by $1 → Balance ≠ 0
+        {
+            "glAccountId": "1707_3002",
+            "amount": -52.23,
+            "metaData": {"apPostingLine": True},
+        },
+    ]
     r = verify_vendor_invoice(
-        client=_client(_po(), hit=_hit(), postings=_vendor_postings("WRONG CTRL", "3142")),
+        client=_client(_po(), hit=_hit(), postings=postings),
         expected=_input(),
         dry_run=True,
     )
-    assert not r.ok and r.code == CODE_JE_CONTROL
-    assert "SCHAUMBURG KIA" in r.message
+    assert not r.ok and r.code == CODE_UNBALANCED
+    assert "Balance" in r.message
+
+
+def test_control_must_be_vendor_name() -> None:
+    prev = vi_verify.ENFORCE_JE_CONTROL
+    vi_verify.ENFORCE_JE_CONTROL = True
+    try:
+        r = verify_vendor_invoice(
+            client=_client(_po(), hit=_hit(), postings=_vendor_postings("WRONG CTRL", "3142")),
+            expected=_input(),
+            dry_run=True,
+        )
+        assert not r.ok and r.code == CODE_JE_CONTROL
+        assert "SCHAUMBURG KIA" in r.message
+    finally:
+        vi_verify.ENFORCE_JE_CONTROL = prev
 
 
 def test_je_control_7xxx_needs_description() -> None:
-    postings = [
-        {
-            "glAccountId": "1707_7193",
-            "amount": 53.23,
-            "description": "",
-            "refText": "SCHAUMBURG KIA",
-        },
-        {"glAccountId": "1707_3002", "amount": -53.23, "metaData": {"apPostingLine": True}},
-    ]
-    r = verify_vendor_invoice(
-        client=_client(_po(), hit=_hit(), postings=postings),
-        expected=_input(),
-        dry_run=True,
-    )
-    assert not r.ok and r.code == CODE_JE_CONTROL
-    assert "Description" in r.message
+    prev = vi_verify.ENFORCE_JE_CONTROL
+    vi_verify.ENFORCE_JE_CONTROL = True
+    try:
+        postings = [
+            {
+                "glAccountId": "1707_7193",
+                "amount": 53.23,
+                "description": "",
+                "refText": "SCHAUMBURG KIA",
+            },
+            {"glAccountId": "1707_3002", "amount": -53.23, "metaData": {"apPostingLine": True}},
+        ]
+        r = verify_vendor_invoice(
+            client=_client(_po(), hit=_hit(), postings=postings),
+            expected=_input(),
+            dry_run=True,
+        )
+        assert not r.ok and r.code == CODE_JE_CONTROL
+        assert "Description" in r.message
+    finally:
+        vi_verify.ENFORCE_JE_CONTROL = prev
 
 
 def test_sublet_2460_control_is_ro() -> None:
-    postings = [
-        {
-            "glAccountId": "1707_2460",
-            "amount": 53.23,
-            "description": "sublet",
-            "refText": "SCHAUMBURG KIA",
-        },
-        {"glAccountId": "1707_3002", "amount": -53.23, "metaData": {"apPostingLine": True}},
-    ]
-    r = verify_vendor_invoice(
-        client=_client(_po(), hit=_hit(), postings=postings),
-        expected=_input(po_type="SUBLET", ro_number="123456"),
-        dry_run=True,
-    )
-    assert not r.ok and r.code == CODE_JE_CONTROL
-    assert "123456" in r.message
+    prev = vi_verify.ENFORCE_JE_CONTROL
+    vi_verify.ENFORCE_JE_CONTROL = True
+    try:
+        postings = [
+            {
+                "glAccountId": "1707_2460",
+                "amount": 53.23,
+                "description": "sublet",
+                "refText": "SCHAUMBURG KIA",
+            },
+            {"glAccountId": "1707_3002", "amount": -53.23, "metaData": {"apPostingLine": True}},
+        ]
+        r = verify_vendor_invoice(
+            client=_client(_po(), hit=_hit(), postings=postings),
+            expected=_input(po_type="SUBLET", ro_number="123456"),
+            dry_run=True,
+        )
+        assert not r.ok and r.code == CODE_JE_CONTROL
+        assert "123456" in r.message
+    finally:
+        vi_verify.ENFORCE_JE_CONTROL = prev
 
 
 def test_tekion_near_duplicate_flags() -> None:
@@ -249,9 +338,13 @@ def test_tekion_near_duplicate_flags() -> None:
         "payeeName": "AUTO GLASS",
         "poDetails": [{"poNum": "99999"}],
     }
+    po = _po(
+        invoice_numbers=[{"invoiceId": "inv-1", "invoiceNumber": "BLK123"}],
+    )
+    po["vendorDetails"] = {"vendorName": "AUTO GLASS", "vendorId": "1"}
     r = verify_vendor_invoice(
         client=_client(
-            _po(),
+            po,
             hit=hit,
             extra_hits=[extra],
             postings=_vendor_postings("AUTO GLASS"),
@@ -332,13 +425,17 @@ def test_norm_keeps_prefix() -> None:
 def main() -> None:
     tests = [
         test_norm_keeps_prefix,
-        test_po_not_found,
-        test_pre_invoice_missing,
+        test_pre_invoice_missing_no_vi,
+        test_ocr_po_mismatch_is_hard_fail,
+        test_finds_vi_when_ocr_po_blank,
+        test_po_total_mismatch,
+        test_po_vendor_vs_vi_mismatch,
         test_amount_mismatch,
-        test_invoice_number_mismatch,
+        test_invoice_number_not_on_pre_invoice_list,
         test_vendor_mismatch,
         test_invoice_date_mismatch,
         test_missing_gl,
+        test_je_unbalanced_fails,
         test_control_must_be_vendor_name,
         test_je_control_7xxx_needs_description,
         test_sublet_2460_control_is_ro,

@@ -39,6 +39,7 @@ _PO_CODES = frozenset(
     {
         "NO_GL_ACCOUNT_WRITTEN",
         "INVOICE_NUMBER_MISMATCH",
+        "PO_NUMBER_MISMATCH",
         "AMOUNT_MISMATCH",
         "INVOICE_DATE_MISMATCH",
         "VENDOR_MISMATCH",
@@ -53,6 +54,7 @@ _PO_CODES = frozenset(
 _JE_CODES = frozenset(
     {
         "JE_CONTROL_REQUIRED",
+        "UNBALANCED_ENTRY",
     }
 )
 
