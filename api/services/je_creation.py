@@ -35,6 +35,8 @@ PAYLOAD NOTES (captured, not guessed -- these differ from the rest of the repo)
     * `journalId` is "{dealerId}_{journalNumber}", and `documentTypeId` is
       "{dealerId}_document_type_5" for "S - Payable Invoice".
     * `scheduledTime` carries the accounting date, as epoch-ms in a STRING.
+      That instant is **dealer-TZ midnight** for the invoice calendar day
+      (not UTC midnight — UTC shifts Central stores to the previous day).
 
 INTEGRATION NOTE
     Nothing here imports the PO routes, and nothing here touches the database.
@@ -55,10 +57,13 @@ SAFETY
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from api.services.tekion_client import TekionApiClient
+
+DEFAULT_DEALER_TZ = "America/Chicago"
 
 # ── The captured writes ───────────────────────────────────────────────────────
 # POST /api/accounting/u/v2/transaction/dealer/{dealerId}/draft  -> 200, DRAFT
@@ -209,14 +214,26 @@ class JournalEntryResult:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-def _parse_date(date_str: str) -> datetime:
-    """Parse the Parts Ticket date. MM/DD/YYYY is what the ticket prints."""
+def _parse_date(date_str: str, *, tz_name: str | None = None) -> datetime:
+    """Parse the Parts Ticket date as midnight in the dealership timezone.
+
+    MM/DD/YYYY is what the ticket prints. Epoch ms for Tekion `scheduledTime`
+    must be that calendar day's 00:00 in the dealer TZ (e.g. America/Chicago),
+    not UTC midnight — otherwise Tekion displays the previous day.
+    """
+    tz = ZoneInfo((tz_name or DEFAULT_DEALER_TZ).strip() or DEFAULT_DEALER_TZ)
     for fmt in ("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d"):
         try:
-            return datetime.strptime(date_str.strip(), fmt).replace(tzinfo=timezone.utc)
+            naive = datetime.strptime(date_str.strip(), fmt)
+            return naive.replace(tzinfo=tz)
         except ValueError:
             continue
     raise ValueError(f"Unrecognised invoice date {date_str!r} (expected MM/DD/YYYY)")
+
+
+def invoice_date_to_epoch_ms(date_str: str, *, tz_name: str | None = None) -> int:
+    """Calendar invoice date → epoch ms for Tekion (dealer-TZ midnight)."""
+    return int(_parse_date(date_str, tz_name=tz_name).timestamp() * 1000)
 
 
 # Tekion truncates long reference text on the JE screen; keep part names short
@@ -673,7 +690,17 @@ def create_journal_entry(
           f"invoice {expected.invoice_number!r}, ${expected.invoice_amount:.2f}")
 
     # ── Step 2: header ───────────────────────────────────────────────────────
-    accounting_date = _parse_date(expected.invoice_date)
+    # Accounting date in dealer TZ so Tekion's JE screen matches the paper date.
+    dealer_tz = DEFAULT_DEALER_TZ
+    get_tz = getattr(client, "get_dealer_timezone", None)
+    if callable(get_tz):
+        try:
+            dealer_tz = str(get_tz() or DEFAULT_DEALER_TZ)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[JE] dealer timezone lookup failed ({exc}); using {DEFAULT_DEALER_TZ}")
+            dealer_tz = DEFAULT_DEALER_TZ
+
+    accounting_date = _parse_date(expected.invoice_date, tz_name=dealer_tz)
     result.accounting_date_ms = int(accounting_date.timestamp() * 1000)
     result.control_number = _control_number(accounting_date)
     result.journal_id = f"{result.dealer_id}_{expected.journal_number}"
@@ -681,8 +708,11 @@ def create_journal_entry(
     result.description = expected.invoice_number
     result.reference = expected.invoice_number
 
-    print(f"[JE] Accounting date: {accounting_date.strftime('%m/%d/%Y')} "
-          f"-> control {result.control_number}")
+    print(
+        f"[JE] Accounting date: {accounting_date.strftime('%m/%d/%Y')} "
+        f"({dealer_tz} midnight) -> ms={result.accounting_date_ms} "
+        f"-> control {result.control_number}"
+    )
 
     # ── Step 0/3: resolve GL accounts against the live chart ─────────────────
     resolved, problems = svc.resolve_accounts(expected)

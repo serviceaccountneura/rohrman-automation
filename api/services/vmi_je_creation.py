@@ -954,7 +954,17 @@ def create_vehicle_journal_entry(
     if dry_run:
         return result
 
-    accounting_date_ms = int(_parse_date(facts.invoice_date).timestamp() * 1000)
+    # Same dealer-TZ midnight as OEM JE — avoid UTC off-by-one on Accounting Date.
+    dealer_tz = None
+    get_tz = getattr(client, "get_dealer_timezone", None)
+    if callable(get_tz):
+        try:
+            dealer_tz = get_tz()
+        except Exception:  # noqa: BLE001
+            dealer_tz = None
+    accounting_date_ms = int(
+        _parse_date(facts.invoice_date, tz_name=dealer_tz).timestamp() * 1000
+    )
     payload = service.build_payload(facts, postings, accounting_date_ms, dealer_id, debit)
     transaction = service.save_draft(payload, dealer_id)
     result.transaction_id = transaction.get("id") or transaction.get("transactionId")

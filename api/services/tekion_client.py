@@ -99,6 +99,8 @@ class TekionApiClient:
         self.dealers: list[dict[str, str]] = []
         self._db: Session | None = db_session
         self._logged_in = False
+        # dealerId -> IANA tz from dealerMaster (e.g. America/Chicago).
+        self._dealer_tz_by_id: dict[str, str] = {}
 
     @property
     def current_dealer_id(self) -> str:
@@ -468,10 +470,37 @@ class TekionApiClient:
         """Fetch the current dealer's default address from the bootstrap endpoint."""
         res = self._req_json("/api/api-platform/u/bootstrap")
         dm = (res.get("data") or {}).get("dealerMaster") or {}
+        # Cache timezone while we have dealerMaster — used for JE scheduledTime.
+        tz = str(dm.get("timeZone") or "").strip()
+        if tz and self.dealer_id:
+            self._dealer_tz_by_id[str(self.dealer_id)] = tz
         addresses = dm.get("dealerAddress") or []
         if not addresses:
             raise Exception(f"No dealer address found for dealer {self.dealer_id}")
         return addresses[0]
+
+    def get_dealer_timezone(self) -> str:
+        """IANA timezone for the current dealership (Tekion dealerMaster.timeZone).
+
+        Used when converting a calendar invoice date to epoch ms for JE
+        `scheduledTime` / pre-invoice dates. Falls back to America/Chicago
+        (Rohrman IL stores) if Tekion does not return a value.
+        """
+        fallback = "America/Chicago"
+        dealer_id = str(self.dealer_id or "")
+        cached = self._dealer_tz_by_id.get(dealer_id)
+        if cached:
+            return cached
+        try:
+            res = self._req_json("/api/api-platform/u/bootstrap")
+            dm = (res.get("data") or {}).get("dealerMaster") or {}
+            tz = str(dm.get("timeZone") or "").strip()
+            if tz and dealer_id:
+                self._dealer_tz_by_id[dealer_id] = tz
+                return tz
+        except Exception as exc:  # noqa: BLE001
+            print(f"[API] dealer timezone fetch failed ({exc}); using {fallback}")
+        return fallback
 
     def fetch_gl_accounts(self) -> list[dict[str, Any]]:
         """Fetch GL accounts for the current dealership from Tekion.
@@ -1168,8 +1197,13 @@ class TekionApiClient:
         else:
             invoice_date_ms = None
         if not invoice_date_ms:
+            # Calendar day at dealer-TZ midnight — not UTC (avoids −1 day in Central).
+            from api.services.je_creation import invoice_date_to_epoch_ms
+
             date_str = invoice_date or datetime.now(tz=timezone.utc).strftime("%m/%d/%Y")
-            invoice_date_ms = int(datetime.strptime(date_str, "%m/%d/%Y").replace(tzinfo=timezone.utc).timestamp() * 1000)
+            invoice_date_ms = invoice_date_to_epoch_ms(
+                date_str, tz_name=self.get_dealer_timezone()
+            )
         print(f"[API] Invoice date: {datetime.fromtimestamp(invoice_date_ms / 1000, tz=timezone.utc).strftime('%m/%d/%Y')}")
 
         # Step 2: Get due date
