@@ -198,8 +198,9 @@ _SEVERITY = {
     EX_PO_NUMBER_MISMATCH: "HIGH",
 }
 
-# Only OCR is retried, and only because it is free of side effects: reading a
-# document twice costs a Gemini call and changes nothing.
+# Only side-effect-free steps are retried: OCR, and a batch split that failed
+# because Vertex was rate-limiting (nothing posted yet). Bad segmentations that
+# are not quota errors stay terminal — retrying will not invent page boundaries.
 #
 # Tekion failures are deliberately NOT retried. A run can fail *after* Tekion
 # has already created a purchase order — that is exactly what happened when a
@@ -215,14 +216,21 @@ def _fail(session: Session, doc: Document, exception_type: str, error: str = "")
     # PO that turned out to be closed, a vendor Tekion no longer has -- must go
     # back through review on a re-run, not post whatever was approved before
     # the reason it failed was known.
+    from api.services.vertex_retry import is_rate_limited
+
     doc.review_approved = False
+    # BATCH_SPLIT_FAILED after a 429: still nothing in Tekion, and a later
+    # attempt often succeeds once quota cools — same class as OCR_FAILED.
+    rate_limited_split = (
+        exception_type == EX_SPLIT_FAILED and is_rate_limited(Exception(error))
+    )
     job_queue.fail(
         session,
         doc,
         exception_type,
         severity=_SEVERITY.get(exception_type, "MEDIUM"),
         error=error,
-        retryable=exception_type in _RETRYABLE,
+        retryable=exception_type in _RETRYABLE or rate_limited_split,
     )
 
 
@@ -464,6 +472,9 @@ def _split_batch(
         # a 40-page batch became a single journal entry and looked fine.
         #
         # Hold it for a person instead. Nothing has been sent to Tekion.
+        # Vertex 429s are retried inside segment_documents and again by the
+        # queue (see _fail + is_rate_limited); other segmentation failures stay
+        # terminal exceptions.
         print(f"[SPLIT] {doc.id} could not be segmented ({e}); holding for review")
         _fail(
             session,

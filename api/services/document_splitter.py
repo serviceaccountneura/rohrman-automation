@@ -65,6 +65,7 @@ from PIL import Image  # noqa: E402
 # Reusing the model and endpoint from ocr_service also keeps one place to
 # upgrade when the Gemini version moves.
 from api.services.ocr_service import VISION_LOCATION, VISION_MODEL  # noqa: E402
+from api.services.vertex_retry import call_with_retry  # noqa: E402
 from pipeline import get_client  # noqa: E402
 
 # Finding a header needs far less resolution than reading handwriting does.
@@ -232,32 +233,38 @@ def segment_documents(file_path: str | Path) -> list[Segment]:
         parts = _render_for_segmentation(path)
         parts.append(types.Part.from_text(text=SEGMENT_PROMPT))
         client = get_client(location=VISION_LOCATION)
-        resp = client.models.generate_content(
-            model=VISION_MODEL,
-            contents=parts,
-            config=types.GenerateContentConfig(
-                temperature=0.0,
-                response_mime_type="application/json",
-                response_schema=_segment_schema(),
-                # Room for the answer AND for the model's own reasoning, which
-                # is charged to the same budget on a thinking model.
-                #
-                # 4096 was enough for a scan of about 28 invoices and silently
-                # not enough for 35: the reasoning consumed the allowance, the
-                # JSON was cut off in the middle of the third entry, parsing
-                # threw, and a 40-page batch was posted to Tekion as if it were
-                # one invoice. The ceiling has to sit far above any real batch,
-                # because crossing it does not look like an error.
-                max_output_tokens=MAX_SEGMENT_TOKENS,
-                # And cap the reasoning explicitly, so a hard page can never
-                # spend the whole budget thinking and leave nothing to answer
-                # with. Segmenting is a shallow task -- find the page where the
-                # invoice number changes -- and does not need deep reasoning.
-                thinking_config=types.ThinkingConfig(
-                    thinking_budget=SEGMENT_THINKING_TOKENS
+
+        def _generate():
+            return client.models.generate_content(
+                model=VISION_MODEL,
+                contents=parts,
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                    response_mime_type="application/json",
+                    response_schema=_segment_schema(),
+                    # Room for the answer AND for the model's own reasoning, which
+                    # is charged to the same budget on a thinking model.
+                    #
+                    # 4096 was enough for a scan of about 28 invoices and silently
+                    # not enough for 35: the reasoning consumed the allowance, the
+                    # JSON was cut off in the middle of the third entry, parsing
+                    # threw, and a 40-page batch was posted to Tekion as if it were
+                    # one invoice. The ceiling has to sit far above any real batch,
+                    # because crossing it does not look like an error.
+                    max_output_tokens=MAX_SEGMENT_TOKENS,
+                    # And cap the reasoning explicitly, so a hard page can never
+                    # spend the whole budget thinking and leave nothing to answer
+                    # with. Segmenting is a shallow task -- find the page where the
+                    # invoice number changes -- and does not need deep reasoning.
+                    thinking_config=types.ThinkingConfig(
+                        thinking_budget=SEGMENT_THINKING_TOKENS
+                    ),
                 ),
-            ),
-        )
+            )
+
+        # 429 RESOURCE_EXHAUSTED used to fail the whole batch as BATCH_SPLIT_FAILED
+        # with no retry. Wait out Vertex quota here before declaring failure.
+        resp = call_with_retry(_generate, what="SPLIT")
         import json
 
         raw = json.loads(resp.text or "{}").get("documents") or []

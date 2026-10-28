@@ -28,6 +28,7 @@ from google.genai import types  # noqa: E402
 from api.config import settings  # noqa: E402
 from api.services import confidence_read, page_enhance, page_orientation  # noqa: E402
 from api.services.ocr_helpers import to_flat_fields  # noqa: E402
+from api.services.vertex_retry import call_with_retry, is_rate_limited  # noqa: E402
 from normalize import to_po_contract  # noqa: E402
 from pipeline import get_client, load_pages, pil_to_part  # noqa: E402
 from vision_extract import VISION_PROMPT, build_response_schema, validate  # noqa: E402
@@ -100,30 +101,42 @@ def extract_document(
     parts.append(types.Part.from_text(text=VISION_PROMPT))
 
     # Vertex AI intermittently drops the connection on long structured-schema
-    # calls. Retry a few times with backoff before giving up — the pipeline's
-    # own retry is coarser (30s/120s) and burns a full OCR re-run per attempt.
+    # calls, and also returns 429 when quota is hot. Rate limits use longer
+    # backoff (call_with_retry); other transient errors keep short 5/10s sleeps.
+    # The pipeline's own retry is coarser (30s/120s) and burns a full OCR re-run.
+    def _generate():
+        return client.models.generate_content(
+            model=VISION_MODEL,
+            contents=parts,
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                response_mime_type="application/json",
+                response_schema=build_response_schema(),
+                max_output_tokens=65535,
+            ),
+        )
+
     last_err: Exception | None = None
+    resp = None
     for attempt in range(3):
         try:
-            resp = client.models.generate_content(
-                model=VISION_MODEL,
-                contents=parts,
-                config=types.GenerateContentConfig(
-                    temperature=0.0,
-                    response_mime_type="application/json",
-                    response_schema=build_response_schema(),
-                    max_output_tokens=65535,
-                ),
-            )
+            resp = call_with_retry(_generate, what="OCR")
             break
         except Exception as e:  # noqa: BLE001 — Vertex drops show up as various errors
             last_err = e
+            if is_rate_limited(e):
+                # call_with_retry already exhausted its 429 budget.
+                raise
             if attempt < 2:
                 wait = 5 * (attempt + 1)
-                print(f"[OCR] Vertex call failed (attempt {attempt + 1}/3): {e}; retrying in {wait}s")
+                print(
+                    f"[OCR] Vertex call failed (attempt {attempt + 1}/3): {e}; "
+                    f"retrying in {wait}s"
+                )
                 time.sleep(wait)
     else:
         raise last_err  # type: ignore[misc]
+    assert resp is not None
 
     try:
         doc = json.loads(resp.text or "{}")
