@@ -1054,6 +1054,9 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         ],
         reference=result.transaction_number or result.reference or "",
         balance=result.balance,
+        # Persist the ticket date so the detail page can show Invoice Date
+        # (same value posted as Tekion scheduledTime / Accounting Date).
+        invoice_date=invoice_date,
     )
 
     # Checked before `balanced`: a refused entry never got as far as balancing,
@@ -1210,6 +1213,7 @@ def _run_vehicle_journal_entry(
         ],
         reference=result.transaction_number or facts.stock_number or "",
         balance=result.balance,
+        invoice_date=facts.invoice_date,
     )
 
     # Checked before the balance: a refused entry never reached the balance
