@@ -177,15 +177,13 @@ def confirm_duplicate(
     document_id: UUID,
     session: Annotated[Session, Depends(get_session)],
 ) -> PipelineStatusResponse:
-    """Reprocess a document that was held as a duplicate.
+    """Resolve a held duplicate: Process (local original) or Ignore (Tekion).
 
-    The invoice keeps ONE identity: the new upload is folded into the original
-    document, which is re-queued with the duplicate check waived for that run,
-    and the extra row is dropped. The response is the ORIGINAL document — poll
-    that id from here, not the one that was posted to.
+    Local DB duplicate: fold this upload into the original document, re-queue
+    that original with the duplicate check waived once, and drop this row.
 
-    This will create a second record in Tekion. That is the point of confirming,
-    but it is worth saying plainly.
+    Tekion Pre Invoice near-duplicate (no local original): re-queue this same
+    document with near-dup checks waived once ("Ignore" on the dashboard).
     """
     doc = session.get(Document, job_queue.resolve_id(session, document_id))
     if doc is None:

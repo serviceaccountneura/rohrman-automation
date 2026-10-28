@@ -171,6 +171,27 @@ def hold_as_duplicate(session: Session, doc: Document, original: Document) -> No
     print(f"[QUEUE] {doc.id} -> DUPLICATE of {original.id}")
 
 
+def hold_as_tekion_duplicate(session: Session, doc: Document, message: str) -> None:
+    """Park a run that matches another Pre Invoice on Tekion (near-duplicate).
+
+    No prior document in our DB — the clash is on Tekion's Pre Invoice list
+    (same digit pattern + shared PO or amount). Dashboard actions are Discard
+    or Ignore (waive the near-dup check once and continue).
+    """
+    doc.status = STATUS_DUPLICATE
+    doc.duplicate_of = None
+    doc.exception_type = "DUPLICATE_INVOICE"
+    doc.severity = "HIGH"
+    doc.locked_at = None
+    doc.locked_by = ""
+    doc.next_attempt_at = None
+    doc.processed_at = _utcnow()
+    doc.last_error = (message or "Possible duplicate Pre Invoice in Tekion")[:1000]
+    session.add(doc)
+    session.commit()
+    print(f"[QUEUE] {doc.id} -> DUPLICATE (Tekion Pre Invoice near-match)")
+
+
 def hold_for_po_decision(session: Session, doc: Document, found: Any, summary: str) -> None:
     """Park a run whose invoice names a purchase order that already exists.
 
@@ -271,15 +292,24 @@ def confirm_duplicate(session: Session, doc: Document) -> Document:
     """
     original = session.get(Document, doc.duplicate_of) if doc.duplicate_of else None
     if original is None:
-        # The original was deleted while this sat in review; the duplicate is
-        # no longer a duplicate, so let it run on its own.
+        # Tekion near-dup hold (no local original), or the original was deleted
+        # while this sat in review. Re-queue with duplicate checks waived once
+        # (DB + Tekion near-dup) — dashboard "Ignore".
         doc.status = STATUS_QUEUED
         doc.duplicate_of = None
         doc.duplicate_override = True
+        doc.exception_type = None
+        doc.severity = None
         doc.last_error = ""
         doc.processed_at = None
+        doc.attempts = 0
+        doc.locked_at = None
+        doc.locked_by = ""
+        doc.next_attempt_at = None
         session.add(doc)
         session.commit()
+        session.refresh(doc)
+        print(f"[QUEUE] duplicate ignored -- re-running {doc.id}")
         return doc
 
     # Carry the new upload over: the file itself, and what OCR made of it.

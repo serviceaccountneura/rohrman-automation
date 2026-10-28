@@ -330,11 +330,43 @@ def test_sublet_2460_control_is_ro() -> None:
 
 
 def test_tekion_near_duplicate_flags() -> None:
+    """Pattern match + same amount as the exact VI → DUPLICATE_INVOICE."""
     hit = _hit(invoiceNumber="BLK123", payeeName="AUTO GLASS")
     extra = {
         "id": "inv-2",
         "invoiceNumber": "123",
-        "invoiceAmount": {"amount": 5323},
+        "invoiceAmount": {"amount": 5323},  # same $53.23 as exact match
+        "payeeName": "AUTO GLASS",
+        "poDetails": [{"poNum": "99999"}],  # different PO — amount alone confirms
+    }
+    po = _po(
+        invoice_numbers=[{"invoiceId": "inv-1", "invoiceNumber": "BLK123"}],
+    )
+    po["vendorDetails"] = {"vendorName": "AUTO GLASS", "vendorId": "1"}
+    r = verify_vendor_invoice(
+        client=_client(
+            po,
+            hit=hit,
+            extra_hits=[extra],
+            postings=_vendor_postings("AUTO GLASS"),
+        ),
+        expected=_input(
+            invoice_number="BLK123",
+            invoice_amount=53.23,
+            vendor_name="AUTO GLASS",
+        ),
+        dry_run=True,
+    )
+    assert not r.ok and r.code == CODE_DUPLICATE
+
+
+def test_tekion_near_duplicate_requires_po_or_amount() -> None:
+    """Same digit pattern but different PO and amount is not a duplicate."""
+    hit = _hit(invoiceNumber="BLK123", payeeName="AUTO GLASS")
+    extra = {
+        "id": "inv-2",
+        "invoiceNumber": "123",
+        "invoiceAmount": {"amount": 9900},  # $99.00 — not the exact VI total
         "payeeName": "AUTO GLASS",
         "poDetails": [{"poNum": "99999"}],
     }
@@ -356,7 +388,38 @@ def test_tekion_near_duplicate_flags() -> None:
         ),
         dry_run=True,
     )
-    assert not r.ok and r.code == CODE_DUPLICATE
+    assert r.ok, r.message
+
+
+def test_tekion_near_duplicate_skipped_when_ignored() -> None:
+    hit = _hit(invoiceNumber="BLK123", payeeName="AUTO GLASS")
+    extra = {
+        "id": "inv-2",
+        "invoiceNumber": "123",
+        "invoiceAmount": {"amount": 5323},
+        "payeeName": "AUTO GLASS",
+        "poDetails": [{"poNum": "36137"}],
+    }
+    po = _po(
+        invoice_numbers=[{"invoiceId": "inv-1", "invoiceNumber": "BLK123"}],
+    )
+    po["vendorDetails"] = {"vendorName": "AUTO GLASS", "vendorId": "1"}
+    r = verify_vendor_invoice(
+        client=_client(
+            po,
+            hit=hit,
+            extra_hits=[extra],
+            postings=_vendor_postings("AUTO GLASS"),
+        ),
+        expected=_input(
+            invoice_number="BLK123",
+            invoice_amount=53.23,
+            vendor_name="AUTO GLASS",
+            skip_near_duplicate_check=True,
+        ),
+        dry_run=True,
+    )
+    assert r.ok, r.message
 
 
 def test_happy_path_dry_run() -> None:
@@ -440,6 +503,8 @@ def main() -> None:
         test_je_control_7xxx_needs_description,
         test_sublet_2460_control_is_ro,
         test_tekion_near_duplicate_flags,
+        test_tekion_near_duplicate_requires_po_or_amount,
+        test_tekion_near_duplicate_skipped_when_ignored,
         test_happy_path_dry_run,
         test_happy_path_completes_when_writes_on,
         test_pipeline_po_invoice_path_never_preinvoices,

@@ -72,6 +72,8 @@ class ViVerifyInput:
     reference_number: str = ""
     invoice_file_path: str | None = None
     invoice_file_name: str | None = None
+    # One-shot waive after dashboard "Ignore" on a Tekion near-duplicate hold.
+    skip_near_duplicate_check: bool = False
 
 
 @dataclass
@@ -597,19 +599,31 @@ def verify_vendor_invoice(
         result.match = _snap()
         return result
 
-    # ── Near-duplicates on Tekion's Pre Invoice list (BLK123 vs 123, …RI) ──
-    dup = _find_tekion_near_duplicates(svc, invoice_number, result.invoice_id)
-    if dup:
-        others = ", ".join(repr(x) for x in dup)
-        result.code = CODE_DUPLICATE
-        result.message = (
-            f"Tekion already has another Pre Invoice whose number looks like the "
-            f"same invoice ({invoice_number!r}): {others}. Letter prefixes or "
-            "suffixes may have been dropped when the PO was typed. Verify in "
-            "Tekion and remove the duplicate before this one is posted."
+    # ── Near-duplicates on Tekion's Pre Invoice list (Daisy check) ─────────
+    # Exact invoice # already matched above. Also scan for pattern variants
+    # (BLK123 vs 123). Only hold as duplicate when that other Pre Invoice
+    # shares this VI's PO number OR total amount — same rule Parts use on
+    # the Pre Invoice screen.
+    if not expected.skip_near_duplicate_check:
+        dup = _find_confirmed_tekion_near_duplicates(
+            svc,
+            invoice_number,
+            result.invoice_id,
+            matched_po=vi_po,
+            matched_amount=vi_amount,
         )
-        result.match = _snap()
-        return result
+        if dup:
+            others = ", ".join(repr(x) for x in dup)
+            result.code = CODE_DUPLICATE
+            result.message = (
+                f"Tekion already has another Pre Invoice whose number looks like "
+                f"the same invoice ({invoice_number!r}): {others}. That row "
+                "shares this invoice's PO number or total amount, so it may be "
+                "the same bill typed with letters dropped or added. Discard this "
+                "upload, or Ignore to continue anyway."
+            )
+            result.match = _snap()
+            return result
 
     # ── 4. Invoice Amount exact cents (invoice ↔ PO ↔ Pre-invoice) ───────────
     if vi_amount is None:
@@ -814,12 +828,19 @@ def verify_vendor_invoice(
     return result
 
 
-def _find_tekion_near_duplicates(
+def _find_confirmed_tekion_near_duplicates(
     svc: ApApprovalService,
     invoice_number: str,
     matched_invoice_id: str | None,
+    *,
+    matched_po: str,
+    matched_amount: float | None,
 ) -> list[str]:
-    """Other PRE_INVOICED invoice numbers that share this digit core."""
+    """Other Pre Invoices that look like the same # and share PO or amount.
+
+    Pattern-only hits (same digits, different letters) are not enough — Parts
+    also confirm against the exact-matched row's PO number or total.
+    """
     core = invoice_digits(invoice_number)
     if not core:
         return []
@@ -833,12 +854,21 @@ def _find_tekion_near_duplicates(
             continue
         if our_id and other_id == our_id:
             continue
+        if _invoice_numbers_equal(other_num, invoice_number):
+            continue
         key = normalize_invoice(other_num)
         if key in seen:
             continue
-        if invoices_are_near_duplicates(invoice_number, other_num):
-            seen.add(key)
-            found.append(other_num)
+        if not invoices_are_near_duplicates(invoice_number, other_num):
+            continue
+        other_po = _po_num_from_vi_hit(hit)
+        other_amt = _money(hit.get("invoiceAmount"))
+        po_same = bool(matched_po and other_po and _po_nums_equal(matched_po, other_po))
+        amt_same = _money_eq(matched_amount, other_amt)
+        if not (po_same or amt_same):
+            continue
+        seen.add(key)
+        found.append(other_num)
     return found
 
 

@@ -733,9 +733,11 @@ def _run(doc: Document, session: Session) -> None:
     # ── 4. Idempotency ───────────────────────────────────────────────────────
     # Checked after OCR because the invoice number is only known now. A repeat
     # upload is held for a decision rather than posted twice to Tekion — see
-    # job_queue.hold_as_duplicate. A user who confirms gets `duplicate_override`
-    # set for exactly this run.
+    # job_queue.hold_as_duplicate. Ignore / confirm sets `duplicate_override`
+    # for exactly this run (also skips Tekion Pre Invoice near-dup check).
+    waive_dup_checks = False
     if doc.duplicate_override:
+        waive_dup_checks = True
         doc.duplicate_override = False
         session.add(doc)
         session.commit()
@@ -799,7 +801,13 @@ def _run(doc: Document, session: Session) -> None:
     elif doc.po_type in (FOLDER_PO_INVOICE, *_PO_INVOICE_TYPES):
         # Unified PO inbox (and legacy Sublet/Misc/Stock uploads): look up the
         # Tekion PO, set the concrete type from orderType, then pre-invoice.
-        _run_po_invoice(doc, ocr, session, original)
+        _run_po_invoice(
+            doc,
+            ocr,
+            session,
+            original,
+            skip_near_duplicate_check=waive_dup_checks,
+        )
     else:
         _fail(
             session,
@@ -1264,6 +1272,8 @@ def _run_po_invoice(
     ocr: dict[str, Any],
     session: Session,
     source_path: str | None,
+    *,
+    skip_near_duplicate_check: bool = False,
 ) -> None:
     """Verify the invoice against an already pre-invoiced Tekion VI.
 
@@ -1287,7 +1297,13 @@ def _run_po_invoice(
         )
         return
 
-    _run_vi_verify(doc, ocr, session, source_path)
+    _run_vi_verify(
+        doc,
+        ocr,
+        session,
+        source_path,
+        skip_near_duplicate_check=skip_near_duplicate_check,
+    )
 
 
 def _run_vi_verify(
@@ -1295,6 +1311,8 @@ def _run_vi_verify(
     ocr: dict[str, Any],
     session: Session,
     source_path: str | None,
+    *,
+    skip_near_duplicate_check: bool = False,
 ) -> None:
     """Compare OCR to the Tekion Vendor Invoice; on pass complete the VI."""
     from api.routes.tekion import get_client, reset_client
@@ -1333,6 +1351,7 @@ def _run_vi_verify(
         reference_number=invoice_number,
         invoice_file_path=source_path,
         invoice_file_name=doc.file_name or None,
+        skip_near_duplicate_check=skip_near_duplicate_check,
     )
 
     try:
@@ -1364,6 +1383,13 @@ def _run_vi_verify(
 
     if not result.ok:
         code = result.code or EX_TEKION_ERROR
+        # Tekion Pre Invoice near-dup → dashboard Duplicate (Discard / Ignore),
+        # not a hard EXCEPTION.
+        if code == EX_DUPLICATE_INVOICE:
+            job_queue.hold_as_tekion_duplicate(
+                session, doc, result.message or "; ".join(result.notes)
+            )
+            return
         # Map VI codes onto pipeline constants (same string values).
         _fail(session, doc, code, error=result.message or "; ".join(result.notes))
         return
