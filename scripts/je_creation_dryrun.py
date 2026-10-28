@@ -83,6 +83,11 @@ def main() -> int:
         help="With --save, SUBMIT the entry instead of saving a draft. A posted "
              "entry cannot be undone in the UI.",
     )
+    ap.add_argument(
+        "--attach", metavar="PDF",
+        help="Local invoice PDF/image to attach on the JE (media-v3 + "
+             "assetAttachmentDto). Only uploaded when --save is set.",
+    )
     args = ap.parse_args()
 
     expected = ExpectedJournalEntry(
@@ -128,8 +133,17 @@ def main() -> int:
     if args.save:
         kind = "POSTED" if args.post else "DRAFT"
         print(f"  !! --save given: a real {kind} transaction will be created.\n")
+    attach = args.attach
+    if attach and not Path(attach).is_file():
+        print(f"  Attachment not found: {attach}")
+        return 1
     result = create_journal_entry(
-        client, expected=expected, dry_run=not args.save, post=args.post
+        client,
+        expected=expected,
+        dry_run=not args.save,
+        post=args.post,
+        attachment_file_path=attach,
+        attachment_file_name=Path(attach).name if attach else None,
     )
 
     _rule("Result")
@@ -146,6 +160,7 @@ def main() -> int:
           f"(known vendor: {result.control_number_known})")
     print(f"  credit / debit / balance : ${result.credit_total:.2f} / "
           f"${result.debit_total:.2f} / ${result.balance:.2f}")
+    print(f"  attachment media id      : {result.attachment_media_id}")
 
     if result.resolved_accounts:
         print("\n  GL accounts resolved from Tekion:")

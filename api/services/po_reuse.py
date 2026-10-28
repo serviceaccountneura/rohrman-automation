@@ -1,25 +1,19 @@
-"""Reuse a purchase order the invoice already names.
+"""Match a purchase order the invoice already names (Sublet / Misc).
 
-THE PROBLEM
-    Sublet and Misc invoices always created a NEW purchase order, even when the
-    invoice plainly printed the number of one that already existed in Tekion.
-    The clerk who raised that PO then had two: the real one, still open, and
-    ours, carrying the invoice.
+THE PROBLEM (historical)
+    Sublet and Misc invoices used to create a NEW purchase order even when the
+    invoice printed the number of one that already existed in Tekion. The clerk
+    who raised that PO then had two: the real one, still open, and ours.
 
-THE SHAPE OF THE ANSWER
-    Read the number off the invoice, look it up, and if it is there ask whether
-    to use it. Nothing here decides on its own to post against a purchase order
-    somebody else raised -- that is a person's call, and the pipeline stops and
-    asks for it.
-
-    Everything this needs already existed for the vendor stock-order flow, which
-    has always invoiced against a PO rather than creating one:
+THE SHAPE OF THE ANSWER (current)
+    Parts raise the PO in Tekion first. We only read the number off the invoice,
+    look it up, and pre-invoice against it -- same idea as the vendor stock
+    flow. We do not create Sublet/Misc POs, and we do not ask "create a new
+    one?". If the number is missing or not in Tekion, the document fails.
 
         ocr_helpers.get_po_number()          the number on the page
         TekionApiClient.find_purchase_order() the exact-match lookup
         TekionApiClient.pre_invoice()         takes any PO's id/number/universalId
-
-    So this module is the decision, not the plumbing.
 
 WHAT THE PO RECORD TELLS US
     The search hit carries `invoiceStatus` and `invoiceNumbers`. The second is
@@ -154,9 +148,8 @@ def _invoice_numbers(hit: dict[str, Any]) -> list[str]:
 def look_up(client: Any, po_number: str) -> FoundPo | None:
     """The purchase order with this number at the client's current dealership.
 
-    Returns None when there is no such PO, which is not a failure: it means the
-    number on the invoice refers to nothing here, and the normal flow -- create
-    a PO, then invoice it -- is exactly right.
+    Returns None when there is no such PO. For Sublet/Misc that is a failure
+    upstream (we do not create POs); the caller turns it into PO_NOT_FOUND.
 
     The caller must already have switched dealership. Every field this reads is
     per-store, and a PO number is only unique within one.
@@ -227,3 +220,88 @@ def describe(found: FoundPo) -> str:
     if found.invoice_numbers:
         bits.append("invoice " + ", ".join(found.invoice_numbers))
     return " · ".join(bits)
+
+
+def as_pre_invoice_po(found: FoundPo) -> dict[str, Any]:
+    """Search hit shaped for ``client.pre_invoice`` / CreatePoResponse fields.
+
+    Tekion's purchase search returns ``id`` / ``orderNumber``; the create-PO
+    response (and pre-invoice call) use ``poId`` / ``poNumber``. Both keys are
+    set so either naming works.
+    """
+    po = dict(found.raw)
+    po_id = found.po_id if found.po_id is not None else po.get("id")
+    po_number = found.po_number or str(po.get("orderNumber") or "")
+    universal = found.universal_id or str(po.get("universalId") or "")
+    po["id"] = po_id
+    po["poId"] = po_id
+    po["orderNumber"] = po_number
+    po["poNumber"] = po_number
+    po["universalId"] = universal
+    po["status"] = found.status or str(po.get("status") or "")
+    po["orderType"] = found.order_type or str(po.get("orderType") or "")
+    return po
+
+
+def pipeline_folder_for(found: FoundPo) -> str | None:
+    """Map Tekion's PO type onto our pipeline folder, or None if unknown.
+
+    Prefers ``orderType``, then the prefix of ``universalId``
+    (``MISCELLANEOUS%10950`` → MISCELLANEOUS). That is what lets one upload
+    folder accept Sublet, Misc and Vendor Stock invoices without the clerk
+    sorting them first.
+    """
+    raw = (found.order_type or "").strip().upper()
+    if not raw and found.universal_id:
+        raw = str(found.universal_id).split("%", 1)[0].strip().upper()
+    if raw in {"MISCELLANEOUS", "MISC"}:
+        return "MISCELLANEOUS"
+    if raw == "SUBLET":
+        return "SUBLET"
+    if raw in {"NON_OEM_STOCK_ORDER", "PARTS", "STOCK"}:
+        return "STOCK"
+    return None
+
+
+def vendor_from_po(po: dict[str, Any]) -> dict[str, str] | None:
+    """Vendor fields Tekion already has on the PO, ready for pre-invoice."""
+    vd = po.get("vendorDetails") or {}
+    vendor_id = vd.get("vendorId") or vd.get("id")
+    if not vendor_id:
+        return None
+    site = vd.get("vendorSiteId") or vendor_id
+    return {
+        "id": str(vendor_id),
+        "siteId": str(site),
+        "name": str(vd.get("vendorName") or ""),
+        "displayId": str(vd.get("vendorDisplayId") or ""),
+        "phone": str(vd.get("vendorPhone") or ""),
+        "email": str(vd.get("vendorEmail") or ""),
+    }
+
+
+def misc_gl_splits_from_po(po: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expense GL lines from a Misc PO's ``miscItemPurchaseDetails``.
+
+    Used when the invoice has no handwritten splits and Tekion's
+    ``preInvoicing/postings`` call comes back empty.
+    """
+    splits: list[dict[str, Any]] = []
+    for ln in po.get("miscItemPurchaseDetails") or []:
+        gl = str(ln.get("glAccountId") or "").strip()
+        if not gl:
+            continue
+        try:
+            amount = float(ln.get("grossTotalPrice") if ln.get("grossTotalPrice") is not None else ln.get("price") or 0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        if not amount:
+            continue
+        splits.append(
+            {
+                "gl_account_id": gl,
+                "amount": round(amount, 2),
+                "description": str(ln.get("item") or "") or None,
+            }
+        )
+    return splits

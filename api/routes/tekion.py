@@ -1,6 +1,8 @@
-"""Tekion routes — unified PO creation + vendor mapping management.
+"""Tekion routes — PO helpers + vendor mapping management.
 
-POST /api/tekion/po        — create sublet, misc, or stock PO (discriminated by po_type)
+POST /api/tekion/po        — create a STOCK PO only (Sublet/Misc create is off;
+                             those invoices pre-invoice an existing Tekion PO
+                             via the upload pipeline)
 GET  /api/tekion/vendors/{dealer_id}  — list vendor mappings for a dealer
 POST /api/tekion/vendors   — add/update a vendor mapping (after human review)
 """
@@ -32,7 +34,7 @@ from api.services.tekion_client import TekionApiClient
 from api.services.tekion_lock import tekion_scope
 from api.services.vendor_service import _normalize, resolve_vendor
 from api.services.gl_service import resolve_gl
-from api.services.gl_service_misc import resolve_misc_gl, refresh_gl_accounts as refresh_gl_cache
+from api.services.gl_service_misc import refresh_gl_accounts as refresh_gl_cache
 
 router = APIRouter(prefix="/api/tekion", tags=["tekion"])
 
@@ -162,6 +164,18 @@ def create_po(
     req: CreatePoRequest,
     session: Annotated[Session, Depends(get_session)],
 ) -> CreatePoResponse:
+    # Sublet/Misc no longer create POs via this route — only STOCK still does.
+    # Invoice uploads go through the pipeline, which matches an existing PO.
+    if isinstance(req, (CreateSubletPoRequest, CreateMiscPoRequest)):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Creating Sublet/Miscellaneous purchase orders is turned off. "
+                "Raise the PO in Tekion, then upload the invoice through Document "
+                "Intake so it can be pre-invoiced against that PO."
+            ),
+        )
+
     # invoice_file_path may be an S3 key (the frontend uploads there directly and
     # never has a local path). Resolve it to a real file for the duration of the
     # call; anything downloaded is cleaned up on the way out.
@@ -173,12 +187,10 @@ def create_po(
         # concurrent requests for different dealerships would otherwise interleave
         # and post to the wrong one. The flow logic itself is unchanged.
         with tekion_scope():
-            if isinstance(req, CreateSubletPoRequest):
-                response = _create_sublet_po(req, session)
-            elif isinstance(req, CreateStockPoRequest):
+            if isinstance(req, CreateStockPoRequest):
                 response = _create_stock_po(req, session)
             else:
-                response = _create_misc_po(req, session)
+                raise HTTPException(status_code=400, detail="Unsupported PO type")
 
     if req.document_id is not None:
         _record_po_result(req.document_id, req, response, session)
@@ -247,113 +259,33 @@ def _create_sublet_po(
     session: Session,
     existing_po: dict | None = None,
 ) -> CreatePoResponse:
-    """Raise a sublet PO and pre-invoice it.
+    """Pre-invoice an existing sublet PO in Tekion.
 
-    `existing_po` reuses a purchase order already in Tekion instead of creating
-    one -- see api/services/po_reuse.py. Everything after the PO is identical
-    either way, which is the point: the reuse path is not a second
-    implementation of pre-invoicing that can drift from this one.
+    New Sublet POs are not created here -- parts raise them in Tekion first.
+    `existing_po` is required (see api/services/po_reuse.py).
     """
+    if not existing_po:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Creating a sublet purchase order is turned off. Raise the PO in "
+                "Tekion first, then upload the invoice to pre-invoice against it."
+            ),
+        )
     try:
+        from api.services import po_reuse
+
         client = get_client(session)
         dealer_id = _resolve_dealer(client, req.dealership_name)
-        vendor = _resolve_vendor(
+        po = existing_po
+        vendor = po_reuse.vendor_from_po(po) or _resolve_vendor(
             client, dealer_id, req.vendor_name, session, req.vendor_codes
         )
-
-        # Build sublet items — each line item has its own RO + job.
-        #
-        # Skipped entirely when reusing: the items describe a PO to be CREATED,
-        # and the one we are invoicing already has its own. Skipping also avoids
-        # the RO-by-VIN search, which is the most failure-prone step in this
-        # flow and has nothing to say about a PO somebody else raised.
-        items: list[dict] = []
-        for li in req.line_items if not existing_po else []:
-            # The same two-step as the pipeline: an open order if there is
-            # one, otherwise whatever the number names. The VIN path always
-            # finds an open order first, so its behaviour does not change.
-            ros = client.search_ro(li.ro_number) or client.search_ro(
-                li.ro_number, include_closed=True
-            )
-            if not ros:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"No RO found for '{li.ro_number}'",
-                )
-            ro = next(
-                (r for r in ros if str(r.get("roNumber")) == str(li.ro_number)),
-                ros[0],
-            )
-
-            jobs = client.get_ro_jobs(ro["id"])
-            if not jobs:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"No jobs found on RO {li.ro_number}",
-                )
-
-            job = jobs[0]
-            matched = next((j for j in jobs if j["jobNumber"] == li.job_number), None)
-            if matched:
-                job = matched
-            elif li.job_number:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Job '{li.job_number}' not found on RO {li.ro_number}",
-                )
-
-            items.append(
-                {
-                    "description": li.description,
-                    "jobId": job["id"],
-                    "referenceId": ro["id"],
-                    "referenceNumber": ro["roNumber"],
-                    "opcode": li.opcode,
-                    "category": "MISCELLANEOUS",
-                    "laborAmount": li.labor_amount,
-                    "partsAmount": li.parts_amount,
-                }
-            )
-
-        if existing_po:
-            po = existing_po
-        else:
-            # If no line items, we still need an RO — require at least one.
-            if not items:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Sublet PO requires at least one line item with an RO number",
-                )
-
-            # The tax belongs on the order too, or the PO is worth the work
-            # while the invoice against it is worth the work plus tax. It hangs
-            # off the same RO job as the first line -- a sublet line must name a
-            # job, and the tax is for that job's work.
-            if req.sales_tax and round(req.sales_tax, 2) > 0 and items:
-                items.append(
-                    {
-                        **items[0],
-                        "description": "SALES TAX",
-                        "laborAmount": 0.0,
-                        "partsAmount": round(req.sales_tax, 2),
-                    }
-                )
-
-            po = _PO_NOT_CREATED if not settings.tekion_po_writes else client.create_sublet_po(  # TEKION_PO_WRITES
-                vendor_id=int(vendor["id"]),
-                vendor_name=vendor["name"],
-                vendor_display_id=vendor["displayId"],
-                vendor_site_id=vendor["siteId"],
-                vendor_phone=vendor["phone"],
-                vendor_email=vendor["email"],
-                items=items,
-            )
 
         # Pre-invoice — GL 2460 for sublet, AP GL 3002.
         gl_account_id = f"{dealer_id}_2460"
         ap_gl_account_id = f"{dealer_id}_3002"
-        # The control the pre-invoice carries. Normally the RO the sublet was
-        # raised against; for a reused PO that RO is the one already on it.
+        # Control from the invoice RO if present, else the one already on the PO.
         ref_text = (
             req.line_items[0].ro_number
             if req.line_items
@@ -382,14 +314,9 @@ def _create_sublet_po(
             ref_text=ref_text,
             po_type="SUBLET",
             sales_tax=req.sales_tax,
-            # An order WE raised carries a SALES TAX line, so this invoice
-            # uses all of it -- consuming the net would leave the tax
-            # outstanding on a PO that could then never be closed.
-            #
-            # A REUSED order has no such line: somebody else raised it, for
-            # whatever it is worth, and claiming the tax from it as well would
-            # consume more of their PO than this invoice is entitled to.
-            po_covers_tax=existing_po is None,
+            # Reused orders have no SALES TAX line we raised; do not consume
+            # more of their PO than this invoice is entitled to.
+            po_covers_tax=False,
             attachment_media_ids=attachment_media_ids or None,
         )
 
@@ -423,61 +350,40 @@ def _create_misc_po(
     session: Session,
     existing_po: dict | None = None,
 ) -> CreatePoResponse:
-    """Raise a misc PO and pre-invoice it.
+    """Pre-invoice an existing misc PO in Tekion.
 
-    `existing_po` reuses a purchase order already in Tekion instead of creating
-    one -- see api/services/po_reuse.py. The GL work below is unchanged either
-    way: which accounts the invoice hits is a property of the invoice, not of
-    who raised the order it pays.
+    New Misc POs are not created here -- parts raise them in Tekion first.
+    `existing_po` is required. GL prefers Tekion ``preInvoicing/postings``,
+    then the PO's misc lines, then any splits written on the invoice.
     """
+    if not existing_po:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Creating a miscellaneous purchase order is turned off. Raise "
+                "the PO in Tekion first, then upload the invoice to pre-invoice "
+                "against it."
+            ),
+        )
     try:
+        from api.services import po_reuse
+
         client = get_client(session)
         dealer_id = _resolve_dealer(client, req.dealership_name)
-        vendor = _resolve_vendor(
+        po = existing_po
+        vendor = po_reuse.vendor_from_po(po) or _resolve_vendor(
             client, dealer_id, req.vendor_name, session, req.vendor_codes
         )
 
-        # Build misc items — each line item has its own GL account.
-        if req.line_items:
-            items = [
-                {
-                    "description": li.part_name,
-                    "qty": li.qty,
-                    "price": li.unit_price,
-                }
-                for li in req.line_items
-            ]
-        else:
-            items = [{"description": "Misc purchase", "qty": 1, "price": req.invoice_amount}]
-
-        if existing_po:
-            po = existing_po
-        else:
-            po = _PO_NOT_CREATED if not settings.tekion_po_writes else client.create_misc_po(  # TEKION_PO_WRITES
-                vendor_id=vendor["id"],
-                vendor_name=vendor["name"],
-                vendor_display_id=vendor["displayId"],
-                vendor_site_id=vendor["siteId"],
-                vendor_phone=vendor["phone"],
-                vendor_email=vendor["email"],
-                items=items,
-                sales_tax=req.sales_tax,
-            )
-
-        # Pre-invoice — use OCR-extracted GL accounts if present, else LLM fallback.
         ap_gl_account_id = f"{dealer_id}_3002"
         gl_splits: list[dict] | None = None
         gl_account_id: str | None = None
+        gl_source = "tekion postings"
 
-        # Check if line items have GL accounts from OCR.
         ocr_gl_items = [li for li in req.line_items if li.gl_account]
 
         if req.gl_splits:
-            # Written on the invoice as accounts AND amounts. This is the whole
-            # instruction, so it is used as given -- no grouping, no deriving
-            # from the rows. A clerk splitting 2,580.23 into 2,378.11 of goods
-            # and 202.12 of tax has already done the arithmetic, and the parts
-            # table contains nothing that would reproduce it.
+            # Clerk corrections / handwritten splits still win when present.
             gl_splits = [
                 {
                     "gl_account_id": sp.account_id or f"{dealer_id}_{sp.gl_account}",
@@ -488,21 +394,17 @@ def _create_misc_po(
                 for sp in req.gl_splits
             ]
             written = sum(sp.amount for sp in req.gl_splits)
+            gl_source = "written on the invoice"
             print(
                 f"[Misc] Using {len(gl_splits)} GL split(s) written on the invoice, "
                 f"totalling {written:,.2f} against an invoice of {req.invoice_amount:,.2f}"
             )
             if abs(written - req.invoice_amount) > 0.01:
-                # Not fatal: Tekion takes the postings as given, and a clerk may
-                # deliberately split only part of an invoice. Worth saying
-                # loudly, because the usual cause is a misread amount.
                 print(
                     f"[Misc] WARNING: splits differ from the invoice total by "
                     f"{written - req.invoice_amount:,.2f}"
                 )
         elif ocr_gl_items:
-            # Build gl_splits from OCR-extracted GL accounts.
-            # Group by GL account number, summing amounts per account.
             gl_totals: dict[str, float] = {}
             for li in ocr_gl_items:
                 gl_num = li.gl_account or ""
@@ -517,18 +419,18 @@ def _create_misc_po(
                 }
                 for gl_num, amt in gl_totals.items()
             ]
+            gl_source = "read from the line items"
             print(f"[Misc] Using OCR GL splits: {len(gl_splits)} GL account(s)")
         else:
-            # Fall back to LLM resolution.
-            descriptions = [li.part_name for li in req.line_items] or ["Misc purchase"]
-            gl_account_id = resolve_misc_gl(
-                dealership_name=req.dealership_name,
-                dealer_id=dealer_id,
-                line_descriptions=descriptions,
-                client=client,
-                session=session,
-            )
-            print(f"[Misc] Using LLM-resolved GL: {gl_account_id}")
+            # Fallback if Tekion postings come back empty.
+            gl_splits = po_reuse.misc_gl_splits_from_po(po) or None
+            if gl_splits:
+                gl_source = "from the Tekion PO lines"
+                print(f"[Misc] Using {len(gl_splits)} GL split(s) from the Tekion PO")
+            else:
+                gl_account_id = f"{dealer_id}_2410"
+                gl_source = "default parts inventory"
+                print(f"[Misc] No PO GL lines; falling back to {gl_account_id}")
 
         # Upload invoice document if provided.
         attachment_media_ids: list[str] = []
@@ -536,6 +438,8 @@ def _create_misc_po(
             media_id = client.upload_document(req.invoice_file_path)
             attachment_media_ids.append(media_id)
 
+        # Prefer what Tekion returns from preInvoicing/postings (same as Stock).
+        use_postings = not req.gl_splits and not ocr_gl_items
         result = {"invoiceId": None} if not settings.tekion_po_writes else client.pre_invoice(  # TEKION_PO_WRITES
             vendor_id=vendor["id"],
             vendor_site_id=vendor["siteId"],
@@ -552,16 +456,10 @@ def _create_misc_po(
             ref_text="",
             po_type="MISCELLANEOUS",
             sales_tax=req.sales_tax,
-            # An order WE raised carries a SALES TAX line, so this invoice
-            # uses all of it -- consuming the net would leave the tax
-            # outstanding on a PO that could then never be closed.
-            #
-            # A REUSED order has no such line: somebody else raised it, for
-            # whatever it is worth, and claiming the tax from it as well would
-            # consume more of their PO than this invoice is entitled to.
-            po_covers_tax=existing_po is None,
+            po_covers_tax=False,
             attachment_media_ids=attachment_media_ids or None,
             gl_splits=gl_splits,
+            use_returned_postings=use_postings,
         )
 
         return CreatePoResponse(
@@ -578,13 +476,7 @@ def _create_misc_po(
                 gl_splits=gl_splits,
                 gl_account_id=gl_account_id or "",
                 net_amount=req.invoice_amount - req.sales_tax,
-                source=(
-                    "written on the invoice"
-                    if req.gl_splits
-                    else "read from the line items"
-                    if gl_splits
-                    else "resolved from the descriptions"
-                ),
+                source=gl_source,
             ),
         )
 

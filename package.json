@@ -26,6 +26,8 @@
     "pw:analyze:ap": "tsx src/playwright/analyzeApproval.ts",
     "pw:capture:je": "tsx src/playwright/captureJE.ts",
     "pw:analyze:je": "tsx src/playwright/analyzeJE.ts",
+    "pw:capture:oem-je": "tsx src/playwright/captureOemJe.ts",
+    "pw:analyze:oem-je": "tsx src/playwright/analyzeOemJe.ts",
     "pw:capture:vmi": "tsx src/playwright/captureVMI.ts",
     "pw:analyze:vmi": "tsx src/playwright/analyzeVMI.ts",
     "pw:capture:vso": "tsx src/playwright/captureVSO.ts",

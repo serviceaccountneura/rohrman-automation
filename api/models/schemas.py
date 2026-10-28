@@ -504,6 +504,7 @@ class PipelineStatusResponse(BaseModel):
     # What this document posted to Tekion -- the GL accounts, the amount against
     # each, and the totals. The same shape for every flow, so one component
     # renders a Misc split, a journal entry and a vehicle purchase alike.
+    confidence: dict[str, Any] = Field(default_factory=dict, alias="confidence")
     posting_details: dict[str, Any] = Field(
         default_factory=dict, alias="postingDetails"
     )
@@ -575,6 +576,7 @@ class DocumentsByType(BaseModel):
     own page listed the documents. Add the field whenever a folder is added.
     """
 
+    PO_INVOICE: int = 0
     SUBLET: int = 0
     MISCELLANEOUS: int = 0
     STOCK: int = 0
@@ -641,10 +643,13 @@ class ExceptionListItem(BaseModel):
     po_number: str
     ro_number: str
     exception_type: str | None
+    # PO | JE | DUPLICATE | OTHER — Parts vs AP vs duplicate buckets.
+    exception_category: str = "OTHER"
     severity: str | None
     detected_on: datetime
     document_type: str
     status: str
+    duplicate_of: UUID | None = None
 
 
 class ExceptionListResponse(BaseModel):
@@ -653,6 +658,8 @@ class ExceptionListResponse(BaseModel):
     page: int
     page_size: int
     total_pages: int
+    # Counts per category across the filtered set (before pagination).
+    by_category: dict[str, int] = {}
 
 
 class ExceptionTypeCount(BaseModel):

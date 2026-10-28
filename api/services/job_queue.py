@@ -171,6 +171,27 @@ def hold_as_duplicate(session: Session, doc: Document, original: Document) -> No
     print(f"[QUEUE] {doc.id} -> DUPLICATE of {original.id}")
 
 
+def hold_as_tekion_duplicate(session: Session, doc: Document, message: str) -> None:
+    """Park a run that matches another Pre Invoice on Tekion (near-duplicate).
+
+    No prior document in our DB — the clash is on Tekion's Pre Invoice list
+    (same digit pattern + shared PO or amount). Dashboard actions are Discard
+    or Ignore (waive the near-dup check once and continue).
+    """
+    doc.status = STATUS_DUPLICATE
+    doc.duplicate_of = None
+    doc.exception_type = "DUPLICATE_INVOICE"
+    doc.severity = "HIGH"
+    doc.locked_at = None
+    doc.locked_by = ""
+    doc.next_attempt_at = None
+    doc.processed_at = _utcnow()
+    doc.last_error = (message or "Possible duplicate Pre Invoice in Tekion")[:1000]
+    session.add(doc)
+    session.commit()
+    print(f"[QUEUE] {doc.id} -> DUPLICATE (Tekion Pre Invoice near-match)")
+
+
 def hold_for_po_decision(session: Session, doc: Document, found: Any, summary: str) -> None:
     """Park a run whose invoice names a purchase order that already exists.
 
@@ -271,15 +292,24 @@ def confirm_duplicate(session: Session, doc: Document) -> Document:
     """
     original = session.get(Document, doc.duplicate_of) if doc.duplicate_of else None
     if original is None:
-        # The original was deleted while this sat in review; the duplicate is
-        # no longer a duplicate, so let it run on its own.
+        # Tekion near-dup hold (no local original), or the original was deleted
+        # while this sat in review. Re-queue with duplicate checks waived once
+        # (DB + Tekion near-dup) — dashboard "Ignore".
         doc.status = STATUS_QUEUED
         doc.duplicate_of = None
         doc.duplicate_override = True
+        doc.exception_type = None
+        doc.severity = None
         doc.last_error = ""
         doc.processed_at = None
+        doc.attempts = 0
+        doc.locked_at = None
+        doc.locked_by = ""
+        doc.next_attempt_at = None
         session.add(doc)
         session.commit()
+        session.refresh(doc)
+        print(f"[QUEUE] duplicate ignored -- re-running {doc.id}")
         return doc
 
     # Carry the new upload over: the file itself, and what OCR made of it.
@@ -439,12 +469,20 @@ def restore(session: Session, doc: Document) -> Document:
 def find_duplicate(session: Session, doc: Document) -> Document | None:
     """An earlier document that already produced this same work.
 
-    Two checks, cheapest first:
+    Checks, cheapest first:
       1. identical file bytes (same SHA-256) — a straight re-upload
-      2. same dealership + invoice number + folder — the same invoice rescanned
+      2. same dealership + folder + exact invoice number
+      3. same dealership + folder + near-duplicate invoice number (letter
+         prefix/suffix variants: BLK123 vs 123, …RI vs bare digits)
 
     Only PROCESSED rows count: a previous failure should not block a retry.
     """
+    from api.services.exception_category import (
+        invoice_digits,
+        invoices_are_near_duplicates,
+    )
+    from sqlalchemy import func
+
     if doc.file_hash:
         same_file = session.exec(
             select(Document).where(
@@ -461,19 +499,41 @@ def find_duplicate(session: Session, doc: Document) -> Document | None:
         if same_file:
             return same_file
 
-    if doc.invoice_number and doc.dealership_name:
-        same_invoice = session.exec(
-            select(Document).where(
-                Document.invoice_number == doc.invoice_number,
-                Document.dealership_name == doc.dealership_name,
-                Document.po_type == doc.po_type,
-                Document.deleted_at.is_(None),  # type: ignore[union-attr]
-                Document.id != doc.id,
-                Document.status == STATUS_PROCESSED,
-            )
-        ).first()
-        if same_invoice:
-            return same_invoice
+    if not (doc.invoice_number and doc.dealership_name):
+        return None
+
+    same_invoice = session.exec(
+        select(Document).where(
+            Document.invoice_number == doc.invoice_number,
+            Document.dealership_name == doc.dealership_name,
+            Document.po_type == doc.po_type,
+            Document.deleted_at.is_(None),  # type: ignore[union-attr]
+            Document.id != doc.id,
+            Document.status == STATUS_PROCESSED,
+        )
+    ).first()
+    if same_invoice:
+        return same_invoice
+
+    # Near-duplicate: shared digit core, different letter wrap (Parts typed
+    # BLK123 on one PO and 123 on another / SNS dropped RI).
+    core = invoice_digits(doc.invoice_number)
+    if not core:
+        return None
+    digit_col = func.regexp_replace(Document.invoice_number, "[^0-9]", "", "g")
+    candidates = session.exec(
+        select(Document).where(
+            Document.dealership_name == doc.dealership_name,
+            Document.po_type == doc.po_type,
+            Document.deleted_at.is_(None),  # type: ignore[union-attr]
+            Document.id != doc.id,
+            Document.status == STATUS_PROCESSED,
+            digit_col == core,
+        )
+    ).all()
+    for other in candidates:
+        if invoices_are_near_duplicates(doc.invoice_number, other.invoice_number):
+            return other
 
     return None
 
