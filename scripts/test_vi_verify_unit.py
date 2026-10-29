@@ -54,6 +54,7 @@ def _client(
     hit: dict[str, Any] | None = None,
     extra_hits: list[dict[str, Any]] | None = None,
     postings: list[dict[str, Any]] | None = None,
+    post_error: str | None = None,
 ) -> MagicMock:
     client = MagicMock()
     client.current_dealer_id = "1707"
@@ -78,8 +79,10 @@ def _client(
             return {"data": {"invoiceDueDate": 1}}
         if "lookup/numbers" in path:
             return {"data": {}}
-        if any(x in path for x in ("postTransaction", "/poInvoice/post", "approve")):
-            return {"data": {"ok": True}}
+        if "poInvoice/receivedTransaction/" in path:
+            if post_error:
+                raise Exception(f"{method} {path} -> 400: {post_error}")
+            return {"data": {"ok": True}, "status": "success"}
         raise AssertionError(f"unexpected call {method} {path}")
 
     client._req_json.side_effect = _req_json
@@ -120,10 +123,24 @@ def _vendor_postings(ref: str = "SCHAUMBURG KIA", acct: str = "2410") -> list[di
         {
             "glAccountId": f"1707_{acct}",
             "amount": 53.23,
+            "postingOrder": 1,
             "description": "parts",
+            "refType": None,
             "refText": ref,
+            "lineIdentifier": "f26f6878",
+            "medias": None,
         },
-        {"glAccountId": "1707_3002", "amount": -53.23, "metaData": {"apPostingLine": True}},
+        {
+            "glAccountId": "1707_3002",
+            "amount": -53.23,
+            "postingOrder": 0,
+            "refType": "VENDOR",
+            "refId": "42047",
+            "refText": "1707_160",
+            "lineIdentifier": "57c5958a",
+            "medias": None,
+            "metaData": {"apPostingLine": True},
+        },
     ]
 
 
@@ -449,11 +466,59 @@ def test_happy_path_completes_when_writes_on() -> None:
         (c.args[0] if c.args else c.kwargs.get("path", ""))
         for c in client._req_json.call_args_list
     ]
-    assert any(
-        "postTransaction" in p or p.endswith("/poInvoice/post") or "approve" in p
-        for p in paths
-    )
+    assert "/api/accounting/u/poInvoice/receivedTransaction/inv-1" in paths
     assert not any("preInvoice/post" in p for p in paths)
+
+    body = _posted_body(client)
+    assert body["journalId"] == "1707_75"
+    assert body["refId"] == "inv-1" and body["refId__PO_INVOICE_ASSET"] == ["inv-1"]
+    assert body["refText"] == "PW-FLOW-001"
+    assert body["transactionAmount"] == 53.23
+    assert body["scheduledTime"] == str(_hit()["invoiceDate"])
+    assert body["defaultJournalValidationRequired"] is False
+    assert body["assetAttachmentDto"]["attachments"][0]["mediaId"] == "media-abc"
+    ap, expense = body["postings"]
+    assert ap["glAccountId"] == "1707_3002" and ap["postingOrder"] == 0
+    assert ap["refType"] == "VENDOR" and ap["refId"] == "42047"
+    # Control = vendor name, as both refId and refText (refText alone is A217).
+    assert expense["refType"] == "CUSTOM"
+    assert expense["refId"] == expense["refText"] == "SCHAUMBURG KIA"
+    assert "lineIdentifier" not in expense and "medias" not in expense
+
+
+def _posted_body(client: MagicMock) -> dict[str, Any]:
+    for c in client._req_json.call_args_list:
+        path = c.args[0] if c.args else c.kwargs.get("path", "")
+        if "receivedTransaction" in path:
+            return c.kwargs["body"]
+    raise AssertionError("no receivedTransaction call")
+
+
+def test_sublet_2460_post_control_is_ro_number() -> None:
+    client = _client(_po(), hit=_hit(), postings=_vendor_postings(ref="", acct="2460"))
+    r = verify_vendor_invoice(
+        client=client,
+        expected=_input(po_type="SUBLET", ro_number="RO123456"),
+        dry_run=False,
+    )
+    assert r.ok and r.completed, r.message
+    expense = _posted_body(client)["postings"][1]
+    assert expense["glAccountId"] == "1707_2460"
+    assert expense["refType"] == "CUSTOM"
+    assert expense["refId"] == expense["refText"] == "RO123456"
+
+
+def test_duplicate_invoice_number_refused_on_post() -> None:
+    client = _client(
+        _po(),
+        hit=_hit(),
+        postings=_vendor_postings(),
+        post_error='{"status":"failed","errorDetails":{"errorCode":"A111",'
+        '"key":"duplicate.invoice.number"}}',
+    )
+    r = verify_vendor_invoice(client=client, expected=_input(), dry_run=False)
+    assert not r.ok and not r.completed
+    assert r.code == CODE_DUPLICATE, r.code
 
 
 def test_pipeline_po_invoice_path_never_preinvoices() -> None:
@@ -507,6 +572,8 @@ def main() -> None:
         test_tekion_near_duplicate_skipped_when_ignored,
         test_happy_path_dry_run,
         test_happy_path_completes_when_writes_on,
+        test_sublet_2460_post_control_is_ro_number,
+        test_duplicate_invoice_number_refused_on_post,
         test_pipeline_po_invoice_path_never_preinvoices,
     ]
     failed = 0

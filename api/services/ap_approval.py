@@ -16,7 +16,8 @@ the web app does when a clerk approves a pre-invoiced PO:
     4. Enter invoice information on the postings:
          Description       -> posting.description  = reference number
          next to GL Account-> posting.refText      = RO number (SUBLET only)
-    5. Post Transaction  -- DELIBERATELY NOT IMPLEMENTED. See post_transaction().
+    5. Post Transaction
+       -> POST /api/accounting/u/poInvoice/receivedTransaction/{invoiceId}
 
 Endpoints were captured from a live session with `npm run pw:capture:ap` and
 analysed with `npm run pw:analyze:ap` (captured/ap-endpoints.json).
@@ -29,9 +30,8 @@ INTEGRATION NOTE
     pass it to `approve_invoice()` -- no other change is required.
 
 SAFETY
-    `approve_invoice()` runs read-only by default. Every mutating step is gated
-    behind dry_run=False, and the final Post Transaction always raises, because
-    its endpoint was intentionally never captured.
+    `approve_invoice()` runs read-only by default and never posts. The pipeline
+    posts through `vi_verify._complete_vendor_invoice`, behind TEKION_PO_WRITES.
 """
 from __future__ import annotations
 
@@ -40,6 +40,33 @@ from datetime import datetime, timezone
 from typing import Any
 
 from api.services.tekion_client import TekionApiClient
+
+# ── Post Transaction (captured 29 Oct, pw:capture:ap at dealer 1707) ─────────
+#
+# The body is a journal entry on the AP journal, linked back to the invoice.
+# The posting lines are the ones invoicePostings returns, in postingOrder, with
+# only the keys below -- the GET adds lineIdentifier, tags, medias, ... which
+# the UI does not send back.
+_RECEIVED_TRANSACTION_PATH = "/api/accounting/u/poInvoice/receivedTransaction/{invoice_id}"
+_AP_JOURNAL_NUMBER = "75"
+_DOCUMENT_TYPE_SUFFIX = "document_type_5"
+_WIRE_POSTING_KEYS = (
+    "dealerId", "glAccountId", "amount", "refId", "refText", "refType",
+    "description", "countAdjusted", "count", "postingOrder", "metaData",
+    "amountCredited",
+)
+
+
+def set_control(line: dict[str, Any], text: str) -> None:
+    """Fill a posting's Control column with free text.
+
+    What a clerk types into Control goes out as BOTH refId and refText on a
+    CUSTOM line. refText alone, with no refId, is refused at post time with
+    A217 "Mandatory fields are not filled as per COA".
+    """
+    line["refType"] = "CUSTOM"
+    line["refId"] = text
+    line["refText"] = text
 
 # ── The record we expect to find in Tekion ────────────────────────────────────
 
@@ -98,7 +125,7 @@ class Discrepancy:
 @dataclass
 class ApprovalResult:
     matched: bool = False
-    posted: bool = False  # always False until Post Transaction is implemented
+    posted: bool = False  # approve_invoice never posts; see vi_verify
     invoice_id: str | None = None
     invoice_number: str | None = None
     po_number: str | None = None
@@ -308,48 +335,96 @@ class ApApprovalService:
                 # Sublet GL 2460 → Control = RO #. All other expense GLs →
                 # Control stays as clerk set (verify enforces vendor name).
                 if acct == "2460" and expected.ro_number:
-                    line["refText"] = expected.ro_number
+                    set_control(line, expected.ro_number)
                 elif expected.po_type == "SUBLET" and expected.ro_number:
-                    line["refText"] = expected.ro_number
+                    set_control(line, expected.ro_number)
             prepared.append(line)
         return prepared
 
-    # ── Step 5: Post Transaction — intentionally not implemented ─────────────
+    # ── Step 5: Post Transaction ─────────────────────────────────────────────
+
+    @staticmethod
+    def build_post_payload(
+        invoice_id: str,
+        invoice_number: str,
+        postings: list[dict[str, Any]],
+        dealer_id: str,
+        accounting_date_ms: int,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """The receivedTransaction body, matching the captured request."""
+        wire_postings = []
+        for p in sorted(postings, key=lambda p: p.get("postingOrder") or 0):
+            line = {k: p.get(k) for k in _WIRE_POSTING_KEYS if k in p}
+            line.setdefault("dealerId", dealer_id)
+            if not line.get("refType"):
+                # invoicePostings returns null; the UI sends CUSTOM.
+                line["refType"] = "CUSTOM"
+            wire_postings.append(line)
+        # The A/P line carries the invoice total as its credit.
+        ap_line = next(
+            (p for p in wire_postings if (p.get("metaData") or {}).get("apPostingLine")),
+            None,
+        )
+        if ap_line is not None:
+            transaction_amount = abs(float(ap_line.get("amount") or 0))
+        else:
+            transaction_amount = sum(
+                float(p.get("amount") or 0) for p in wire_postings if float(p.get("amount") or 0) > 0
+            )
+        return {
+            "transactionType": "GENERAL",
+            "postings": wire_postings,
+            "transactionAmount": round(transaction_amount, 2),
+            "journalId": f"{dealer_id}_{_AP_JOURNAL_NUMBER}",
+            "description": invoice_number,
+            "metadata": {
+                "sourceType": "RECEIVING_INVOICE",
+                "businessFlow": "VENDOR_INVOICE_FLOW",
+            },
+            "refId__PO_INVOICE_ASSET": [invoice_id],
+            "refType": "PURCHASE_ORDER_INVOICE",
+            "refId": invoice_id,
+            "refText": invoice_number,
+            "documentTypeId": f"{dealer_id}_{_DOCUMENT_TYPE_SUFFIX}",
+            "franchiseId": dealer_id,
+            # The journal-entry Submit sends true; the Vendor Invoice post sends false.
+            "defaultJournalValidationRequired": False,
+            # Epoch-ms as a string, as the UI sends it.
+            "scheduledTime": str(accounting_date_ms),
+            "assetAttachmentDto": {"attachments": attachments} if attachments else {},
+            "userConsentToSkipCreditLimitCheckForAR": False,
+        }
 
     def post_transaction(
         self,
         invoice_id: str,
+        invoice_number: str,
         postings: list[dict[str, Any]],
         *,
-        attachments: list[dict[str, str]] | None = None,
+        accounting_date_ms: int,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Finish the Vendor Invoice / AP posting in Tekion.
+        """Post the Vendor Invoice to the ledger. There is no undo.
 
-        The exact Post Transaction payload was never captured in this repo, so
-        we try the known AP-style paths. Prefer ``vi_verify._complete_vendor_invoice``
-        for the pipeline; this method remains for the dry-run script.
+        Tekion refuses an invoice number already posted for the vendor with a
+        400 carrying "duplicate.invoice.number" (A111); that raises like any
+        other refusal.
         """
-        body: dict[str, Any] = {
-            "invoiceId": invoice_id,
-            "dealerId": self.client.current_dealer_id,
-            "postings": postings,
-            "attachments": attachments or [],
-        }
-        last_error: Exception | None = None
-        for path in (
-            "/api/accounting/u/poInvoice/postTransaction",
-            "/api/accounting/u/poInvoice/post",
-            "/api/accounting/u/poInvoice/approve",
-        ):
-            try:
-                return self.client._req_json(path, method="POST", body=body)
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                print(f"[AP] {path} failed: {exc}")
-        raise RuntimeError(
-            "Post Transaction failed on all known endpoints. Re-capture with "
-            f"`npm run pw:capture:ap`. Last error: {last_error}"
+        dealer_id = str(self.client.current_dealer_id)
+        body = self.build_post_payload(
+            invoice_id, invoice_number, postings, dealer_id, accounting_date_ms, attachments
         )
+        path = _RECEIVED_TRANSACTION_PATH.format(invoice_id=invoice_id)
+        print(f"[AP] Post Transaction: POST {path}")
+        res = self.client._req_json(path, method="POST", body=body)
+        if isinstance(res, dict) and res.get("status") == "failed":
+            details = res.get("errorDetails") or {}
+            raise RuntimeError(
+                f"Post Transaction refused: {details.get('errorCode')} "
+                f"{details.get('key')}: {details.get('displayMessage')}"
+            )
+        return res
 
 
 # ── Orchestration ─────────────────────────────────────────────────────────────
@@ -463,6 +538,8 @@ def approve_invoice(
     if dry_run:
         result.notes.append("Dry run - stopped before Post Transaction. Nothing was written.")
     else:
-        svc.post_transaction()  # raises: endpoint deliberately not captured
+        raise RuntimeError(
+            "approve_invoice never posts; the pipeline posts through vi_verify."
+        )
 
     return result

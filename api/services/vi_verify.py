@@ -17,12 +17,14 @@ Never creates a PO. Never calls preInvoice/post.
 """
 from __future__ import annotations
 
+import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any
 
-from api.services.ap_approval import ApApprovalService, ExpectedInvoice
+from api.services.ap_approval import ApApprovalService, ExpectedInvoice, set_control
 from api.services.exception_category import (
     invoice_digits,
     invoices_are_near_duplicates,
@@ -89,6 +91,8 @@ class ViVerifyResult:
     po_total: float | None = None
     invoice_date: str | None = None
     tekion_invoice_date: str | None = None
+    # The Vendor Invoice's invoiceDate as Tekion holds it; posted as scheduledTime.
+    tekion_invoice_date_ms: int | None = None
     postings: list[dict[str, Any]] = field(default_factory=list)
     media_id: str | None = None
     completed: bool = False
@@ -426,6 +430,8 @@ def verify_vendor_invoice(
     vi_po = _po_num_from_vi_hit(hit)
     vi_date = _parse_date(hit.get("invoiceDate"))
     result.tekion_invoice_date = _fmt_date(vi_date)
+    if isinstance(hit.get("invoiceDate"), (int, float)):
+        result.tekion_invoice_date_ms = int(hit["invoiceDate"])
 
     if not result.invoice_id:
         result.code = CODE_PRE_INVOICE_MISSING
@@ -820,6 +826,11 @@ def verify_vendor_invoice(
     # ── Pass path: attach PDF + complete VI ──────────────────────────────────
     try:
         _complete_vendor_invoice(client, svc, expected, result)
+    except DuplicateInvoiceNumber as exc:
+        result.ok = False
+        result.code = CODE_DUPLICATE
+        result.message = str(exc)
+        result.completed = False
     except Exception as exc:  # noqa: BLE001
         result.ok = False
         result.code = CODE_TEKION
@@ -872,6 +883,17 @@ def _find_confirmed_tekion_near_duplicates(
     return found
 
 
+class DuplicateInvoiceNumber(RuntimeError):
+    """Tekion refused the post: the invoice number is already posted (A111)."""
+
+
+def _file_size(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
 def _complete_vendor_invoice(
     client: TekionApiClient,
     svc: ApApprovalService,
@@ -879,7 +901,7 @@ def _complete_vendor_invoice(
     result: ViVerifyResult,
 ) -> None:
     """Attach the invoice PDF and finish the VI / AP posting in Tekion."""
-    media_id: str | None = None
+    attachments: list[dict[str, Any]] = []
     if expected.invoice_file_path:
         media_id = client.upload_document(
             expected.invoice_file_path,
@@ -887,6 +909,17 @@ def _complete_vendor_invoice(
         )
         result.media_id = media_id
         result.notes.append(f"Uploaded invoice mediaId={media_id}")
+        if media_id:
+            attachments.append(
+                {
+                    "id": media_id,
+                    "mediaId": media_id,
+                    "uploadedTime": int(time.time() * 1000),
+                    "name": expected.invoice_file_name
+                    or os.path.basename(expected.invoice_file_path),
+                    "fileSize": _file_size(expected.invoice_file_path),
+                }
+            )
 
     ap_expected = ExpectedInvoice(
         invoice_number=_norm_invoice(expected.invoice_number),
@@ -905,23 +938,30 @@ def _complete_vendor_invoice(
             continue
         acct = _account_number(line)
         if acct == SUBLET_GL and expected.ro_number:
-            line["refText"] = expected.ro_number
+            set_control(line, expected.ro_number)
         elif vendor:
-            line["refText"] = vendor
-    attachments = [{"mediaId": media_id}] if media_id else []
+            set_control(line, vendor)
 
+    accounting_date_ms = result.tekion_invoice_date_ms or int(time.time() * 1000)
     try:
         svc.post_transaction(
             result.invoice_id or "",
+            result.invoice_number or _norm_invoice(expected.invoice_number),
             prepared,
+            accounting_date_ms=accounting_date_ms,
             attachments=attachments,
         )
     except Exception as exc:  # noqa: BLE001
+        if "duplicate.invoice.number" in str(exc):
+            raise DuplicateInvoiceNumber(
+                f"Tekion refused to post: invoice number {result.invoice_number!r} is "
+                "already posted for this vendor. Void the duplicate Vendor Invoice "
+                "in Tekion; nothing was posted."
+            ) from exc
         raise RuntimeError(
             "Verification passed and the invoice file was "
-            f"{'uploaded' if media_id else 'not uploaded'}, but completing the "
-            "Vendor Invoice in Tekion failed. Re-capture Post Transaction with "
-            f"`npm run pw:capture:ap`. Last error: {exc}"
+            f"{'uploaded' if result.media_id else 'not uploaded'}, but completing the "
+            f"Vendor Invoice in Tekion failed: {exc}"
         ) from exc
 
     result.completed = True
