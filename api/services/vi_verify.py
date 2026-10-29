@@ -97,6 +97,7 @@ class ViVerifyResult:
     vi_record: dict[str, Any] = field(default_factory=dict)
     postings: list[dict[str, Any]] = field(default_factory=list)
     media_id: str | None = None
+    attached: bool = False
     completed: bool = False
     notes: list[str] = field(default_factory=list)
     # Snapshot for the dashboard three-way match panel.
@@ -909,6 +910,7 @@ def _complete_vendor_invoice(
         result.media_id = media_id
         result.notes.append(f"Uploaded invoice mediaId={media_id}")
         svc.attach_to_invoice(result.vi_record, media_id)
+        result.attached = True
         result.notes.append(f"Attached mediaId={media_id} to the Vendor Invoice.")
 
     ap_expected = ExpectedInvoice(

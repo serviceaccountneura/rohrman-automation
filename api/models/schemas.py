@@ -625,6 +625,9 @@ class DocumentItem(BaseModel):
     exception_type: str | None
     created_at: datetime
     processed_at: datetime | None
+    # Vendor Invoice flow only: {writes, attached, posted}, so the table can
+    # tell a verified invoice from a posted one. None for every other flow.
+    vi_post: dict[str, bool] | None = None
 
 
 class DocumentListResponse(BaseModel):

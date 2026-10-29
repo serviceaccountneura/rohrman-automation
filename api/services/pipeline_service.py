@@ -843,6 +843,7 @@ def _record_postings(
     tekion_amount: float | None = None,
     invoice_date: str | None = None,
     tekion_invoice_date: str | None = None,
+    vi_post: dict[str, bool] | None = None,
 ) -> None:
     """Record the accounting lines this document put into Tekion.
 
@@ -860,7 +861,8 @@ def _record_postings(
     see which lines were built and where they stopped adding up.
 
     ``vi_match`` holds the Vendor Invoice header comparison (PO #, vendor,
-    invoice #, amount, date) for the three-way match UI.
+    invoice #, amount, date) for the three-way match UI. ``vi_post`` says what
+    the Vendor Invoice flow did in Tekion: {writes, attached, posted}.
     """
     clean = [
         {
@@ -893,6 +895,8 @@ def _record_postings(
         payload["invoiceDate"] = invoice_date
     if tekion_invoice_date:
         payload["tekionInvoiceDate"] = tekion_invoice_date
+    if vi_post is not None:
+        payload["viPost"] = vi_post
 
     doc.posting_details = json.dumps(payload, default=str)[:8000]
     session.add(doc)
@@ -1394,6 +1398,11 @@ def _run_vi_verify(
             tekion_amount=result.tekion_amount,
             invoice_date=result.invoice_date or expected.invoice_date,
             tekion_invoice_date=result.tekion_invoice_date,
+            vi_post={
+                "writes": settings.tekion_po_writes,
+                "attached": result.attached,
+                "posted": result.completed,
+            },
         )
 
     if not result.ok:

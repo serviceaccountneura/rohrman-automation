@@ -7,6 +7,7 @@ GET /api/dashboard/documents — paginated list of documents, filterable by po_t
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
@@ -248,6 +249,15 @@ def filter_options(
     }
 
 
+def _vi_post(posting_details: str) -> dict[str, bool] | None:
+    """What the Vendor Invoice flow did in Tekion, from posting_details."""
+    try:
+        vi_post = json.loads(posting_details or "{}").get("viPost")
+    except (ValueError, AttributeError):
+        return None
+    return vi_post if isinstance(vi_post, dict) else None
+
+
 @router.get("/documents", response_model=DocumentListResponse)
 def list_documents(
     session: Annotated[Session, Depends(get_session)],
@@ -330,6 +340,7 @@ def list_documents(
             exception_type=doc.exception_type,
             created_at=doc.created_at,
             processed_at=doc.processed_at,
+            vi_post=_vi_post(doc.posting_details),
         )
         for doc in docs
     ]
