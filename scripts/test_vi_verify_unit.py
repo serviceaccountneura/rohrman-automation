@@ -55,6 +55,7 @@ def _client(
     extra_hits: list[dict[str, Any]] | None = None,
     postings: list[dict[str, Any]] | None = None,
     post_error: str | None = None,
+    attach_ok: bool = True,
 ) -> MagicMock:
     client = MagicMock()
     client.current_dealer_id = "1707"
@@ -79,6 +80,14 @@ def _client(
             return {"data": {"invoiceDueDate": 1}}
         if "lookup/numbers" in path:
             return {"data": {}}
+        if path.endswith("poInvoice/preInvoice/post"):
+            # Only ever an attach: the re-post of an existing invoice.
+            assert (body or {}).get("invoiceId"), "preInvoice/post without invoiceId"
+            media = [a["mediaId"] for a in body["attachments"]] if attach_ok else []
+            return {
+                "status": "success",
+                "data": {"id": body["invoiceId"], "attachments": [{"mediaId": m} for m in media]},
+            }
         if "poInvoice/receivedTransaction/" in path:
             if post_error:
                 raise Exception(f"{method} {path} -> 400: {post_error}")
@@ -113,6 +122,12 @@ def _hit(**overrides: Any) -> dict[str, Any]:
             datetime(2026, 10, 9, 12, 0, tzinfo=timezone.utc).timestamp() * 1000
         ),
         "poDetails": [{"poNum": "36137", "universalId": "MISCELLANEOUS%10968"}],
+        "payeeId": "42047",
+        "vendorSiteId": "42047",
+        "attachments": [],
+        "accountingDetails": [
+            {"glAccountId": "1707_2410", "postingAmount": {"amount": 5323, "currency": "USD"}}
+        ],
     }
     base.update(overrides)
     return base
@@ -466,8 +481,21 @@ def test_happy_path_completes_when_writes_on() -> None:
         (c.args[0] if c.args else c.kwargs.get("path", ""))
         for c in client._req_json.call_args_list
     ]
-    assert "/api/accounting/u/poInvoice/receivedTransaction/inv-1" in paths
-    assert not any("preInvoice/post" in p for p in paths)
+    post_path = "/api/accounting/u/poInvoice/receivedTransaction/inv-1"
+    attach_path = "/api/accounting/u/poInvoice/preInvoice/post"
+    assert post_path in paths and attach_path in paths
+    # Attach happens while the invoice is still PRE_INVOICED, i.e. before the post.
+    assert paths.index(attach_path) < paths.index(post_path)
+    assert client.upload_document.call_args.kwargs["service_name"] == "Vendor Invoices"
+
+    attach = _sent_body(client, "preInvoice/post")
+    assert attach["invoiceId"] == "inv-1"
+    assert attach["attachments"] == [{"mediaId": "media-abc"}]
+    # Everything else goes back as Tekion holds it.
+    assert attach["invoiceNumber"] == "PW-FLOW-001"
+    assert attach["invoiceAmount"] == {"amount": 5323}
+    assert attach["invoiceDate"] == _hit()["invoiceDate"]
+    assert attach["accountingDetails"] == _hit()["accountingDetails"]
 
     body = _posted_body(client)
     assert body["journalId"] == "1707_75"
@@ -476,7 +504,7 @@ def test_happy_path_completes_when_writes_on() -> None:
     assert body["transactionAmount"] == 53.23
     assert body["scheduledTime"] == str(_hit()["invoiceDate"])
     assert body["defaultJournalValidationRequired"] is False
-    assert body["assetAttachmentDto"]["attachments"][0]["mediaId"] == "media-abc"
+    assert body["assetAttachmentDto"] == {}
     ap, expense = body["postings"]
     assert ap["glAccountId"] == "1707_3002" and ap["postingOrder"] == 0
     assert ap["refType"] == "VENDOR" and ap["refId"] == "42047"
@@ -486,12 +514,25 @@ def test_happy_path_completes_when_writes_on() -> None:
     assert "lineIdentifier" not in expense and "medias" not in expense
 
 
-def _posted_body(client: MagicMock) -> dict[str, Any]:
+def _sent_body(client: MagicMock, fragment: str) -> dict[str, Any]:
     for c in client._req_json.call_args_list:
         path = c.args[0] if c.args else c.kwargs.get("path", "")
-        if "receivedTransaction" in path:
+        if fragment in path:
             return c.kwargs["body"]
-    raise AssertionError("no receivedTransaction call")
+    raise AssertionError(f"no {fragment} call")
+
+
+def _posted_body(client: MagicMock) -> dict[str, Any]:
+    return _sent_body(client, "receivedTransaction")
+
+
+def test_attach_refused_stops_before_post() -> None:
+    client = _client(_po(), hit=_hit(), postings=_vendor_postings(), attach_ok=False)
+    expected = _input(invoice_file_path="/tmp/fake.pdf", invoice_file_name="fake.pdf")
+    r = verify_vendor_invoice(client=client, expected=expected, dry_run=False)
+    assert not r.ok and not r.completed
+    paths = [(c.args[0] if c.args else "") for c in client._req_json.call_args_list]
+    assert not any("receivedTransaction" in p for p in paths)
 
 
 def test_sublet_2460_post_control_is_ro_number() -> None:
@@ -574,6 +615,7 @@ def main() -> None:
         test_happy_path_completes_when_writes_on,
         test_sublet_2460_post_control_is_ro_number,
         test_duplicate_invoice_number_refused_on_post,
+        test_attach_refused_stops_before_post,
         test_pipeline_po_invoice_path_never_preinvoices,
     ]
     failed = 0

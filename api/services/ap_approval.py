@@ -16,7 +16,9 @@ the web app does when a clerk approves a pre-invoiced PO:
     4. Enter invoice information on the postings:
          Description       -> posting.description  = reference number
          next to GL Account-> posting.refText      = RO number (SUBLET only)
-    5. Post Transaction
+    5. Attach the invoice PDF (while still PRE_INVOICED)
+       -> POST /api/accounting/u/poInvoice/preInvoice/post   (invoiceId set)
+    6. Post Transaction
        -> POST /api/accounting/u/poInvoice/receivedTransaction/{invoiceId}
 
 Endpoints were captured from a live session with `npm run pw:capture:ap` and
@@ -48,6 +50,10 @@ from api.services.tekion_client import TekionApiClient
 # only the keys below -- the GET adds lineIdentifier, tags, medias, ... which
 # the UI does not send back.
 _RECEIVED_TRANSACTION_PATH = "/api/accounting/u/poInvoice/receivedTransaction/{invoice_id}"
+# Attaching a file to an existing Vendor Invoice re-posts the whole pre-invoice
+# with its invoiceId and the media in `attachments` (captured 30 Oct). The post
+# ignores assetAttachmentDto, so a file sent there never shows on the invoice.
+_PRE_INVOICE_POST_PATH = "/api/accounting/u/poInvoice/preInvoice/post"
 _AP_JOURNAL_NUMBER = "75"
 _DOCUMENT_TYPE_SUFFIX = "document_type_5"
 _WIRE_POSTING_KEYS = (
@@ -341,7 +347,72 @@ class ApApprovalService:
             prepared.append(line)
         return prepared
 
-    # ── Step 5: Post Transaction ─────────────────────────────────────────────
+    # ── Step 5: attach the invoice PDF ───────────────────────────────────────
+
+    @staticmethod
+    def build_attach_payload(invoice: dict[str, Any], media_ids: list[str]) -> dict[str, Any]:
+        """Re-post body for an existing pre-invoice, as the UI sends it.
+
+        `invoice` is the Vendor Invoice as poInvoice/search returns it. Every
+        field goes back as Tekion holds it -- amounts, dates, GL lines -- so the
+        only change is the attachment. A field rebuilt from anywhere else would
+        overwrite the invoice.
+        """
+        usd0 = {"amount": 0, "currency": "USD"}
+        existing = [
+            str(a.get("mediaId"))
+            for a in invoice.get("attachments") or []
+            if a.get("mediaId")
+        ]
+        site = str(invoice.get("vendorSiteId") or "")
+        return {
+            # The UI sends 0 and an empty poDetails; Tekion keeps the PO link.
+            "poAmount": usd0,
+            "payeeId": str(invoice.get("payeeId") or ""),
+            "vendorSiteId": int(site) if site.isdigit() else site,
+            "invoiceNumber": invoice.get("invoiceNumber"),
+            "invoiceAmount": invoice.get("invoiceAmount"),
+            "invoiceDate": invoice.get("invoiceDate"),
+            "invoiceDueDate": invoice.get("invoiceDueDate"),
+            "comment": invoice.get("comment"),
+            "salesTax": invoice.get("salesTax") or usd0,
+            "fees": invoice.get("fees") or usd0,
+            "shippingCharges": invoice.get("shippingCharges") or usd0,
+            "discount": invoice.get("discount") or usd0,
+            "attachments": [{"mediaId": m} for m in existing + media_ids],
+            "invoiceId": invoice.get("id"),
+            "type": invoice.get("type") or "INVOICE",
+            "transactionDetails": {},
+            "payeeName": invoice.get("payeeName"),
+            "payeeNumber": invoice.get("payeeNumber"),
+            "poDetails": [],
+            "apGlAccountId": invoice.get("apGlAccountId"),
+            "accountingDetails": invoice.get("accountingDetails") or [],
+            "taxes": invoice.get("taxes") or [],
+            "payeeType": invoice.get("payeeType") or "VENDOR",
+        }
+
+    def attach_to_invoice(self, invoice: dict[str, Any], media_id: str) -> dict[str, Any]:
+        """Link an uploaded file to a PRE_INVOICED Vendor Invoice."""
+        body = self.build_attach_payload(invoice, [media_id])
+        print(f"[AP] Attach mediaId={media_id} to invoice {invoice.get('id')}")
+        res = self.client._req_json(_PRE_INVOICE_POST_PATH, method="POST", body=body)
+        res = res if isinstance(res, dict) else {}
+        if res.get("status") == "failed":
+            details = res.get("errorDetails") or {}
+            raise RuntimeError(
+                f"Attaching the invoice PDF was refused: {details.get('errorCode')} "
+                f"{details.get('key')}: {details.get('displayMessage')}"
+            )
+        attached = [a.get("mediaId") for a in (res.get("data") or {}).get("attachments") or []]
+        if media_id not in attached:
+            raise RuntimeError(
+                f"Tekion accepted the re-post but invoice {invoice.get('id')} does not "
+                f"list mediaId {media_id} among its attachments."
+            )
+        return res
+
+    # ── Step 6: Post Transaction ─────────────────────────────────────────────
 
     @staticmethod
     def build_post_payload(
@@ -350,9 +421,12 @@ class ApApprovalService:
         postings: list[dict[str, Any]],
         dealer_id: str,
         accounting_date_ms: int,
-        attachments: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """The receivedTransaction body, matching the captured request."""
+        """The receivedTransaction body, matching the captured request.
+
+        The PDF is not sent here: the post ignores assetAttachmentDto, so the
+        file is linked beforehand by attach_to_invoice().
+        """
         wire_postings = []
         for p in sorted(postings, key=lambda p: p.get("postingOrder") or 0):
             line = {k: p.get(k) for k in _WIRE_POSTING_KEYS if k in p}
@@ -392,7 +466,7 @@ class ApApprovalService:
             "defaultJournalValidationRequired": False,
             # Epoch-ms as a string, as the UI sends it.
             "scheduledTime": str(accounting_date_ms),
-            "assetAttachmentDto": {"attachments": attachments} if attachments else {},
+            "assetAttachmentDto": {},
             "userConsentToSkipCreditLimitCheckForAR": False,
         }
 
@@ -403,7 +477,6 @@ class ApApprovalService:
         postings: list[dict[str, Any]],
         *,
         accounting_date_ms: int,
-        attachments: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Post the Vendor Invoice to the ledger. There is no undo.
 
@@ -413,7 +486,7 @@ class ApApprovalService:
         """
         dealer_id = str(self.client.current_dealer_id)
         body = self.build_post_payload(
-            invoice_id, invoice_number, postings, dealer_id, accounting_date_ms, attachments
+            invoice_id, invoice_number, postings, dealer_id, accounting_date_ms
         )
         path = _RECEIVED_TRANSACTION_PATH.format(invoice_id=invoice_id)
         print(f"[AP] Post Transaction: POST {path}")

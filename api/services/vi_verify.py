@@ -13,11 +13,11 @@ step only:
      with 7 also need a description (control checks behind ENFORCE_JE_CONTROL).
   5. On pass (and writes on): attach the PDF and complete the VI / AP posting.
 
-Never creates a PO. Never calls preInvoice/post.
+Never creates a PO or a pre-invoice. preInvoice/post is only called with the
+existing invoiceId, to attach the PDF -- that is how Tekion links a file.
 """
 from __future__ import annotations
 
-import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -93,6 +93,8 @@ class ViVerifyResult:
     tekion_invoice_date: str | None = None
     # The Vendor Invoice's invoiceDate as Tekion holds it; posted as scheduledTime.
     tekion_invoice_date_ms: int | None = None
+    # The Vendor Invoice record from poInvoice/search; re-posted to attach the PDF.
+    vi_record: dict[str, Any] = field(default_factory=dict)
     postings: list[dict[str, Any]] = field(default_factory=list)
     media_id: str | None = None
     completed: bool = False
@@ -418,6 +420,7 @@ def verify_vendor_invoice(
         return result
 
     result.invoice_id = str(hit.get("id") or "")
+    result.vi_record = hit
     vi_invoice_number = _norm_invoice(hit.get("invoiceNumber") or invoice_number)
     result.invoice_number = vi_invoice_number
     vi_amount = _money(hit.get("invoiceAmount"))
@@ -887,13 +890,6 @@ class DuplicateInvoiceNumber(RuntimeError):
     """Tekion refused the post: the invoice number is already posted (A111)."""
 
 
-def _file_size(path: str) -> int:
-    try:
-        return os.path.getsize(path)
-    except OSError:
-        return 0
-
-
 def _complete_vendor_invoice(
     client: TekionApiClient,
     svc: ApApprovalService,
@@ -901,25 +897,19 @@ def _complete_vendor_invoice(
     result: ViVerifyResult,
 ) -> None:
     """Attach the invoice PDF and finish the VI / AP posting in Tekion."""
-    attachments: list[dict[str, Any]] = []
+    # Attach first: the re-post only works while the invoice is PRE_INVOICED.
+    # A failure here stops before posting, so a re-run can finish the job.
     if expected.invoice_file_path:
         media_id = client.upload_document(
             expected.invoice_file_path,
             display_name=expected.invoice_file_name or None,
+            module_name="ACCOUNTING",
+            service_name="Vendor Invoices",
         )
         result.media_id = media_id
         result.notes.append(f"Uploaded invoice mediaId={media_id}")
-        if media_id:
-            attachments.append(
-                {
-                    "id": media_id,
-                    "mediaId": media_id,
-                    "uploadedTime": int(time.time() * 1000),
-                    "name": expected.invoice_file_name
-                    or os.path.basename(expected.invoice_file_path),
-                    "fileSize": _file_size(expected.invoice_file_path),
-                }
-            )
+        svc.attach_to_invoice(result.vi_record, media_id)
+        result.notes.append(f"Attached mediaId={media_id} to the Vendor Invoice.")
 
     ap_expected = ExpectedInvoice(
         invoice_number=_norm_invoice(expected.invoice_number),
@@ -949,7 +939,6 @@ def _complete_vendor_invoice(
             result.invoice_number or _norm_invoice(expected.invoice_number),
             prepared,
             accounting_date_ms=accounting_date_ms,
-            attachments=attachments,
         )
     except Exception as exc:  # noqa: BLE001
         if "duplicate.invoice.number" in str(exc):
