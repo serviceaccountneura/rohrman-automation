@@ -107,6 +107,9 @@ class SubletLineItem(BaseModel):
 class _CreatePoBase(BaseModel):
     dealership_name: str = Field(alias="dealershipName")
     vendor_name: str = Field(alias="vendorName")
+    # Dealer-vendor codes written on the invoice ("1707-310"). One for the
+    # dealership being posted to picks the vendor ahead of the name.
+    vendor_codes: list[str] = Field(default_factory=list, alias="vendorCodes")
     invoice_number: str = Field(alias="invoiceNumber")
     invoice_amount: float = Field(alias="invoiceAmount")
     sales_tax: float = Field(default=0.0, alias="salesTax")
@@ -133,6 +136,14 @@ class GlSplitInput(BaseModel):
     gl_account: str = Field(alias="glAccount")
     amount: float
     description: str | None = None
+    # The control this line carries in Tekion. Per line, because a person
+    # reviewing a split may give each account its own reference.
+    control: str | None = None
+    # The account's REAL Tekion id, when it is known. An id is not always
+    # "{dealer}_{number}" -- at Schaumburg Kia 1710_2246 is account 2245 -- so
+    # a line resolved against the chart of accounts says which it is rather
+    # than having one built from the number.
+    account_id: str | None = Field(default=None, alias="accountId")
 
     model_config = {"populate_by_name": True}
 
@@ -172,6 +183,23 @@ class VendorCandidate(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class GlLine(BaseModel):
+    """One accounting line as it was sent to Tekion.
+
+    The same shape for every flow, so one component can render a Misc
+    invoice's split, an OEM journal entry and a vehicle purchase alike.
+    """
+
+    gl_account: str = ""
+    gl_name: str = ""
+    # Signed: negative is a credit, which is how every flow already carries it.
+    amount: float = 0.0
+    control: str = ""
+    # Where the figure came from, in words -- "written on the invoice",
+    # "template preset". Only the flows that have something to say fill it in.
+    source: str = ""
+
+
 class CreatePoResponse(BaseModel):
     success: bool
     po_number: str | None = None
@@ -184,6 +212,10 @@ class CreatePoResponse(BaseModel):
     needs_review: bool = False
     review_reason: str | None = None
     vendor_candidates: list[VendorCandidate] = Field(default_factory=list)
+    # The accounting lines this PO's pre-invoice carried. Reported so the
+    # document can record what it posted; nothing in the PO response said where
+    # the money went, so a Misc invoice's split was only visible in Tekion.
+    gl_lines: list[GlLine] = Field(default_factory=list)
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -335,13 +367,8 @@ class UpdateUserStatusRequest(BaseModel):
 
 class Token(BaseModel):
     access_token: str
-    refresh_token: str
     token_type: str = "bearer"
-    expires_in: int  # seconds until access token expires
-
-
-class RefreshRequest(BaseModel):
-    refresh_token: str
+    expires_in: int  # seconds until the token expires; then sign in again
 
 
 class MessageResponse(BaseModel):
@@ -381,6 +408,18 @@ class PipelineFolder(str, Enum):
     STOCK = "STOCK"
     OEM = "OEM"
     VEHICLE_MANUFACTURING = "VEHICLE_MANUFACTURING"
+
+
+class ReviewEdit(BaseModel):
+    """A correction to a Misc invoice held for review.
+
+    `fields` merges into what is there; `lines` replaces the whole table,
+    because removing a line is an edit and a merge could not express it. Either
+    may be omitted to leave that half alone.
+    """
+
+    fields: dict[str, Any] | None = None
+    lines: list[dict[str, Any]] | None = None
 
 
 class PoDecisionRequest(BaseModel):
@@ -450,11 +489,24 @@ class PipelineStatusResponse(BaseModel):
     # and the invoices already on it, so the choice can be made without opening
     # Tekion and without this endpoint calling it.
     po_candidate: dict[str, Any] | None = Field(default=None, alias="poCandidate")
+    # Set when status is AWAITING_REVIEW: what the flow would post -- the fields
+    # read and the GL lines chosen -- plus how those lines add up. Kept after
+    # posting as the record of what was approved.
+    review_draft: dict[str, Any] | None = Field(default=None, alias="reviewDraft")
     # What a person typed in on a previous re-run, so the form comes back filled
     # rather than blank on the second correction.
     manual_fields: dict[str, Any] = Field(default_factory=dict, alias="manualFields")
     # What the vehicle flow read, matched and built. Present on refusals too.
     vehicle_details: dict[str, Any] = Field(default_factory=dict, alias="vehicleDetails")
+    # What was read off the document in any folder -- invoice date, and the
+    # handwritten GL lines with their signs -- for the correction form.
+    read_fields: dict[str, Any] = Field(default_factory=dict, alias="readFields")
+    # What this document posted to Tekion -- the GL accounts, the amount against
+    # each, and the totals. The same shape for every flow, so one component
+    # renders a Misc split, a journal entry and a vehicle purchase alike.
+    posting_details: dict[str, Any] = Field(
+        default_factory=dict, alias="postingDetails"
+    )
     # Exactly which fields would fix this document, named by the code that
     # refused it. The correction form renders these and nothing else.
     needs_fields: list[str] = Field(default_factory=list, alias="needsFields")
@@ -474,6 +526,8 @@ class PipelineStatusResponse(BaseModel):
     uploaded_by: str = Field(default="", alias="uploadedBy")
     created_at: datetime = Field(alias="createdAt")
     processed_at: datetime | None = Field(default=None, alias="processedAt")
+    # Set when the document was deleted. Kept on record, shown greyed out.
+    deleted_at: datetime | None = Field(default=None, alias="deletedAt")
 
     model_config = {"populate_by_name": True}
 
@@ -550,6 +604,10 @@ class DocumentItem(BaseModel):
     # repeats. Exposed on the list so the table can pair them up and offer the
     # decision without opening each row.
     duplicate_of: UUID | None = None
+    # Set when the row was deleted. It stays in the list, greyed out -- the
+    # record is kept, it is only taken out of the way.
+    deleted_at: datetime | None = None
+    deleted_by: str = ""
     file_name: str
     dealership_name: str
     vendor_name: str
@@ -557,6 +615,9 @@ class DocumentItem(BaseModel):
     vin: str
     ro_number: str
     po_number: str
+    # The journal entry an OEM or vehicle document created. With po_number, it
+    # is how the table can say WHAT a deleted row left behind in Tekion.
+    transaction_number: str = ""
     po_type: str
     status: str
     exception_type: str | None

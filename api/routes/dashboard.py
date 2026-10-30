@@ -15,7 +15,7 @@ from sqlalchemy import func
 from sqlmodel import Session, select
 
 from api.db import get_session
-from api.models.db import Document
+from api.models.db import Document, User
 from api.models.schemas import (
     TrendPoint,
     TrendsResponse,
@@ -103,6 +103,12 @@ def _filtered(
     date would return nothing, which reads as broken rather than as empty.
     """
     query = _for_dealership(query, dealership)
+
+    # A deleted document is off the books. It stays in the documents list, greyed
+    # out, but it must not be counted: leaving it in means "12 processed today"
+    # includes rows a person deliberately removed, and the number stops matching
+    # anything they can see.
+    query = query.where(Document.deleted_at.is_(None))  # type: ignore[union-attr]
 
     start = _parse_day(date_from)
     if start:
@@ -282,10 +288,24 @@ def list_documents(
         .limit(page_size)
     ).all()
 
+    # Deleted rows are INCLUDED here on purpose -- the table greys them out, and
+    # hiding them would make "deleted" indistinguishable from "gone", which is
+    # the thing a soft delete exists to avoid.
+    removers = {
+        u.id: (u.full_name or u.email or "")
+        for u in session.exec(
+            select(User).where(
+                User.id.in_([d.deleted_by_id for d in docs if d.deleted_by_id])  # type: ignore[union-attr]
+            )
+        ).all()
+    } if any(d.deleted_by_id for d in docs) else {}
+
     items = [
         DocumentItem(
             id=doc.id,
             duplicate_of=doc.duplicate_of,
+            deleted_at=doc.deleted_at,
+            deleted_by=removers.get(doc.deleted_by_id, "") if doc.deleted_by_id else "",
             file_name=doc.file_name,
             dealership_name=doc.dealership_name,
             vendor_name=doc.vendor_name,
@@ -293,6 +313,7 @@ def list_documents(
             vin=doc.vin,
             ro_number=doc.ro_number,
             po_number=doc.po_number,
+            transaction_number=doc.transaction_number,
             po_type=doc.po_type,
             status=doc.status,
             exception_type=doc.exception_type,

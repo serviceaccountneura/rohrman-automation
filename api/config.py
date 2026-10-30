@@ -21,8 +21,10 @@ class Settings(BaseSettings):
     # ── JWT ───────────────────────────────────────────────────────────────────
     jwt_secret: str = "change-me-in-production-please-use-a-long-random-string"
     jwt_algorithm: str = "HS256"
-    access_token_expire_minutes: int = 15
-    refresh_token_expire_days: int = 7
+    # One token per login, no refresh: when it expires the user signs in again.
+    # 7 days. Renewing short-lived tokens with single-use refresh tokens raced
+    # whenever two requests renewed at once, and a lost race ended the session.
+    access_token_expire_minutes: int = 10080
 
     # ── AWS S3 ────────────────────────────────────────────────────────────────
     aws_access_key_id: str = ""
@@ -34,6 +36,41 @@ class Settings(BaseSettings):
     # is obvious rather than silently degraded.
     s3_bucket: str = ""
     s3_presign_expiry: int = 300  # seconds (5 min)
+    # Point S3 somewhere other than AWS -- MinIO on the staging box, say.
+    # Empty means real S3, which is what production uses, so nothing changes
+    # there. Any S3-compatible server also needs path-style addressing:
+    # bucket.host virtual-hosting only resolves for AWS, so another endpoint
+    # has to be addressed as host/bucket instead.
+    s3_endpoint_url: str = ""
+    s3_force_path_style: bool = False
+    # The address a BROWSER can fetch a presigned URL from, when that differs
+    # from the address this process talks to. With MinIO on the same box the
+    # api reaches it at http://minio:9000, which resolves for nobody outside
+    # Docker -- so an invoice preview signed for that host never loads.
+    #
+    # Signing is pure local computation, no request, so the two can differ:
+    # uploads and downloads keep using s3_endpoint_url, and only the signature
+    # is computed against this one. Empty means "same as s3_endpoint_url",
+    # which is the case on real S3 and therefore in production.
+    s3_public_endpoint_url: str = ""
+
+    # Clean up each page (crop, enlarge, flatten the background, boost local
+    # contrast) before Gemini reads it -- see api/services/page_enhance.py.
+    # False sends the page as scanned, as before.
+    ocr_enhance: bool = True
+
+    # TESTING BRANCH (staging-no-preinvoice): Misc, Sublet and Vendor Stock
+    # read, check and show their GL lines but create NOTHING in Tekion -- no
+    # purchase order, no pre-invoice, no uploaded invoice. OEM and Vehicle
+    # still save their drafts. Set TEKION_PO_WRITES=true (or change this
+    # default) to reconnect; every guarded call is marked "TEKION_PO_WRITES".
+    tekion_po_writes: bool = False
+
+    # OEM stock orders: post the journal entry to Tekion (true) or leave it as
+    # a draft for a clerk to submit (false). Posting cannot be undone in
+    # Tekion, so the default is a draft. Production sets OEM_POST=true; staging
+    # leaves it false. The only difference between the two is this env value.
+    oem_post: bool = False
 
     # ── Frontend ──────────────────────────────────────────────────────────────
     frontend_url: str = "http://localhost:3000"

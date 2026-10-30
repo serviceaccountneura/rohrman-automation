@@ -12,9 +12,10 @@ reproducing what a clerk does on Accounting -> Journal Entry -> Create New:
     3. Lines -- exactly two, and they must net to $0.00:
          line 1: GL 3000 TRADE CREDITORS  CREDIT  control = MMYY of the acct date
          line 2: GL 2410 PARTS INV        DEBIT
-    4. Save as Draft
+    4. Submit
+         -> POST /api/accounting/u/v2/transaction/dealer/{dealerId}/post
+       Save as Draft is still here and still works
          -> POST /api/accounting/u/v2/transaction/dealer/{dealerId}/draft
-    5. Submit -- deliberately not implemented, see submit().
 
 Only three values come off the Parts Ticket PDF: invoice number, invoice date,
 invoice amount. Everything else is either fixed by the SOP (journal 76, GL 3000)
@@ -44,10 +45,12 @@ INTEGRATION NOTE
     `create_journal_entry()` -- no other change is required.
 
 SAFETY
-    `create_journal_entry()` runs read-only by default. The Save as Draft write
-    is gated behind dry_run=False, and the entry is refused unless it balances
-    to $0.00. Submit always raises: drafts are reversible in the UI, posted
-    journal entries are not.
+    `create_journal_entry()` runs read-only by default; every write is gated
+    behind dry_run=False, and the entry is refused unless it balances to $0.00.
+
+    Posting is NOT reversible in the UI, where a draft is -- so which of the two
+    happens is an explicit argument (`post`) rather than a default. The OEM
+    flow asks for a post; anything that does not say stays on drafts.
 """
 from __future__ import annotations
 
@@ -57,10 +60,26 @@ from typing import Any
 
 from api.services.tekion_client import TekionApiClient
 
-# ── The captured Save as Draft call ───────────────────────────────────────────
+# ── The captured writes ───────────────────────────────────────────────────────
 # POST /api/accounting/u/v2/transaction/dealer/{dealerId}/draft  -> 200, DRAFT
+# POST /api/accounting/u/v2/transaction/dealer/{dealerId}/post   -> 200, POSTED
+#
+# Submit sends the SAME payload as the draft, to a different path, and comes
+# back with status POSTED and the transaction number. Captured 24 Sep 2026 by
+# submitting a $10 test entry at dealer 1707.
 _SAVE_DRAFT_METHOD = "POST"
 _SAVE_DRAFT_PATH = "/api/accounting/u/v2/transaction/dealer/{dealer_id}/draft"
+_POST_METHOD = "POST"
+_POST_PATH = "/api/accounting/u/v2/transaction/dealer/{dealer_id}/post"
+
+# Two keys the UI adds on Submit and not on a draft. Both were captured as sent
+# by Tekion's own screen: the first asks the server to run the journal's
+# validation rules, the second answers the A/R credit-limit prompt that a
+# GENERAL entry never raises.
+_POST_ONLY_FIELDS = {
+    "defaultJournalValidationRequired": True,
+    "userConsentToSkipCreditLimitCheckForAR": False,
+}
 
 # The control number is validated against vendor numbers before the save. This
 # is the same endpoint the AP approval flow uses for its vendor lookup.
@@ -156,7 +175,14 @@ class JournalEntryResult:
     # How the debit account was decided: written on the invoice, classified, or
     # the SOP default. Worth surfacing -- the three are not equally trustworthy.
     debit_gl_source: str = ""
+    # GL accounts the entry needed that the dealership's chart does not have,
+    # e.g. "2420" written on a Kia invoice whose parts account is 2410.
+    # Terminal: nothing was built, so nothing was sent to Tekion.
+    accounts_not_in_chart: list[str] = field(default_factory=list)
     saved: bool = False
+    # Whether it went in POSTED rather than as a draft. Separate from `saved`
+    # because the two differ in what can still be undone.
+    posted: bool = False
     transaction_id: str | None = None
     transaction_number: str | None = None
     status: str | None = None
@@ -458,7 +484,11 @@ class JournalEntryService:
             }
             if description:
                 # The part name, so the line says what it is on the JE screen.
-                row["refText"] = description[:_REF_TEXT_MAX]
+                # `description` is the Description column. NOT refText: that is
+                # the Control column, and a CUSTOM control holding free text
+                # with no refId is refused at post time with A217 "Mandatory
+                # fields are not filled as per COA". Drafts do not check it.
+                row["description"] = description[:_REF_TEXT_MAX]
             return row
 
         # A written block replaces the per-part debit entirely: it names the
@@ -481,7 +511,11 @@ class JournalEntryService:
                 }
                 description = split.get("description")
                 if description:
-                    row["refText"] = str(description)[:_REF_TEXT_MAX]
+                    # Description column, not refText (the Control column) --
+                    # see _debit above. OCR labels the written amount on some
+                    # runs ("Invoice Total") and not others, and every labelled
+                    # run was refused with A217 while the unlabelled ones posted.
+                    row["description"] = str(description)[:_REF_TEXT_MAX]
                 postings.append(row)
             return postings
 
@@ -546,19 +580,23 @@ class JournalEntryService:
         data = res.get("data") or {}
         return data.get("transaction") or data
 
-    # ── Step 5: Submit — intentionally not implemented ───────────────────────
+    # ── Step 5: Submit ───────────────────────────────────────────────────────
 
-    def submit(self, *_args: Any, **_kwargs: Any) -> None:
-        """The final post. NOT IMPLEMENTED ON PURPOSE.
+    def submit(self, payload: dict[str, Any], dealer_id: str) -> dict[str, Any]:
+        """Post the entry for real. Returns the created transaction.
 
-        Draft first, by explicit instruction: a draft is reversible in the UI, a
-        posted journal entry is not. Capture the Submit click the same way Save
-        as Draft was captured before implementing this.
+        There is no undo. A draft can be opened and deleted in the UI; a posted
+        entry has hit the ledger and has to be reversed with another entry. The
+        balance check upstream is what stands between this call and a wrong
+        posting, which is why it refuses rather than rounds.
         """
-        raise NotImplementedError(
-            "Submit is intentionally not implemented — the flow stops at Save as Draft. "
-            "Re-capture with npm run pw:capture:je and click Submit once to record it."
+        path = _POST_PATH.format(dealer_id=dealer_id)
+        print(f"[JE] Submit: {_POST_METHOD} {path}")
+        res = self.client._req_json(
+            path, method=_POST_METHOD, body={**payload, **_POST_ONLY_FIELDS}
         )
+        data = res.get("data") or {}
+        return data.get("transaction") or data
 
 
 # ── Orchestration ─────────────────────────────────────────────────────────────
@@ -569,14 +607,17 @@ def create_journal_entry(
     expected: ExpectedJournalEntry | None = None,
     dealership_name: str | None = None,
     dry_run: bool = True,
+    post: bool = False,
 ) -> JournalEntryResult:
-    """Run the Parts Manufacture Ticket SOP up to (but not including) Submit.
+    """Run the Parts Manufacture Ticket SOP and write the entry.
 
     Args:
         client: a logged-in TekionApiClient.
         expected: the entry to create. Defaults to HARDCODED_EXPECTED.
         dealership_name: dealer to switch to. Defaults to expected.dealership_name.
         dry_run: when True (default) nothing is written to Tekion.
+        post: submit the entry instead of leaving it as a draft. Not reversible,
+            so it is off unless the caller asks for it.
     """
     expected = expected or HARDCODED_EXPECTED
     svc = JournalEntryService(client)
@@ -648,10 +689,32 @@ def create_journal_entry(
     result.resolved_accounts = resolved
     result.discrepancies.extend(problems)
 
-    if len(resolved) < 2:
-        result.notes.append(
-            "Could not resolve both GL accounts for this dealership — nothing was built."
-        )
+    # An account the chart does not have -- the credit, the debit, or one named
+    # in a written block -- stops the entry with its number, rather than
+    # falling through to a balance check that reads "balance $0.00" and says
+    # nothing about why. A written account used to be skipped silently, which
+    # would have posted that line with no account at all.
+    # Once each: the same account can be both the debit and a written line.
+    missing = list(dict.fromkeys(
+        str(p.expected)
+        for p in problems
+        if p.found == "not in this dealership's chart"
+    ))
+    if missing or len(resolved) < 2:
+        result.accounts_not_in_chart = missing
+        dealership = expected.dealership_name or "this dealership"
+        if missing:
+            numbers = ", ".join(f"GL {n}" for n in missing)
+            result.notes.append(
+                f"{numbers} {'is' if len(missing) == 1 else 'are'} not in {dealership}'s "
+                "chart of accounts in Tekion, so nothing was posted. Check the account "
+                "written on the invoice, correct it, and run it again."
+            )
+        else:
+            result.notes.append(
+                f"Could not resolve both GL accounts for {dealership} — nothing was built."
+            )
+        print(f"[JE] {result.notes[-1]}")
         return result
 
     # Advisory: the UI warns when the control number is not a known vendor.
@@ -688,16 +751,23 @@ def create_journal_entry(
         result.debit_total,
     )
 
-    # ── Step 4: Save as Draft ────────────────────────────────────────────────
+    # ── Step 4/5: write it ───────────────────────────────────────────────────
+    what = "Submit" if post else "Save as Draft"
     if dry_run:
-        result.notes.append("Dry run - stopped before Save as Draft. Nothing was written.")
+        result.notes.append(f"Dry run - stopped before {what}. Nothing was written.")
     else:
-        txn = svc.save_draft(result.payload, result.dealer_id)
+        txn = (
+            svc.submit(result.payload, result.dealer_id)
+            if post
+            else svc.save_draft(result.payload, result.dealer_id)
+        )
         result.saved = True
+        result.posted = post
         result.transaction_id = str(txn.get("id") or "")
         result.transaction_number = str(txn.get("transactionNumber") or "")
         result.status = txn.get("status")
-        print(f"[JE] Draft saved: transaction {result.transaction_number} "
-              f"(id={result.transaction_id}, status={result.status})")
+        print(f"[JE] {'Posted' if post else 'Draft saved'}: transaction "
+              f"{result.transaction_number} (id={result.transaction_id}, "
+              f"status={result.status})")
 
     return result

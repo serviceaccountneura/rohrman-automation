@@ -58,22 +58,13 @@ class User(SQLModel, table=True):
     dealerships: str = Field(default="", max_length=4000)
     is_active: bool = Field(default=True)
     is_superuser: bool = Field(default=False)
+    # Tokens issued before this are refused. There is no server-side session
+    # to revoke -- a login is one signed token, good for 7 days -- so this is
+    # how a password reset still signs out every existing session. NULL means
+    # every unexpired token is good.
+    tokens_valid_after: datetime | None = Field(default=None)
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
-
-
-class RefreshToken(SQLModel, table=True):
-    __tablename__ = "refresh_tokens"
-
-    id: UUID = Field(default_factory=uuid4, primary_key=True)
-    user_id: UUID = Field(foreign_key="users.id", index=True)
-    # The jti (JWT ID) of the refresh token — used to look up + revoke.
-    jti: str = Field(index=True, unique=True, max_length=64)
-    # SHA-256 of the token so we never store the raw refresh token.
-    token_hash: str = Field(index=True, max_length=128)
-    expires_at: datetime
-    revoked: bool = Field(default=False)
-    created_at: datetime = Field(default_factory=_utcnow)
 
 
 class VendorMapping(SQLModel, table=True):
@@ -178,6 +169,23 @@ class Document(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_utcnow, index=True)
     processed_at: datetime | None = Field(default=None)
 
+    # ── Soft delete ───────────────────────────────────────────────────────────
+    # Removed from view, kept on record. A document that reached Tekion is part
+    # of the audit trail whether or not anyone wants it in the list, and the
+    # OCR, the corrections and the PO number it produced are the only account of
+    # what happened.
+    #
+    # The timestamp IS the flag -- NULL means live. A separate boolean could
+    # disagree with it, and then neither would be trustworthy.
+    deleted_at: datetime | None = Field(default=None, index=True)
+    deleted_by_id: UUID | None = Field(
+        default=None, foreign_key="users.id"
+    )
+
+    @property
+    def is_deleted(self) -> bool:
+        return self.deleted_at is not None
+
     # ── Queue bookkeeping ─────────────────────────────────────────────────────
     # This table doubles as the job queue: workers claim rows with
     # SELECT ... FOR UPDATE SKIP LOCKED, so status lives in one place and the
@@ -227,10 +235,45 @@ class Document(SQLModel, table=True):
     # attempt including refusals -- those are the ones somebody needs to look
     # at, and nothing else here records why an entry came out as it did.
     vehicle_details: str = Field(default="", max_length=8000)
+    # What this document posted to Tekion, in one shape for every flow: the GL
+    # accounts, the amount against each, and what they total. Written on every
+    # attempt including failures -- a refusal is exactly when somebody wants to
+    # see which lines were built and where they stopped adding up.
+    #
+    # Separate from vehicle_details because that one also carries stock numbers,
+    # templates and handwritten annotations, none of which mean anything to a
+    # Misc invoice.
+    posting_details: str = Field(default="", max_length=8000)
+
+    # ── Review before posting (MISCELLANEOUS) ─────────────────────────────────
+    # What the flow decided it WOULD post -- the fields read and the GL lines
+    # chosen -- plus every correction a person makes to it. See
+    # api/services/misc_review.py for the shape.
+    review_draft: str = Field(default="", max_length=8000)
+    # Set when a person releases the draft to Tekion. Cleared once posting is
+    # attempted, so an approval covers exactly one attempt.
+    review_approved: bool = Field(default=False)
     split_from: UUID | None = Field(default=None, foreign_key="documents.id")
     # Which pages of the parent this document is, e.g. "1-2" or "3". Empty for
     # anything that was not split out of a batch.
     page_range: str = Field(default="", max_length=20)
+
+
+class DocumentAlias(SQLModel, table=True):
+    """An upload that was folded into an earlier document, and which one.
+
+    A re-scan of an invoice that already failed does not become a second row:
+    once OCR has read the invoice number, the new upload moves onto the failed
+    document and is processed there. The new row is dropped -- but the screen
+    that uploaded it is still asking about its id, so that id has to keep
+    leading somewhere. This is where.
+    """
+
+    __tablename__ = "document_aliases"
+
+    alias_id: UUID = Field(primary_key=True)
+    document_id: UUID = Field(foreign_key="documents.id", index=True)
+    created_at: datetime = Field(default_factory=_utcnow)
 
 
 class GlVendorMapping(SQLModel, table=True):

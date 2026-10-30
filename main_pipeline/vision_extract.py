@@ -70,6 +70,54 @@ TABLES (most important — reproduce them faithfully):
 - ALSO populate the typed helpers where they apply: `line_items[]` for part/qty/price rows,
   `totals[]` for subtotal/tax/total/balance figures, `identifiers[]` for invoice/PO/control/account
   numbers and dates. These may duplicate data already in `tables[]` — that is fine and expected.
+- THE INVOICE NUMBER is everything printed in the invoice-number field, as one value: the
+  number, plus any short letter code printed with it in that field -- beside it on the same line
+  ("6101029 RI") or directly beneath it ("331937" with "HOM" under it is "331937 HOM"). Join the
+  parts with a single space, number first. Do not add text from outside the field. Report it the
+  same way every time, code included.
+
+THE INVOICE NUMBER AND THE INVOICE TOTAL -- decide these two yourself, from the whole page, and
+  put them in the top-level fields. Everything else stays a faithful transcription; these two are
+  your judgement of what the document means.
+  * `invoice_number`: the number this vendor uses to identify THIS bill, written as the rule above
+    says. When the page prints no invoice number, use the number that plays its part -- an
+    "Order #", "Document #" or "Ref #" printed in the header where an invoice number would be.
+    Never a customer, account, PO, phone or tracking number. "" when there is none.
+    `invoice_number_label`: the label printed beside the number you chose ("Invoice #", "Order #").
+  * `invoice_total`: the amount THIS invoice charges -- its own merchandise plus its own tax,
+    freight, shipping and handling. Not a merchandise-only line, not a subtotal, not an opening
+    or previous balance, and not a "payment due" or "balance due" that adds earlier balances to
+    this invoice. Example -- MERCHANDISE INVOICE TOTAL 20.00, SHIPPING & HANDLING 10.00, INVOICE
+    TOTAL 30.00, OPENING BALANCE 91.00, PAYMENT DUE 121.00: the invoice total is 30.00.
+    A plain number, no "$" or commas. A credit (printed "CR", in brackets or with a minus) is
+    negative: "-422.27". "" when no total can be read.
+  * `posting_lines`: where the clerk says this invoice is to be posted -- each General Ledger
+    account written or stamped on the invoice, with the amount that account takes. This is
+    what gets posted, so decide it from the whole page:
+    - One entry per account line the clerk wrote, in the order written. `account` = the account
+      number alone ("2410", "6777", "2410V"), without "#", "GL" or words.
+    - `amount` = a plain signed number. Positive = a charge to that account. Negative = a credit
+      to it: on a credit memo (its total printed "CR", in brackets or negative), and wherever the
+      clerk writes "Credit", "CR" or a minus by the line. On a credit memo every line is
+      negative unless the clerk marks one otherwise. A discount line on an ordinary invoice
+      ("#6777 -$271.19") is negative.
+    - An account written with no amount: if it is the only account, it takes the whole invoice
+      total, with the total's sign. Accounts written beside individual rows: one entry per
+      account, its amount the sum of the rows it is written beside.
+    - `label` = any word written with the line ("Tires", "Credit", "Freight"), else "".
+    - The lines normally add up to `invoice_total`, sign included. Copy what is written: never
+      invent, complete or "correct" an account. A dealer-vendor code ("1707-446"), a part number,
+      a PO number or a printed GL code in a parts table is not a posting line.
+    - [] when no account is written on the invoice.
+    Examples, as written -> `posting_lines`:
+      "Credit # 5003  $2,890.20" on a credit memo  -> [{"account":"5003","amount":"-2890.20","label":"Credit"}]
+      "GL# 5003 $20.00" and "GL# 9006 $10.00"      -> [{"account":"5003","amount":"20.00"}, {"account":"9006","amount":"10.00"}]
+      "#5003 $1,669.90" and "#8004 -$271.19"       -> [{"account":"5003","amount":"1669.90"}, {"account":"8004","amount":"-271.19"}]
+
+THE VENDOR CODE (`vendor.id`): the dealership often writes or stamps its own code for the vendor
+  on the invoice: a dealer number, a dash, then a vendor number ("1707-310"). Copy it into
+  `vendor.id` exactly as written, and keep it in `handwritten_notes[]` too. Only that code -- never
+  the vendor's customer, account or remit-to numbers. null when there is none.
 
 NUMBERS & FAITHFULNESS:
 - Clean currency of symbols and commas into the string value where a number is expected
@@ -78,6 +126,29 @@ NUMBERS & FAITHFULNESS:
 - If a token is genuinely unreadable, add it to `illegible[]` rather than guessing.
 - Capture handwritten annotations, margin notes, stamps, signatures and initials in
   `handwritten_notes[]` (note signatures as "[signature] <legible name>").
+- HANDWRITTEN GL LINES IN `handwritten_notes[]`: when the clerk writes a GL account with an amount
+  beside it, the sign of that amount is read from this transcription and nowhere else, so copy
+  each such line in exactly this form:
+
+      #<account> <amount>
+
+  * ONE entry per written line. Never join two written lines into one entry, and never split one
+    written line across two entries.
+  * Account FIRST, then the amount -- the order the clerk wrote it. Never put the amount first.
+  * Keep a minus exactly where it is written, directly in front of the amount: "-$271.19".
+    A dash before the dollar sign is a minus, not a "#" and not part of the account.
+  * Write cents with a decimal point. Raised or underlined cents ($1,669^90, $271^19) become
+    $1,669.90 and $271.19. Keep a leading point as written: -$.25.
+  * Copy only what is written. Add no words, labels or codes that are not on the page.
+
+  Examples -- as written on the page -> entry in `handwritten_notes[]`:
+
+      #5003   $1,669^90        ->  "#5003 $1,669.90"
+      #8004   -$271^19         ->  "#8004 -$271.19"
+      GL# 8004  -$.25          ->  "#8004 -$.25"
+
+  Everything else in `handwritten_notes[]` -- signatures, PO numbers, stock numbers, other
+  notes -- is unchanged by this rule.
 
 MULTI-DOCUMENT UPLOADS:
 - One upload may be a single document spanning pages, OR a PRIMARY document plus SUPPORTING
@@ -149,13 +220,13 @@ GL ACCOUNTS & SPATIAL BINDING:
      spatial target independently to ensure every line item, subtotal, discount, or extra fee is
      assigned its correct GL code and corresponding dollar amount.
 - POPULATE OUTPUT:
-  - For items in `line_items[]`, populate the string field `gl_account` (e.g. `gl_account: "2410"`)
+  - For items in `line_items[]`, populate the string field `gl_account` (e.g. `gl_account: "5003"`)
     on EVERY row that has one. This is per-row: three rows with three different handwritten codes
     must come back as three different `gl_account` values, not one repeated or one at document
     level. Leave it empty only for a row with no code of its own.
   - For fees, discounts, freight, or subtotals outside the main table that have an assigned GL
     code, populate `gl_mappings[]` with: `gl_account`, `amount`, and `mapped_description`
-    (e.g. `{"gl_account": "7555", "amount": "15.12", "mapped_description": "Delivery Charge"}`).
+    (e.g. `{"gl_account": "9006", "amount": "15.12", "mapped_description": "Delivery Charge"}`).
   - GL CODES WRITTEN WITH THEIR OWN AMOUNTS: wherever an account appears with a dollar figure
     beside it, that is the clerk stating how the invoice divides. It may be circled, boxed, in a
     margin, at the foot of the page, or just written plainly with nothing around it -- the layout
@@ -163,15 +234,16 @@ GL ACCOUNTS & SPATIAL BINDING:
     account number followed by an amount. The commonest form is a short list written in open
     space on the page:
 
-        GL 2245    1129$
-        GL 2250     368$
+        GL 1005    1129$
+        GL 1006     368$
 
     There is no limit to how many lines such a list has, and the prefix varies -- "GL", "GL#",
     "gl", or nothing at all before the number. Capture EVERY such pair in `gl_mappings[]`, one
     entry each, with the amount exactly as written:
 
-        GL# 7193   $2,378.11        -> {"gl_account": "7193", "amount": "2378.11", ...}
-        GL# 3142   $202.12          -> {"gl_account": "3142", "amount": "202.12", ...}
+        GL# 5007   $2,378.11        -> {"gl_account": "5007", "amount": "2378.11", ...}
+        GL# 8006   $202.12          -> {"gl_account": "8006", "amount": "202.12", ...}
+        #8004      -$271^19         -> {"gl_account": "8004", "amount": "-271.19", ...}
 
     Accounts written this way do NOT belong to any single row and must not be copied into
     `line_items[].gl_account`. This is now the usual way GL accounts are marked: expect the
@@ -188,8 +260,19 @@ GL ACCOUNTS & SPATIAL BINDING:
     code rather than shown as a dollar figure. In `1001948819-KAC0780KAC-KRS0290-FPA0156`,
     `KAC0780KAC` carries 780.00 and `KRS0290` carries 290.00: read the digit run beside the
     letters and drop leading zeros. When a handwritten GL code points at such a segment, emit
-    `{"gl_account": "2245", "amount": "780.00", "mapped_description": "KAC0780KAC"}` -- put the
+    `{"gl_account": "1005", "amount": "780.00", "mapped_description": "KAC0780KAC"}` -- put the
     code segment verbatim in `mapped_description` so the reading can be checked.
+  - A REPAIR ORDER NUMBER WRITTEN ON A ROW: a sublet invoice often bills several vehicles at
+    once, one per row, with that vehicle's repair order number written beside it -- frequently by
+    hand, in a different colour from the printed text, and often with a stock number on the same
+    row. Put it in that row's `ro_number`, per row, exactly as the per-row `gl_account` works:
+    eight rows with eight different numbers must come back as eight different `ro_number` values,
+    not one repeated and not one at document level.
+
+    An RO number is 5-8 digits and carries NO letters. Do not put a stock number there -- those
+    look like "SH3626P" or "SH10649A", letters and digits together -- and do not put a part
+    number, a VIN fragment, a date or a price there. A row with no such number gets an empty
+    `ro_number`; leave it out rather than reusing the row above.
   - A PURCHASE ORDER NUMBER WRITTEN ON BY HAND: staff often write the PO number the invoice
     should be billed against in a margin or at the top of the page -- "PO 35096", "P.O. #35096",
     or just "35096" beside the word PO. Put it in `identifiers[]` as
@@ -215,10 +298,13 @@ GL ACCOUNTS & SPATIAL BINDING:
     key code, dealer number, order reference, zip code and phone number. If the invoice has no
     such run, return an empty array.
   - When a handwritten GL code points instead at a labelled figure in a totals column, use that
-    figure and name the label (e.g. `{"gl_account": "3300", "amount": "32133.00",
+    figure and name the label (e.g. `{"gl_account": "9008", "amount": "32133.00",
     "mapped_description": "TOTAL dealer cost"}`).
-  - Report `amount` as a POSITIVE number in `gl_mappings[]`. Debit/credit direction is decided
-    downstream, never here.
+  - Report `amount` in `gl_mappings[]` WITH ITS SIGN, exactly as the page shows it. A minus in
+    front of the figure, "CR" beside it, or brackets around it mean a credit: report it as a
+    negative number -- "-$271.19" -> "-271.19", "$118.03 CR" -> "-118.03", "(82.80)" -> "-82.80",
+    "-$.25" -> "-0.25". A figure written with none of those is positive. Never add a minus the page
+    does not show, and never drop one it does.
 
 Return ONLY the JSON object described by the schema. No commentary, no markdown fences.
 """
@@ -246,6 +332,14 @@ def build_response_schema() -> types.Schema:
     label_value = _obj({"label": _str(), "value": _str()})
     return _obj({
         "document_type": _str(),
+        "invoice_number": _str(),
+        "invoice_number_label": _str(),
+        "invoice_total": _str(),
+        "posting_lines": _arr(_obj({
+            "account": _str(),
+            "amount": _str(),
+            "label": _str(),
+        })),
         "vendor": _obj({
             "id": _str(), "name": _str(), "address": _str(), "phone": _str(),
         }),
@@ -262,6 +356,7 @@ def build_response_schema() -> types.Schema:
             "unit_price": _str(),
             "total_price": _str(),
             "gl_account": _str(),
+            "ro_number": _str(),
         })),
         "tables": _arr(_obj({
             "title": _str(),

@@ -119,13 +119,84 @@ def get_control_number(ocr: dict[str, Any]) -> str:
     )
 
 
+# How many whitespace-separated pieces an invoice number may be made of, and how
+# long a piece has to be before it stops looking like part of one.
+_INVOICE_MAX_PARTS = 3
+_INVOICE_CODE_MAX = 3
+_INVOICE_PREFIX_MAX = 4
+
+
 def _clean_invoice_number(raw: str) -> str:
-    trimmed = raw.strip()
-    first_token = trimmed.split()[0] if trimmed.split() else trimmed
-    return first_token or trimmed
+    """The invoice number as printed, including any short code attached to it.
+
+    Letters were never the problem -- "80090801610A" and "41854-39" always came
+    through whole. What was lost was anything after a SPACE, because this took
+    the first token and stopped. S&S Automotive prints
+
+        ORDER          INVOICE        PAGE
+        10180847 SS    6101029 RI     1
+
+    and "RI" is part of the number, not a note beside it. Dropping it makes two
+    different documents from the same vendor collide on 6101029 and reports the
+    second as a duplicate of the first.
+
+    So a short code is kept, on either side of the digits:
+
+        "6101029 RI"    -> "6101029 RI"
+        "RI 6101029"    -> "RI 6101029"
+        "80090801610A"  -> unchanged
+        "41854-39"      -> unchanged
+
+    Bounded on purpose. An identifier field sometimes carries a few words of
+    prose after the number, and a rule that simply kept everything would post
+    "6101029 RI Customer Copy" to Tekion. Only pieces SHORT enough to be a code
+    are taken, and at most three of them:
+
+        "6101029 RI Customer Copy" -> "6101029 RI"
+    """
+    trimmed = " ".join(str(raw or "").split())
+    if not trimmed:
+        return ""
+
+    parts = trimmed.split(" ")
+    kept = [parts[0]]
+    index = 1
+
+    # A leading letter-only code belongs to the digits that follow it: "RI
+    # 6101029" is one number written the other way round, and keeping only "RI"
+    # would throw away the number itself.
+    if (
+        parts[0].isalpha()
+        and len(parts[0]) <= _INVOICE_PREFIX_MAX
+        and len(parts) > 1
+        and any(c.isdigit() for c in parts[1])
+    ):
+        kept.append(parts[1])
+        index = 2
+
+    # Short codes after it: "RI", "SS", "CM". Three characters is the cutoff --
+    # it admits every code seen and excludes the shortest real word likely to
+    # follow one.
+    while (
+        index < len(parts)
+        and len(kept) < _INVOICE_MAX_PARTS
+        and len(parts[index]) <= _INVOICE_CODE_MAX
+        and parts[index].isalnum()
+    ):
+        kept.append(parts[index])
+        index += 1
+
+    return " ".join(kept)
 
 
 def get_invoice_number(ocr: dict[str, Any]) -> str:
+    # Gemini's own answer first: it reads the page as a whole, so it knows the
+    # "Order #" is this vendor's invoice number where no invoice number is
+    # printed. The label rules below are for reads made before it was asked.
+    decided = _clean_invoice_number(str(ocr.get("invoice_number") or ""))
+    if decided:
+        return decided
+
     for id_entry in ocr.get("identifiers", []):
         label = (id_entry.get("label") or "").lower()
         if "invoice number" in label or "invoice #" in label or label == "invoice":
@@ -392,10 +463,31 @@ def get_invoice_date(ocr: dict[str, Any]) -> str:
     )
 
 
+# How a printed figure says it is a CREDIT: "422.27 CR", "-1,001.52",
+# "(460.00)", "CR 541.52".
+_CREDIT_MARK = re.compile(r"(?:\bCR\b|\bCREDIT\b|^\s*-|^\s*\()", re.IGNORECASE)
+
+
+def _is_credit_value(value: Any) -> bool:
+    """Whether a printed amount is marked as a credit."""
+    if isinstance(value, (int, float)):
+        return value < 0
+    return bool(_CREDIT_MARK.search(str(value or "")))
+
+
 def _parse_amount(value: Any) -> float:
+    """The MAGNITUDE of a printed amount. Whether it is a credit is asked
+    separately -- see _is_credit_value -- because most callers want the size.
+
+    "422.27 CR" used to fail to parse at all and come back as 0.0. On a Honda
+    parts credit memo every total is printed that way, so no total was found,
+    and the invoice was posted for the first part's price, 332.25, instead of
+    its 422.27 total.
+    """
     if isinstance(value, (int, float)):
         return abs(float(value))
-    cleaned = re.sub(r"[$,]", "", str(value or "0"))
+    cleaned = re.sub(r"(?i)\b(?:CR|DR|CREDIT|DEBIT)\b", "", str(value or "0"))
+    cleaned = re.sub(r"[$,()\s]", "", cleaned)
     try:
         return abs(float(cleaned))
     except ValueError:
@@ -422,52 +514,141 @@ _NOT_A_GRAND_TOTAL = (
 _GRAND_TOTAL_LABELS = (
     "grand total", "total amount due", "amount due", "balance due",
     "invoice total", "total due", "total amount", "net due", "please pay",
+    # Honda on Grand prints its total as "PAY THIS AMOUNT". Missing from this
+    # list, the total fell through to a guess that picked the -16.00 core
+    # return, and a $112.64 invoice was sent to Tekion as a $16 credit.
+    "pay this amount", "amount to pay", "total to pay",
 )
 
 
-def get_total_amount(ocr: dict[str, Any]) -> float:
-    """The amount owed on the invoice, tax included.
+def _grand_total_raw(ocr: dict[str, Any]) -> Any:
+    """The printed grand-total value, as printed -- "422.27 CR", "-1001.52".
 
     Label matching is deliberately prioritised rather than first-match: an
     invoice prints several numbers that read as totals, and picking the wrong
     one is not a rounding error. One S&S invoice listed EXTENDED 411.26, SALES
     TAX 34.96 and TOTAL 446.22; returning 411.26 as "the total" and then
     deducting tax produced a purchase order for 376.30 against a 446.22 bill.
+
+    Shared by get_total_amount and is_credit_invoice, so the size of the total
+    and whether it is a credit are read off the same figure.
     """
+    # Gemini's own answer first. It sees the layout, so it can tell the bill's
+    # total from a merchandise-only line, an opening balance or a payment due
+    # that adds earlier balances. Matching label words could not: "MERCHANDISE
+    # INVOICE TOTAL 20.00" contains "invoice total" and was taken for a $30.00
+    # invoice. The label rules below are the fallback for reads made before
+    # the model was asked, and for a total it could not give. Every flow still
+    # checks this figure against the GL lines or line items before posting.
+    decided = ocr.get("invoice_total")
+    if decided not in (None, "") and _parse_amount(decided):
+        return decided
+
     totals = ocr.get("totals") or []
 
-    def value_for(predicate) -> float | None:
+    def raw_for(predicate) -> Any:
         for entry in totals:
             label = (entry.get("label") or "").strip().lower()
             if not label or any(bad in label for bad in _NOT_A_GRAND_TOTAL):
                 continue
-            if predicate(label):
-                amount = _parse_amount(entry.get("value"))
-                if amount:
-                    return amount
+            if predicate(label) and _parse_amount(entry.get("value")):
+                return entry.get("value")
         return None
 
     # 1. An unambiguous grand-total label.
     for wanted in _GRAND_TOTAL_LABELS:
-        found = value_for(lambda label, w=wanted: w in label)
+        found = raw_for(lambda label, w=wanted: w in label)
         if found is not None:
             return found
 
     # 2. The word "total" on its own.
-    found = value_for(lambda label: label == "total")
+    found = raw_for(lambda label: label == "total")
     if found is not None:
         return found
 
-    # 3. Any surviving label containing "total" — subtotals and line totals
+    # 3. Any surviving label containing "total" -- subtotals and line totals
     #    were excluded above.
-    found = value_for(lambda label: "total" in label)
+    found = raw_for(lambda label: "total" in label)
     if found is not None:
         return found
+
+    # 4. No total line at all: add up what the invoice prints instead --
+    #    subtotal plus tax and freight -- before trusting a guess made
+    #    elsewhere. That guess (the _po_contract total) is built from the rows,
+    #    and on a parts invoice with a core return it took the core line.
+    rebuilt = _total_from_parts(totals)
+    if rebuilt is not None:
+        return rebuilt
 
     po_contract = ocr.get("_po_contract") or {}
     summary = ocr.get("summary") or {}
-    fallback = ocr.get("total") or po_contract.get("total") or summary.get("total") or 0
-    return abs(float(fallback))
+    return ocr.get("total") or po_contract.get("total") or summary.get("total") or 0
+
+
+def _total_from_parts(totals: list[dict[str, Any]]) -> float | None:
+    """Subtotal + tax + freight/shipping/handling, when a subtotal is printed.
+
+    Signed, so a subtotal printed "CR" gives a negative total and the invoice
+    still reads as a credit. None when there is no subtotal to start from.
+    """
+    def signed(value: Any) -> float:
+        amount = _parse_amount(value)
+        return -amount if _is_credit_value(value) else amount
+
+    subtotal = None
+    extras = 0.0
+    for entry in totals:
+        label = (entry.get("label") or "").strip().lower()
+        value = entry.get("value")
+        if not label or not re.search(r"\d", str(value or "")):
+            continue
+        if subtotal is None and ("subtotal" in label or "sub total" in label or "sub-total" in label):
+            subtotal = signed(value)
+        elif "tax" in label and "exempt" not in label:
+            extras += signed(value)
+        elif any(word in label for word in ("freight", "shipping", "handling", "delivery")):
+            extras += signed(value)
+    if subtotal is None:
+        return None
+    return round(subtotal + extras, 2)
+
+
+def get_total_amount(ocr: dict[str, Any]) -> float:
+    """The amount owed on the invoice, tax included, as a positive figure."""
+    return _parse_amount(_grand_total_raw(ocr))
+
+
+def has_printed_zero_total(ocr: dict[str, Any]) -> bool:
+    """Whether the invoice's total was READ, and reads zero.
+
+    get_total_amount returns 0.0 both for a total that says .00 and for one
+    that was never found, and the two need different answers: a Kia core
+    credit memo printed ".00CR" has nothing to post, while an unread total
+    needs a clearer scan. Only true when a total figure is actually present.
+    """
+    # _grand_total_raw skips zero values and falls back to a bare 0 when it
+    # finds nothing, so it cannot answer this: look for the total line itself.
+    if get_total_amount(ocr):
+        return False
+    for entry in ocr.get("totals") or []:
+        label = (entry.get("label") or "").strip().lower()
+        if "total" not in label or any(bad in label for bad in _NOT_A_GRAND_TOTAL):
+            continue
+        value = str(entry.get("value") or "").strip()
+        if re.search(r"\d", value) and _parse_amount(value) == 0.0:
+            return True
+    return False
+
+
+def is_credit_invoice(ocr: dict[str, Any]) -> bool:
+    """Whether the invoice is a CREDIT -- money owed to the dealership.
+
+    Honda prints a credit memo's totals as "422.27 CR"; OCR sometimes turns that
+    into "-422.27". Either way the whole entry runs the other direction: A/P is
+    debited, and the accounts the clerk writes are credited. Posting it as an
+    ordinary invoice balances perfectly and is completely backwards.
+    """
+    return _is_credit_value(_grand_total_raw(ocr))
 
 
 def to_flat_fields(ocr: dict[str, Any]) -> dict[str, Any]:
@@ -505,6 +686,22 @@ def get_raw_line_items(ocr: dict[str, Any]) -> list[dict[str, Any]]:
             qty = 1.0
         unit_price = _parse_amount(item.get("unit_price") or item.get("unitPrice"))
         total_price = _parse_amount(item.get("total_price") or item.get("totalPrice"))
+
+        # A row priced ONLY as an extended total.
+        #
+        # Plenty of invoices have one price column and no quantity at all -- a
+        # body shop billing "rear hatch scratches ... 85.00" is not selling 85
+        # of anything. OCR reports that as total_price with unit_price empty,
+        # and everything downstream values the row at qty x unitPrice, which is
+        # zero. On a G.A.R.I. sublet invoice that made all eight rows worth
+        # nothing, so they failed to reconcile against the 760.00 total and were
+        # thrown away -- taking the repair order numbers on them with it.
+        #
+        # Only fills a blank. A row that states its own unit price keeps it,
+        # even where the two disagree, because that disagreement is the
+        # invoice's and not ours to reconcile.
+        if not unit_price and total_price:
+            unit_price = round(total_price / qty, 2) if qty else total_price
         result.append(
             {
                 "description": item.get("description") or "",
@@ -512,6 +709,11 @@ def get_raw_line_items(ocr: dict[str, Any]) -> list[dict[str, Any]]:
                 "unitPrice": unit_price,
                 "totalPrice": total_price,
                 "glAccount": item.get("gl_account") or "",
+                # The repair order this row's work was done on. A sublet invoice
+                # that bills several vehicles names one per row; without it the
+                # flow has to guess the RO from the VIN, and a page listing eight
+                # cars has no single VIN to guess from.
+                "roNumber": _clean_ro_number(item.get("ro_number") or ""),
             }
         )
 
@@ -546,46 +748,170 @@ def get_raw_line_items(ocr: dict[str, Any]) -> list[dict[str, Any]]:
 # an annotation: "HTB 641.93" and "OBT 7992" both fail here, which is right --
 # the first is a memo of a figure and the second is a stock number.
 _NOTE_GL_LINE = re.compile(
-    r"^\s*(?:GL|G/?L|ACCT|ACCOUNT|A/C)?\s*#?\s*"
-    r"(\d{4,5}[A-Za-z]?)\s+"
-    r"(-\s*)?\$?\s*([\d,]+(?:\.\d{1,2})?)\s*\$?"
-    r"\s*(.*)$",
+    # A lead-in the clerk writes before the account: "* Credit GL# 2410".
+    # Without this the whole note failed to match, and the minus sign on it --
+    # the only place a credit is marked -- was never read.
+    r"^\s*(?:[*\-]+\s*)?(?P<word>CREDIT|DEBIT|CR|DR)?\s*"
+    r"(?:GL|G/?L|ACCT|ACCOUNT|A/C)?\s*#?\s*"
+    r"(?P<account>\d{4,5}[A-Za-z]?)\s+"
+    # The figure may start at the decimal point: clerks write small credits as
+    # "-$.25", with no leading zero. Requiring a digit first skipped that note
+    # entirely, its minus with it, and the 6777 discount on 80092491307A
+    # posted as +0.25 -- an entry $0.50 out of balance.
+    r"(?P<minus>-\s*)?\$?\s*(?P<figure>[\d,]+(?:\.\d{1,2})?|\.\d{1,2})"
+    # Cents written raised, which OCR reads as a separate group: "-$422 27".
+    r"(?:\s+(?P<cents>\d{2})(?!\d))?"
+    r"\s*\$?\s*(?P<label>.*)$",
     re.IGNORECASE,
 )
+
+
+def note_lines(raw: Any) -> list[str]:
+    """One handwritten note, split into the lines it was written on.
+
+    OCR does not transcribe a block of handwriting consistently. The same two
+    lines come back as two notes on one run and as ONE note joined by a newline
+    on the next -- "# 2410 $414 00\\n# 6777 - $82 80". Anything that reads a note
+    as a single annotation then sees the first account and swallows the second
+    into its label, which dropped 6777 and its minus and posted a journal entry
+    out of balance by exactly that figure.
+    """
+    return [line.strip() for line in str(raw or "").splitlines() if line.strip()]
+
+
+def _note_annotations(ocr: dict[str, Any]) -> list[str]:
+    """Every "account amount" annotation in the notes, one per entry.
+
+    Each line is read on its own. A line that is not an annotation by itself
+    is tried joined to the one before it, for the clerk who writes the account
+    and puts the figure underneath: "GL# 2410" then "$414.00".
+    """
+    annotations: list[str] = []
+    for raw in ocr.get("handwritten_notes") or []:
+        carry = ""
+        for line in note_lines(raw):
+            if _NOTE_GL_LINE.match(line):
+                annotations.append(line)
+                carry = ""
+            elif carry and _NOTE_GL_LINE.match(f"{carry} {line}"):
+                annotations.append(f"{carry} {line}")
+                carry = ""
+            else:
+                carry = line
+    return annotations
+
+
+# The dealership's own code for the vendor, written or stamped on the invoice
+# as dealer number, dash, vendor number: "1707-310" is vendor 1707_310 in
+# Tekion. A whole note and nothing else, so a GL line ("#3142 $72.69"), a date
+# or a phone number never reads as one.
+_VENDOR_CODE_RE = re.compile(
+    r"^\s*(?:vendor|vend|v)?\s*#?\s*(\d{4})\s*[-_\u2013\u2014]\s*(\d{1,6})\s*$",
+    re.IGNORECASE,
+)
+
+
+def get_vendor_codes(ocr: dict[str, Any]) -> list[str]:
+    """Dealer-vendor codes written on the invoice, as "1707-310", in order.
+
+    From `vendor.id`, where the vision prompt asks for it, and from the
+    handwritten notes, where it lands when the model does not file it there.
+    Which dealer a code belongs to is checked by the caller: only one naming
+    the dealership being posted to is used.
+    """
+    raw = [str((ocr.get("vendor") or {}).get("id") or "")]
+    raw += [str(n) for n in (ocr.get("handwritten_notes") or [])]
+    codes: list[str] = []
+    for text in raw:
+        m = _VENDOR_CODE_RE.match(text)
+        if m and f"{m[1]}-{m[2]}" not in codes:
+            codes.append(f"{m[1]}-{m[2]}")
+    return codes
 
 
 def gl_notes(ocr: dict[str, Any]) -> list[dict[str, Any]]:
     """Accounts and amounts read straight off the transcribed handwriting.
 
-    THE SIGN LIVES HERE AND NOWHERE ELSE. The vision prompt asks for a POSITIVE
-    figure in `gl_mappings` and leaves debit/credit to be decided downstream, so
-    a clerk who writes "GL# 6777 -$62.10" gets 62.10 back from the structured
-    output. The raw note is the only place that minus survives, and without it
-    a discount posts as a charge -- which is how a Honda parts invoice came out
-    $124.20 over, exactly twice the discount.
+    One of TWO places the sign is read. The vision prompt used to demand a
+    POSITIVE figure in `gl_mappings`, so a clerk who wrote "GL# 6777 -$62.10"
+    got 62.10 back from the structured output, and this note was the only place
+    the minus survived -- without it a discount posts as a charge, which is how
+    a Honda parts invoice came out $124.20 over, exactly twice the discount.
+    `gl_mappings` now carries the sign as written too; get_gl_amount_splits
+    takes a minus from either.
 
     Returns [{"account", "amount" (signed), "label", "signed"}] in the order the
     notes were read. `signed` records whether a minus was actually on the page,
     as opposed to the amount simply arriving positive.
     """
     found: list[dict[str, Any]] = []
-    for raw in ocr.get("handwritten_notes") or []:
-        match = _NOTE_GL_LINE.match(str(raw or ""))
+    for text in _note_annotations(ocr):
+        match = _NOTE_GL_LINE.match(text)
         if not match:
             continue
-        amount = _parse_amount(match.group(3))
+        figure = match.group("figure")
+        if match.group("cents") and "." not in figure:
+            figure = f"{figure}.{match.group('cents')}"
+        amount = _parse_amount(figure)
         if amount is None:
             continue
-        negative = bool(match.group(2))
+        # A minus, or the word the clerk wrote in front of it. "Credit GL# 2410
+        # $460" is a credit whether or not a minus made it through OCR.
+        negative = bool(match.group("minus")) or (
+            (match.group("word") or "").upper() in ("CREDIT", "CR")
+        )
         found.append(
             {
-                "account": match.group(1).upper(),
+                "account": match.group("account").upper(),
                 "amount": -abs(amount) if negative else abs(amount),
-                "label": match.group(4).strip(),
+                "label": (match.group("label") or "").strip(),
                 "signed": negative,
             }
         )
     return found
+
+
+# An account as Gemini gives it in posting_lines: digits with an optional
+# trailing letter ("2410V"), which _GL_PATTERN's word boundary would reject.
+_POSTING_ACCOUNT = re.compile(r"(?<![\dA-Za-z])(\d{4,5}[A-Za-z]?)(?![\dA-Za-z])")
+
+
+def has_posting_lines(ocr: dict[str, Any]) -> bool:
+    """Whether this read carries Gemini's own posting lines.
+
+    Reads made before `posting_lines` was asked for do not, and fall back to
+    the transcription rules in get_gl_amount_splits.
+    """
+    return isinstance(ocr.get("posting_lines"), list)
+
+
+def get_posting_lines(ocr: dict[str, Any]) -> list[dict[str, Any]]:
+    """The GL accounts written on the invoice and the signed amount each takes.
+
+    Decided by Gemini from the whole page (see `posting_lines` in the vision
+    prompt): negative is a credit, and the lines add up to the signed invoice
+    total. Used as given -- no hunting through notes, no sign rules. The
+    flows still check the lines against the invoice total and the chart of
+    accounts before anything is posted.
+    """
+    lines: list[dict[str, Any]] = []
+    for line in ocr.get("posting_lines") or []:
+        if not isinstance(line, dict):
+            continue
+        match = _POSTING_ACCOUNT.search(str(line.get("account") or ""))
+        account = match.group(1).upper() if match else ""
+        raw = str(line.get("amount") or "").replace("$", "").replace(",", "").strip()
+        amount = _parse_amount(raw)
+        if not account or not amount:
+            continue
+        if _is_credit_value(raw):
+            amount = -amount
+        lines.append({
+            "gl_account": account,
+            "amount": round(amount, 2),
+            "description": str(line.get("label") or "") or None,
+        })
+    return lines
 
 
 def get_gl_amount_splits(ocr: dict[str, Any]) -> list[dict[str, Any]]:
@@ -605,7 +931,16 @@ def get_gl_amount_splits(ocr: dict[str, Any]) -> list[dict[str, Any]]:
     Returns [] when the invoice carries no amounts against its accounts, which
     is the older style where a code sits beside a row and the split has to be
     worked out from the rows themselves.
+
+    A read that carries Gemini's own `posting_lines` uses those and nothing
+    else: everything below is the transcription-matching for older reads. On a
+    Honda credit memo the clerk's "Credit # 2410 $2,890.20" came back only as a
+    note, gl_mappings stayed empty, this returned [], and the account was
+    guessed from the parts as 2430.
     """
+    if has_posting_lines(ocr):
+        return get_posting_lines(ocr)
+
     notes = gl_notes(ocr)
     claimed: set[int] = set()
 
@@ -614,16 +949,23 @@ def get_gl_amount_splits(ocr: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(mapping, dict):
             continue
         account = _first_gl(mapping.get("gl_account"))
-        amount = _parse_amount(mapping.get("amount"))
+        raw = mapping.get("amount")
+        amount = _parse_amount(raw)
         # An account with no amount is the older style and belongs to the
         # per-line path; taking it here would post a zero split.
         if not account or not amount:
             continue
 
-        # The transcription of this same figure, for its sign. gl_mappings
-        # reports a positive amount whatever the page says -- see gl_notes --
-        # so a discount written "-$62.10" arrives here as a charge unless the
-        # note is consulted.
+        # The sign as Gemini reported it. The prompt used to demand a positive
+        # figure here, which threw away a minus the model had read correctly
+        # and left the note transcription as the only place it could survive --
+        # and that free text came back jumbled often enough ("-#271 19 #6777")
+        # to post a discount as a charge. It now asks for the sign as written.
+        mapped_credit = _is_credit_value(str(raw or "").replace("$", "").strip())
+
+        # The transcription of this same figure, also for its sign. Either one
+        # showing a minus makes it a credit: an unsigned reading in one place is
+        # not evidence against a minus read in the other.
         twin = next(
             (
                 i
@@ -634,14 +976,12 @@ def get_gl_amount_splits(ocr: dict[str, Any]) -> list[dict[str, Any]]:
             ),
             None,
         )
+        note_credit = False
         if twin is not None:
             claimed.add(twin)
-            amount = notes[twin]["amount"]
-        elif amount < 0:
-            # A minus that came through the structured output anyway means the
-            # model saw one; the prompt asking for positives does not make it
-            # noise.
-            pass
+            note_credit = notes[twin]["amount"] < 0
+        if mapped_credit or note_credit:
+            amount = -abs(amount)
 
         splits.append(
             {

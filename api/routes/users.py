@@ -13,14 +13,14 @@ from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlmodel import Session, select
+from sqlmodel import Session, func, select
 
 from api.config import settings
 from api.services import access, email_service
 from api.services.security import hash_password, verify_password
 from api.db import get_session
 from api.deps import CurrentUserDep
-from api.models.db import InviteCode, Notification, RefreshToken, User, as_utc
+from api.models.db import InviteCode, Notification, User, as_utc
 from api.models.schemas import (
     CurrentUserResponse,
     PendingInviteItem,
@@ -148,16 +148,12 @@ def delete_user(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Three tables point at users, and Postgres refuses the delete while any of
+    # Several tables point at users, and Postgres refuses the delete while any of
     # them still does. Each one gets a different answer rather than a blanket
     # cascade, because they do not all mean the same thing.
 
-    # Sessions die with the account -- a deleted user must not keep a working
-    # refresh token.
-    for token in session.exec(
-        select(RefreshToken).where(RefreshToken.user_id == user.id)
-    ).all():
-        session.delete(token)
+    # Sessions die with the account: get_current_user refuses a token whose
+    # user no longer exists, so there is nothing to revoke here.
 
     # Notifications were addressed to this person and mean nothing without them.
     for note in session.exec(
@@ -436,7 +432,7 @@ def create_invite(
 
     email = req.email.strip().lower()
 
-    existing = session.exec(select(User).where(User.email == email)).first()
+    existing = session.exec(select(User).where(func.lower(User.email) == email)).first()
     if existing is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

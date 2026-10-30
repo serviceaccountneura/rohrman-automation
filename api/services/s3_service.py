@@ -51,7 +51,25 @@ def _content_type_for(key: str) -> str:
     return _CONTENT_TYPES.get(ext) or mimetypes.guess_type(key)[0] or "application/octet-stream"
 
 
-def _get_s3_client():
+def _get_presign_client():
+    """A client used ONLY to sign URLs someone else will fetch.
+
+    Signing is local arithmetic -- botocore builds the signature and returns,
+    it never calls the endpoint -- so this client may point at an address this
+    process cannot reach. That is the whole point: with MinIO beside us, the
+    api talks to http://minio:9000 while the browser needs a public address,
+    and a SigV4 signature covers the host, so the URL has to be signed for the
+    host that will actually be requested.
+
+    Falls back to the normal client when no separate public address is set,
+    which is every deployment on real S3.
+    """
+    if not settings.s3_public_endpoint_url:
+        return _get_s3_client()
+    return _get_s3_client(endpoint_override=settings.s3_public_endpoint_url)
+
+
+def _get_s3_client(endpoint_override: str | None = None):
     """An S3 client, however this environment supplies credentials.
 
     Explicit keys win when set, which keeps local development working from a
@@ -62,11 +80,25 @@ def _get_s3_client():
     The arguments are built rather than always passed: handing botocore an
     explicit None is not the same as omitting the key, and suppresses the
     fallback chain entirely.
+
+    `s3_endpoint_url` points the client at an S3-compatible server instead of
+    AWS -- MinIO, on staging. It is empty in production, so nothing below
+    changes there.
     """
+    endpoint = endpoint_override or settings.s3_endpoint_url
+
+    boto_config: dict = {"signature_version": "s3v4"}
+    if endpoint or settings.s3_force_path_style:
+        # bucket.host virtual-hosting resolves only for AWS; anything else has
+        # to be addressed as host/bucket.
+        boto_config["s3"] = {"addressing_style": "path"}
+
     kwargs: dict = {
         "region_name": settings.aws_region,
-        "config": BotoConfig(signature_version="s3v4"),
+        "config": BotoConfig(**boto_config),
     }
+    if endpoint:
+        kwargs["endpoint_url"] = endpoint
     if settings.aws_access_key_id and settings.aws_secret_access_key:
         kwargs["aws_access_key_id"] = settings.aws_access_key_id
         kwargs["aws_secret_access_key"] = settings.aws_secret_access_key
@@ -96,7 +128,9 @@ def generate_upload_url(
     unique_id = uuid.uuid4().hex[:12]
     s3_key = f"invoices/{folder}/{date_str}/{unique_id}{ext}"
 
-    client = _get_s3_client()
+    # Signed for the address the BROWSER will PUT to, which is not necessarily
+    # the one this process talks to -- see _get_presign_client.
+    client = _get_presign_client()
     upload_url = client.generate_presigned_url(
         "put_object",
         Params={
@@ -155,6 +189,41 @@ def upload_file(local_path: str | Path, s3_key: str) -> None:
     )
 
 
+def upright_key(s3_key: str) -> str:
+    """Where the upright copy of a scan is kept: beside the original, ".upright" before the extension.
+
+    The original is never replaced -- it is the record of what was received.
+    """
+    path = Path(s3_key)
+    return str(path.with_name(f"{path.stem}.upright{path.suffix}"))
+
+
+def exists(s3_key: str) -> bool:
+    """Whether an object is stored under this key. False on any error."""
+    if not s3_key or not is_configured():
+        return False
+    try:
+        _get_s3_client().head_object(Bucket=settings.s3_bucket, Key=s3_key)
+        return True
+    except Exception:  # noqa: BLE001 - absent, forbidden or unreachable: not usable
+        return False
+
+
+def enhanced_key(s3_key: str, multi_page: bool) -> str:
+    """Where the cleaned-up copy Gemini read is kept: ".enhanced.png" for one page, ".pdf" for several."""
+    path = Path(s3_key)
+    return str(path.with_name(f"{path.stem}.enhanced.{'pdf' if multi_page else 'png'}"))
+
+
+def viewable_key(s3_key: str) -> str:
+    """The key to show someone, best first: the cleaned-up copy Gemini read,
+    then the upright copy, then the original as uploaded."""
+    for candidate in (enhanced_key(s3_key, False), enhanced_key(s3_key, True), upright_key(s3_key)):
+        if exists(candidate):
+            return candidate
+    return s3_key
+
+
 def download_file(s3_key: str, local_path: str | Path) -> None:
     """Fetch an archived file back to disk.
 
@@ -171,7 +240,9 @@ def generate_download_url(s3_key: str) -> str:
     for objects that were stored as octet-stream, so the detail-page viewer
     renders the invoice instead of the browser saving it.
     """
-    client = _get_s3_client()
+    # Signed for the address the BROWSER will fetch from -- see
+    # _get_presign_client.
+    client = _get_presign_client()
     return client.generate_presigned_url(
         "get_object",
         Params={

@@ -28,17 +28,28 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 FROM python:3.13-slim AS runtime
 
 # libgl / libglib are what PyMuPDF and Pillow link against for raster work.
+# tesseract-ocr is only used for its orientation check (it brings the osd
+# data with it): a page scanned sideways is turned upright before Gemini
+# reads it -- see api/services/page_orientation.py.
 # Without them the image builds fine and then fails at the first PDF render,
 # which is a long way from the mistake.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgl1 \
         libglib2.0-0 \
         curl \
+        tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 # Runs unprivileged. Nothing here needs root, and the container reaches Tekion
 # and Vertex with real credentials.
 RUN useradd --create-home --uid 10001 app
+
+# The uploads volume mounts here. Create it owned by `app` in the image: Docker
+# seeds a fresh named volume from the image's directory, so the volume comes up
+# writable instead of root-owned. Without this the app cannot create its OCR
+# cache under it -- "Permission denied: /tmp/rohrman/ocr" -- and every re-run
+# pays for a second Gemini pass over a document it had already read.
+RUN mkdir -p /tmp/rohrman && chown -R app:app /tmp/rohrman
 
 WORKDIR /app
 

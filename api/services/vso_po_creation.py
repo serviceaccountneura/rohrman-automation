@@ -167,6 +167,16 @@ class VsoPreInvoiceService:
         if isinstance(po_total, (int, float)):
             if abs(float(po_total) - net) > expected.amount_tolerance:
                 problems.append(Discrepancy("amount", net, float(po_total)))
+
+        # GL lines written on the invoice become the pre-invoice's distribution,
+        # so they must add up to it: the whole invoice, or its net of tax when
+        # tax is posted on its own. Checked here, before anything is written.
+        splits = [sp for sp in (expected.gl_splits or []) if sp.get("amount") is not None]
+        if splits:
+            split_total = round(sum(float(sp["amount"]) for sp in splits), 2)
+            targets = (net, round(expected.invoice_amount, 2))
+            if all(round(abs(split_total - t), 2) > 0.01 for t in targets):
+                problems.append(Discrepancy("gl_lines", net, split_total))
         return net, problems
 
     # ── Step 4: post it ──────────────────────────────────────────────────────
@@ -341,11 +351,20 @@ def pre_invoice_stock_order(
     result.discrepancies.extend(problems)
 
     if problems:
-        result.notes.append(
-            f"The invoice is ${net:.2f} net of tax but PO {result.po_number} is "
-            f"${result.po_total}. Tekion will not attach an invoice to a PO worth "
-            "a different amount — check the invoice against the order."
-        )
+        for problem in problems:
+            if problem.field_name == "gl_lines":
+                result.notes.append(
+                    f"The GL lines on this invoice add up to ${problem.found:,.2f}, but "
+                    f"the invoice is ${expected.invoice_amount:,.2f} (${net:,.2f} net of "
+                    "tax). Nothing was sent to Tekion — check the GL lines, correct "
+                    "them, and run it again."
+                )
+            else:
+                result.notes.append(
+                    f"The invoice is ${net:.2f} net of tax but PO {result.po_number} is "
+                    f"${result.po_total}. Tekion will not attach an invoice to a PO worth "
+                    "a different amount — check the invoice against the order."
+                )
         return result
 
     result.matched = True

@@ -10,7 +10,7 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlmodel import Session, select
 
 from api.db import get_session
-from api.models.db import User
+from api.models.db import User, as_utc
 from api.services.security import decode_token
 
 # tokenUrl points at the login endpoint for OpenAPI's "Authorize" button.
@@ -47,6 +47,12 @@ def get_current_user(
     user = session.exec(select(User).where(User.id == user_id)).first()
     if user is None:
         raise credentials_exc
+    # Issued before the password was last reset: that session was ended.
+    if user.tokens_valid_after is not None:
+        issued = payload.get("iat")
+        cutoff = int(as_utc(user.tokens_valid_after).timestamp())
+        if not isinstance(issued, int) or issued < cutoff:
+            raise credentials_exc
     if not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

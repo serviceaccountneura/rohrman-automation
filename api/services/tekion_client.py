@@ -65,6 +65,29 @@ def _as_pdf(file_path: str, file_name: str) -> tuple[str, str, Any]:
         print(f"[API] could not convert {file_name} to PDF ({e}); uploading as-is")
         return file_path, file_name, None
 
+def _with_tax_line(
+    items: list[dict[str, Any]], sales_tax: float
+) -> list[dict[str, Any]]:
+    """Append a sales-tax line to a purchase order's items.
+
+    Tekion totals a misc or sublet order from its lines, and the tax was never
+    one of them -- so the order was worth the goods while the invoice posted
+    against it was worth the goods plus tax, and the two figures on screen never
+    agreed. Whoever checked the PO against the paperwork had to do the addition
+    themselves every time.
+
+    A line, not the tax configuration on the order. Nothing at Rohrman uses that
+    configuration -- 1,200 purchase orders across the four stores and not one
+    carries a tax amount on it -- so a line is what matches how these orders are
+    actually kept, and it needs no per-store tax setup to be right.
+    """
+    if not sales_tax or round(sales_tax, 2) <= 0:
+        return items
+    return list(items) + [
+        {"description": "SALES TAX", "qty": 1, "price": round(sales_tax, 2)}
+    ]
+
+
 class TekionApiClient:
     def __init__(self, db_session: Session | None = None) -> None:
         self.session = requests.Session()
@@ -766,16 +789,37 @@ class TekionApiClient:
         # The search is fuzzy; only an exact number is safe to act on.
         return None
 
-    def search_ro(self, ro_number: str) -> list[dict[str, str]]:
+    def search_ro(self, ro_number: str, include_closed: bool = False) -> list[dict[str, str]]:
+        """Find a repair order by its number.
+
+        Open orders only by default, which is right when the RO is being
+        DISCOVERED -- work still in progress is what a sublet invoice normally
+        refers to.
+
+        `include_closed` is for the case where the invoice NAMES the order. A
+        vendor who bills weeks later is writing down an order that has long
+        since closed, and refusing to look at it turns a known number into "no
+        such RO". What to do with a closed one is the caller's decision; this
+        only stops hiding it.
+        """
+        filters: list[dict[str, Any]] = [
+            {"field": "siteId", "operator": "IN", "values": [self.site_id]},
+        ]
+        if not include_closed:
+            filters.insert(
+                0,
+                {
+                    "field": "status",
+                    "operator": "NIN",
+                    "values": ["INVOICED", "CLOSED", "VOIDED"],
+                },
+            )
         res = self._req_json(
             "/api/lookup/search",
             method="POST",
             body={
                 "REPAIR_ORDER_ASSET": {
-                    "filters": [
-                        {"field": "status", "operator": "NIN", "values": ["INVOICED", "CLOSED", "VOIDED"]},
-                        {"field": "siteId", "operator": "IN", "values": [self.site_id]},
-                    ],
+                    "filters": filters,
                     "searchText": ro_number,
                     "pageInfo": {"start": 0, "rows": 20},
                     "sort": [],
@@ -992,7 +1036,16 @@ class TekionApiClient:
         items: list[dict[str, Any]],
         vendor_phone: str = "",
         vendor_email: str = "",
+        sales_tax: float = 0.0,
     ) -> dict[str, Any]:
+        """Raise a miscellaneous purchase order.
+
+        `sales_tax` is added as a final line rather than left off. The PO used
+        to total the goods alone, so its front page said 2,378.11 where the
+        invoice attached to it said 2,580.23, and the two never reconciled on
+        screen. A line makes the order worth what the invoice is worth.
+        """
+        items = _with_tax_line(items, sales_tax)
         formatted_items = []
         for item in items:
             gross_total = round(item["qty"] * item["price"], 2)
@@ -1086,10 +1139,19 @@ class TekionApiClient:
         attachment_media_ids: list[str] | None = None,
         gl_splits: list[dict[str, Any]] | None = None,
         use_returned_postings: bool = False,
+        po_covers_tax: bool = False,
     ) -> dict[str, str]:
         amount_cents = round(invoice_amount * 100)
         tax_cents = round(sales_tax * 100)
-        subtotal_cents = amount_cents - tax_cents
+
+        # How much of the purchase order this invoice uses up.
+        #
+        # Historically the goods only, because the PO was raised for the goods
+        # only. An order that now carries a SALES TAX line is worth the whole
+        # invoice, and consuming the net would leave the tax outstanding on it
+        # for ever -- a PO that can never be closed.
+        po_consumed_cents = amount_cents if po_covers_tax else amount_cents - tax_cents
+        subtotal_cents = po_consumed_cents
 
         # Step 1: Get invoice date
         print("[API] Pre-invoice: getInvoiceDate...")
@@ -1247,7 +1309,9 @@ class TekionApiClient:
                             "glAccountId": s["gl_account_id"],
                             "postingAmount": {"amount": round(s["amount"] * 100), "currency": "USD"},
                             "controlNumberList": None,
-                            "refText": ref_text,
+                            # A line's own control when it has one, else the
+                            # document's -- which is what every line used to get.
+                            "refText": s.get("ref_text") or ref_text,
                         }
                         for s in gl_splits
                     ]

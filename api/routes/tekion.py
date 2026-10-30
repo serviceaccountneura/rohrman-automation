@@ -14,6 +14,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 
+from api.config import settings
 from api.db import get_session
 from api.deps import CurrentUserDep
 from api.models.db import Document, VendorMapping
@@ -22,6 +23,7 @@ from api.models.schemas import (
     CreateMiscPoRequest,
     CreatePoRequest,
     CreatePoResponse,
+    GlLine,
     CreateStockPoRequest,
     CreateSubletPoRequest,
     VendorCandidate,
@@ -84,8 +86,9 @@ def _resolve_vendor(
     dealer_id: str,
     vendor_name: str,
     session: Session,
+    vendor_codes: list[str] | None = None,
 ) -> dict:
-    result = resolve_vendor(dealer_id, vendor_name, session, client)
+    result = resolve_vendor(dealer_id, vendor_name, session, client, vendor_codes)
     if result["resolved"]:
         return result["vendor"]
 
@@ -183,6 +186,62 @@ def create_po(
     return response
 
 
+def _gl_lines_posted(
+    *,
+    dealer_id: str,
+    ap_gl_account_id: str,
+    invoice_amount: float,
+    gl_splits: list[dict] | None,
+    gl_account_id: str,
+    net_amount: float,
+    source: str,
+) -> list[GlLine]:
+    """The accounting lines a pre-invoice carried, as Tekion shows them.
+
+    Debits first, then the A/P credit -- the order and the signs of the
+    "Accounting Details" panel in Tekion, so what the document records and what
+    a clerk sees on screen are the same thing read twice.
+
+    Nothing is recomputed here. These are the figures that were sent; if they
+    are wrong they are wrong in Tekion too, which is the point of recording
+    them.
+    """
+    lines: list[GlLine] = []
+    if gl_splits:
+        for split in gl_splits:
+            lines.append(
+                GlLine(
+                    gl_account=str(split.get("gl_account_id") or "").split("_")[-1],
+                    gl_name=str((split.get("resolved") or {}).get("account_name") or ""),
+                    amount=round(float(split.get("amount") or 0), 2),
+                    source=source,
+                )
+            )
+    elif gl_account_id:
+        lines.append(
+            GlLine(
+                gl_account=gl_account_id.split("_")[-1],
+                amount=round(net_amount, 2),
+                source=source,
+            )
+        )
+
+    lines.append(
+        GlLine(
+            gl_account=ap_gl_account_id.split("_")[-1],
+            gl_name="A/P",
+            amount=-round(invoice_amount, 2),
+            source="accounts payable",
+        )
+    )
+    return lines
+
+
+# What a purchase order looks like to the rest of the flow when nothing was
+# created in Tekion (TEKION_PO_WRITES off): no number, no id.
+_PO_NOT_CREATED = {"poNumber": "", "poId": None, "status": "NOT_CREATED", "universalId": ""}
+
+
 def _create_sublet_po(
     req: CreateSubletPoRequest,
     session: Session,
@@ -198,7 +257,9 @@ def _create_sublet_po(
     try:
         client = get_client(session)
         dealer_id = _resolve_dealer(client, req.dealership_name)
-        vendor = _resolve_vendor(client, dealer_id, req.vendor_name, session)
+        vendor = _resolve_vendor(
+            client, dealer_id, req.vendor_name, session, req.vendor_codes
+        )
 
         # Build sublet items — each line item has its own RO + job.
         #
@@ -208,13 +269,21 @@ def _create_sublet_po(
         # flow and has nothing to say about a PO somebody else raised.
         items: list[dict] = []
         for li in req.line_items if not existing_po else []:
-            ros = client.search_ro(li.ro_number)
+            # The same two-step as the pipeline: an open order if there is
+            # one, otherwise whatever the number names. The VIN path always
+            # finds an open order first, so its behaviour does not change.
+            ros = client.search_ro(li.ro_number) or client.search_ro(
+                li.ro_number, include_closed=True
+            )
             if not ros:
                 raise HTTPException(
                     status_code=404,
                     detail=f"No RO found for '{li.ro_number}'",
                 )
-            ro = ros[0]
+            ro = next(
+                (r for r in ros if str(r.get("roNumber")) == str(li.ro_number)),
+                ros[0],
+            )
 
             jobs = client.get_ro_jobs(ro["id"])
             if not jobs:
@@ -256,7 +325,21 @@ def _create_sublet_po(
                     detail="Sublet PO requires at least one line item with an RO number",
                 )
 
-            po = client.create_sublet_po(
+            # The tax belongs on the order too, or the PO is worth the work
+            # while the invoice against it is worth the work plus tax. It hangs
+            # off the same RO job as the first line -- a sublet line must name a
+            # job, and the tax is for that job's work.
+            if req.sales_tax and round(req.sales_tax, 2) > 0 and items:
+                items.append(
+                    {
+                        **items[0],
+                        "description": "SALES TAX",
+                        "laborAmount": 0.0,
+                        "partsAmount": round(req.sales_tax, 2),
+                    }
+                )
+
+            po = _PO_NOT_CREATED if not settings.tekion_po_writes else client.create_sublet_po(  # TEKION_PO_WRITES
                 vendor_id=int(vendor["id"]),
                 vendor_name=vendor["name"],
                 vendor_display_id=vendor["displayId"],
@@ -279,11 +362,11 @@ def _create_sublet_po(
 
         # Upload invoice document if provided.
         attachment_media_ids: list[str] = []
-        if req.invoice_file_path:
+        if req.invoice_file_path and settings.tekion_po_writes:  # TEKION_PO_WRITES
             media_id = client.upload_document(req.invoice_file_path)
             attachment_media_ids.append(media_id)
 
-        result = client.pre_invoice(
+        result = {"invoiceId": None} if not settings.tekion_po_writes else client.pre_invoice(  # TEKION_PO_WRITES
             vendor_id=vendor["id"],
             vendor_site_id=vendor["siteId"],
             vendor_name=vendor["name"],
@@ -299,6 +382,14 @@ def _create_sublet_po(
             ref_text=ref_text,
             po_type="SUBLET",
             sales_tax=req.sales_tax,
+            # An order WE raised carries a SALES TAX line, so this invoice
+            # uses all of it -- consuming the net would leave the tax
+            # outstanding on a PO that could then never be closed.
+            #
+            # A REUSED order has no such line: somebody else raised it, for
+            # whatever it is worth, and claiming the tax from it as well would
+            # consume more of their PO than this invoice is entitled to.
+            po_covers_tax=existing_po is None,
             attachment_media_ids=attachment_media_ids or None,
         )
 
@@ -309,6 +400,15 @@ def _create_sublet_po(
             po_status=po["status"],
             invoice_id=result["invoiceId"],
             vendor_name=vendor["name"],
+            gl_lines=_gl_lines_posted(
+                dealer_id=dealer_id,
+                ap_gl_account_id=ap_gl_account_id,
+                invoice_amount=req.invoice_amount,
+                gl_splits=None,
+                gl_account_id=gl_account_id,
+                net_amount=req.invoice_amount - req.sales_tax,
+                source="sublet repairs payable",
+            ),
         )
 
     except HTTPException:
@@ -333,7 +433,9 @@ def _create_misc_po(
     try:
         client = get_client(session)
         dealer_id = _resolve_dealer(client, req.dealership_name)
-        vendor = _resolve_vendor(client, dealer_id, req.vendor_name, session)
+        vendor = _resolve_vendor(
+            client, dealer_id, req.vendor_name, session, req.vendor_codes
+        )
 
         # Build misc items — each line item has its own GL account.
         if req.line_items:
@@ -351,7 +453,7 @@ def _create_misc_po(
         if existing_po:
             po = existing_po
         else:
-            po = client.create_misc_po(
+            po = _PO_NOT_CREATED if not settings.tekion_po_writes else client.create_misc_po(  # TEKION_PO_WRITES
                 vendor_id=vendor["id"],
                 vendor_name=vendor["name"],
                 vendor_display_id=vendor["displayId"],
@@ -359,6 +461,7 @@ def _create_misc_po(
                 vendor_phone=vendor["phone"],
                 vendor_email=vendor["email"],
                 items=items,
+                sales_tax=req.sales_tax,
             )
 
         # Pre-invoice — use OCR-extracted GL accounts if present, else LLM fallback.
@@ -377,9 +480,10 @@ def _create_misc_po(
             # table contains nothing that would reproduce it.
             gl_splits = [
                 {
-                    "gl_account_id": f"{dealer_id}_{sp.gl_account}",
+                    "gl_account_id": sp.account_id or f"{dealer_id}_{sp.gl_account}",
                     "amount": sp.amount,
                     "description": sp.description,
+                    "ref_text": sp.control or "",
                 }
                 for sp in req.gl_splits
             ]
@@ -428,11 +532,11 @@ def _create_misc_po(
 
         # Upload invoice document if provided.
         attachment_media_ids: list[str] = []
-        if req.invoice_file_path:
+        if req.invoice_file_path and settings.tekion_po_writes:  # TEKION_PO_WRITES
             media_id = client.upload_document(req.invoice_file_path)
             attachment_media_ids.append(media_id)
 
-        result = client.pre_invoice(
+        result = {"invoiceId": None} if not settings.tekion_po_writes else client.pre_invoice(  # TEKION_PO_WRITES
             vendor_id=vendor["id"],
             vendor_site_id=vendor["siteId"],
             vendor_name=vendor["name"],
@@ -448,6 +552,14 @@ def _create_misc_po(
             ref_text="",
             po_type="MISCELLANEOUS",
             sales_tax=req.sales_tax,
+            # An order WE raised carries a SALES TAX line, so this invoice
+            # uses all of it -- consuming the net would leave the tax
+            # outstanding on a PO that could then never be closed.
+            #
+            # A REUSED order has no such line: somebody else raised it, for
+            # whatever it is worth, and claiming the tax from it as well would
+            # consume more of their PO than this invoice is entitled to.
+            po_covers_tax=existing_po is None,
             attachment_media_ids=attachment_media_ids or None,
             gl_splits=gl_splits,
         )
@@ -459,6 +571,21 @@ def _create_misc_po(
             po_status=po["status"],
             invoice_id=result["invoiceId"],
             vendor_name=vendor["name"],
+            gl_lines=_gl_lines_posted(
+                dealer_id=dealer_id,
+                ap_gl_account_id=ap_gl_account_id,
+                invoice_amount=req.invoice_amount,
+                gl_splits=gl_splits,
+                gl_account_id=gl_account_id or "",
+                net_amount=req.invoice_amount - req.sales_tax,
+                source=(
+                    "written on the invoice"
+                    if req.gl_splits
+                    else "read from the line items"
+                    if gl_splits
+                    else "resolved from the descriptions"
+                ),
+            ),
         )
 
     except HTTPException:
@@ -475,7 +602,9 @@ def _create_stock_po(
     try:
         client = get_client(session)
         dealer_id = _resolve_dealer(client, req.dealership_name)
-        vendor = _resolve_vendor(client, dealer_id, req.vendor_name, session)
+        vendor = _resolve_vendor(
+            client, dealer_id, req.vendor_name, session, req.vendor_codes
+        )
 
         if not req.parts:
             raise HTTPException(
