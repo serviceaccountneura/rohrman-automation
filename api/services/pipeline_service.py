@@ -52,6 +52,7 @@ from api.services import (
     ocr_helpers,
     page_orientation,
     po_reuse,
+    runtime_flags,
     s3_service,
 )
 from api.services.ocr_service import extract_document
@@ -906,7 +907,7 @@ def _record_postings(
 def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> None:
     """Parts Manufacture Ticket -> journal entry, posted or left as a draft.
 
-    OEM_POST decides (settings.oem_post): production posts, staging saves a
+    OEM_POST (runtime flag) decides: production posts, staging saves a
     draft. Posting saves the clerk opening every draft and pressing Submit, the
     one step of the SOP the automation otherwise leaves to them. A posted entry
     cannot be undone in the UI, so everything that could refuse it -- the parts
@@ -1044,7 +1045,7 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
                 client,
                 expected=expected,
                 dry_run=False,
-                post=settings.oem_post,
+                post=runtime_flags.oem_post(session),
                 attachment_file_path=source_path,
                 attachment_file_name=doc.file_name or None,
             )
@@ -1103,7 +1104,11 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
             session,
             doc,
             EX_TEKION_ERROR,
-            error="the entry was not posted" if settings.oem_post else "draft was not saved",
+            error=(
+                "the entry was not posted"
+                if runtime_flags.oem_post(session)
+                else "draft was not saved"
+            ),
         )
         return
 
@@ -1373,12 +1378,13 @@ def _run_vi_verify(
         skip_near_duplicate_check=skip_near_duplicate_check,
     )
 
+    po_writes = runtime_flags.tekion_po_writes(session)
     try:
         with tekion_scope():
             client = get_client(session)
             # TEKION_PO_WRITES off: verify only — no attach / VI complete.
             result = verify_vendor_invoice(
-                client, expected, dry_run=not settings.tekion_po_writes
+                client, expected, dry_run=not po_writes
             )
     except Exception as e:  # noqa: BLE001
         print(f"[PIPE] {doc.id} VI verify failed: {e}")
@@ -1399,7 +1405,7 @@ def _run_vi_verify(
             invoice_date=result.invoice_date or expected.invoice_date,
             tekion_invoice_date=result.tekion_invoice_date,
             vi_post={
-                "writes": settings.tekion_po_writes,
+                "writes": po_writes,
                 "attached": result.attached,
                 "posted": result.completed,
             },
@@ -1422,7 +1428,7 @@ def _run_vi_verify(
     doc.vendor_name = result.vendor_name or doc.vendor_name
 
     job_queue.complete(session, doc)
-    if not settings.tekion_po_writes:
+    if not po_writes:
         print(
             f"[PIPE] {doc.id} -> PROCESSED (TEKION_PO_WRITES off: VI verified for "
             f"PO {doc.po_number}, nothing posted)"

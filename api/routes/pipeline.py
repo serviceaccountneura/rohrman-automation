@@ -27,7 +27,6 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlmodel import Session, select
 
-from api.config import settings
 from api.db import get_session
 from api.deps import CurrentUserDep
 from api.models.db import Document, User
@@ -61,12 +60,18 @@ def tekion_writes() -> dict[str, object]:
     is off. `postFolders` post their journal entry -- OEM when OEM_POST is on.
     `draftFolders` save theirs as a draft: Vehicle always, OEM when OEM_POST is
     off.
+
+    Values come from persisted runtime flags (Settings toggles), not a restart.
     """
+    from api.services import runtime_flags
+
+    po_writes = runtime_flags.tekion_po_writes()
+    oem_post = runtime_flags.oem_post()
     return {
-        "poWrites": settings.tekion_po_writes,
+        "poWrites": po_writes,
         "folders": ["PO_INVOICE", "SUBLET", "MISCELLANEOUS", "STOCK"],
-        "postFolders": ["OEM"] if settings.oem_post else [],
-        "draftFolders": ["VEHICLE_MANUFACTURING"] + ([] if settings.oem_post else ["OEM"]),
+        "postFolders": ["OEM"] if oem_post else [],
+        "draftFolders": ["VEHICLE_MANUFACTURING"] + ([] if oem_post else ["OEM"]),
     }
 
 
