@@ -16,7 +16,10 @@ the web app does when a clerk approves a pre-invoiced PO:
     4. Enter invoice information on the postings:
          Description       -> posting.description  = reference number
          next to GL Account-> posting.refText      = RO number (SUBLET only)
-    5. Post Transaction  -- DELIBERATELY NOT IMPLEMENTED. See post_transaction().
+    5. Attach the invoice PDF (while still PRE_INVOICED)
+       -> POST /api/accounting/u/poInvoice/preInvoice/post   (invoiceId set)
+    6. Post Transaction
+       -> POST /api/accounting/u/poInvoice/receivedTransaction/{invoiceId}
 
 Endpoints were captured from a live session with `npm run pw:capture:ap` and
 analysed with `npm run pw:analyze:ap` (captured/ap-endpoints.json).
@@ -29,9 +32,8 @@ INTEGRATION NOTE
     pass it to `approve_invoice()` -- no other change is required.
 
 SAFETY
-    `approve_invoice()` runs read-only by default. Every mutating step is gated
-    behind dry_run=False, and the final Post Transaction always raises, because
-    its endpoint was intentionally never captured.
+    `approve_invoice()` runs read-only by default and never posts. The pipeline
+    posts through `vi_verify._complete_vendor_invoice`, behind TEKION_PO_WRITES.
 """
 from __future__ import annotations
 
@@ -40,6 +42,37 @@ from datetime import datetime, timezone
 from typing import Any
 
 from api.services.tekion_client import TekionApiClient
+
+# ── Post Transaction (captured 29 Oct, pw:capture:ap at dealer 1707) ─────────
+#
+# The body is a journal entry on the AP journal, linked back to the invoice.
+# The posting lines are the ones invoicePostings returns, in postingOrder, with
+# only the keys below -- the GET adds lineIdentifier, tags, medias, ... which
+# the UI does not send back.
+_RECEIVED_TRANSACTION_PATH = "/api/accounting/u/poInvoice/receivedTransaction/{invoice_id}"
+# Attaching a file to an existing Vendor Invoice re-posts the whole pre-invoice
+# with its invoiceId and the media in `attachments` (captured 30 Oct). The post
+# ignores assetAttachmentDto, so a file sent there never shows on the invoice.
+_PRE_INVOICE_POST_PATH = "/api/accounting/u/poInvoice/preInvoice/post"
+_AP_JOURNAL_NUMBER = "75"
+_DOCUMENT_TYPE_SUFFIX = "document_type_5"
+_WIRE_POSTING_KEYS = (
+    "dealerId", "glAccountId", "amount", "refId", "refText", "refType",
+    "description", "countAdjusted", "count", "postingOrder", "metaData",
+    "amountCredited",
+)
+
+
+def set_control(line: dict[str, Any], text: str) -> None:
+    """Fill a posting's Control column with free text.
+
+    What a clerk types into Control goes out as BOTH refId and refText on a
+    CUSTOM line. refText alone, with no refId, is refused at post time with
+    A217 "Mandatory fields are not filled as per COA".
+    """
+    line["refType"] = "CUSTOM"
+    line["refId"] = text
+    line["refText"] = text
 
 # ── The record we expect to find in Tekion ────────────────────────────────────
 
@@ -98,7 +131,7 @@ class Discrepancy:
 @dataclass
 class ApprovalResult:
     matched: bool = False
-    posted: bool = False  # always False until Post Transaction is implemented
+    posted: bool = False  # approve_invoice never posts; see vi_verify
     invoice_id: str | None = None
     invoice_number: str | None = None
     po_number: str | None = None
@@ -303,30 +336,168 @@ class ApApprovalService:
             is_ap_line = bool((p.get("metaData") or {}).get("apPostingLine"))
             if not is_ap_line:
                 line["description"] = expected.reference_number
-                if expected.po_type == "SUBLET" and expected.ro_number:
-                    line["refText"] = expected.ro_number
+                gid = str(p.get("glAccountId") or "")
+                acct = gid.split("_")[-1] if gid else ""
+                # Sublet GL 2460 → Control = RO #. All other expense GLs →
+                # Control stays as clerk set (verify enforces vendor name).
+                if acct == "2460" and expected.ro_number:
+                    set_control(line, expected.ro_number)
+                elif expected.po_type == "SUBLET" and expected.ro_number:
+                    set_control(line, expected.ro_number)
             prepared.append(line)
         return prepared
 
-    # ── Step 5: Post Transaction — intentionally not implemented ─────────────
+    # ── Step 5: attach the invoice PDF ───────────────────────────────────────
 
-    def post_transaction(self, *_args: Any, **_kwargs: Any) -> None:
-        """The final commit. NOT IMPLEMENTED ON PURPOSE.
+    @staticmethod
+    def build_attach_payload(invoice: dict[str, Any], media_ids: list[str]) -> dict[str, Any]:
+        """Re-post body for an existing pre-invoice, as the UI sends it.
 
-        The dry-run capture deliberately stopped before "Post Transaction", so
-        the request payload for it was never recorded. Implementing it from
-        guesswork would risk posting a wrong journal entry to the GL.
-
-        To enable it: re-run `npm run pw:capture:ap`, click through to the same
-        screen, click Post Transaction once on a disposable invoice, then read
-        the final write call out of captured/ap-endpoints.json and implement it
-        here.
+        `invoice` is the Vendor Invoice as poInvoice/search returns it. Every
+        field goes back as Tekion holds it -- amounts, dates, GL lines -- so the
+        only change is the attachment. A field rebuilt from anywhere else would
+        overwrite the invoice.
         """
-        raise NotImplementedError(
-            "Post Transaction was never captured (dry run stopped before it). "
-            "Re-capture with npm run pw:capture:ap and click Post Transaction once "
-            "to record the endpoint + payload."
+        usd0 = {"amount": 0, "currency": "USD"}
+        existing = [
+            str(a.get("mediaId"))
+            for a in invoice.get("attachments") or []
+            if a.get("mediaId")
+        ]
+        site = str(invoice.get("vendorSiteId") or "")
+        return {
+            # The UI sends 0 and an empty poDetails; Tekion keeps the PO link.
+            "poAmount": usd0,
+            "payeeId": str(invoice.get("payeeId") or ""),
+            "vendorSiteId": int(site) if site.isdigit() else site,
+            "invoiceNumber": invoice.get("invoiceNumber"),
+            "invoiceAmount": invoice.get("invoiceAmount"),
+            "invoiceDate": invoice.get("invoiceDate"),
+            "invoiceDueDate": invoice.get("invoiceDueDate"),
+            "comment": invoice.get("comment"),
+            "salesTax": invoice.get("salesTax") or usd0,
+            "fees": invoice.get("fees") or usd0,
+            "shippingCharges": invoice.get("shippingCharges") or usd0,
+            "discount": invoice.get("discount") or usd0,
+            "attachments": [{"mediaId": m} for m in existing + media_ids],
+            "invoiceId": invoice.get("id"),
+            "type": invoice.get("type") or "INVOICE",
+            "transactionDetails": {},
+            "payeeName": invoice.get("payeeName"),
+            "payeeNumber": invoice.get("payeeNumber"),
+            "poDetails": [],
+            "apGlAccountId": invoice.get("apGlAccountId"),
+            "accountingDetails": invoice.get("accountingDetails") or [],
+            "taxes": invoice.get("taxes") or [],
+            "payeeType": invoice.get("payeeType") or "VENDOR",
+        }
+
+    def attach_to_invoice(self, invoice: dict[str, Any], media_id: str) -> dict[str, Any]:
+        """Link an uploaded file to a PRE_INVOICED Vendor Invoice."""
+        body = self.build_attach_payload(invoice, [media_id])
+        print(f"[AP] Attach mediaId={media_id} to invoice {invoice.get('id')}")
+        res = self.client._req_json(_PRE_INVOICE_POST_PATH, method="POST", body=body)
+        res = res if isinstance(res, dict) else {}
+        if res.get("status") == "failed":
+            details = res.get("errorDetails") or {}
+            raise RuntimeError(
+                f"Attaching the invoice PDF was refused: {details.get('errorCode')} "
+                f"{details.get('key')}: {details.get('displayMessage')}"
+            )
+        attached = [a.get("mediaId") for a in (res.get("data") or {}).get("attachments") or []]
+        if media_id not in attached:
+            raise RuntimeError(
+                f"Tekion accepted the re-post but invoice {invoice.get('id')} does not "
+                f"list mediaId {media_id} among its attachments."
+            )
+        return res
+
+    # ── Step 6: Post Transaction ─────────────────────────────────────────────
+
+    @staticmethod
+    def build_post_payload(
+        invoice_id: str,
+        invoice_number: str,
+        postings: list[dict[str, Any]],
+        dealer_id: str,
+        accounting_date_ms: int,
+    ) -> dict[str, Any]:
+        """The receivedTransaction body, matching the captured request.
+
+        The PDF is not sent here: the post ignores assetAttachmentDto, so the
+        file is linked beforehand by attach_to_invoice().
+        """
+        wire_postings = []
+        for p in sorted(postings, key=lambda p: p.get("postingOrder") or 0):
+            line = {k: p.get(k) for k in _WIRE_POSTING_KEYS if k in p}
+            line.setdefault("dealerId", dealer_id)
+            if not line.get("refType"):
+                # invoicePostings returns null; the UI sends CUSTOM.
+                line["refType"] = "CUSTOM"
+            wire_postings.append(line)
+        # The A/P line carries the invoice total as its credit.
+        ap_line = next(
+            (p for p in wire_postings if (p.get("metaData") or {}).get("apPostingLine")),
+            None,
         )
+        if ap_line is not None:
+            transaction_amount = abs(float(ap_line.get("amount") or 0))
+        else:
+            transaction_amount = sum(
+                float(p.get("amount") or 0) for p in wire_postings if float(p.get("amount") or 0) > 0
+            )
+        return {
+            "transactionType": "GENERAL",
+            "postings": wire_postings,
+            "transactionAmount": round(transaction_amount, 2),
+            "journalId": f"{dealer_id}_{_AP_JOURNAL_NUMBER}",
+            "description": invoice_number,
+            "metadata": {
+                "sourceType": "RECEIVING_INVOICE",
+                "businessFlow": "VENDOR_INVOICE_FLOW",
+            },
+            "refId__PO_INVOICE_ASSET": [invoice_id],
+            "refType": "PURCHASE_ORDER_INVOICE",
+            "refId": invoice_id,
+            "refText": invoice_number,
+            "documentTypeId": f"{dealer_id}_{_DOCUMENT_TYPE_SUFFIX}",
+            "franchiseId": dealer_id,
+            # The journal-entry Submit sends true; the Vendor Invoice post sends false.
+            "defaultJournalValidationRequired": False,
+            # Epoch-ms as a string, as the UI sends it.
+            "scheduledTime": str(accounting_date_ms),
+            "assetAttachmentDto": {},
+            "userConsentToSkipCreditLimitCheckForAR": False,
+        }
+
+    def post_transaction(
+        self,
+        invoice_id: str,
+        invoice_number: str,
+        postings: list[dict[str, Any]],
+        *,
+        accounting_date_ms: int,
+    ) -> dict[str, Any]:
+        """Post the Vendor Invoice to the ledger. There is no undo.
+
+        Tekion refuses an invoice number already posted for the vendor with a
+        400 carrying "duplicate.invoice.number" (A111); that raises like any
+        other refusal.
+        """
+        dealer_id = str(self.client.current_dealer_id)
+        body = self.build_post_payload(
+            invoice_id, invoice_number, postings, dealer_id, accounting_date_ms
+        )
+        path = _RECEIVED_TRANSACTION_PATH.format(invoice_id=invoice_id)
+        print(f"[AP] Post Transaction: POST {path}")
+        res = self.client._req_json(path, method="POST", body=body)
+        if isinstance(res, dict) and res.get("status") == "failed":
+            details = res.get("errorDetails") or {}
+            raise RuntimeError(
+                f"Post Transaction refused: {details.get('errorCode')} "
+                f"{details.get('key')}: {details.get('displayMessage')}"
+            )
+        return res
 
 
 # ── Orchestration ─────────────────────────────────────────────────────────────
@@ -440,6 +611,8 @@ def approve_invoice(
     if dry_run:
         result.notes.append("Dry run - stopped before Post Transaction. Nothing was written.")
     else:
-        svc.post_transaction()  # raises: endpoint deliberately not captured
+        raise RuntimeError(
+            "approve_invoice never posts; the pipeline posts through vi_verify."
+        )
 
     return result

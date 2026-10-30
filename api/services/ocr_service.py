@@ -26,8 +26,9 @@ if not os.environ.get("VERTEX_CREDENTIALS"):
 from google.genai import types  # noqa: E402
 
 from api.config import settings  # noqa: E402
-from api.services import page_enhance, page_orientation  # noqa: E402
+from api.services import confidence_read, page_enhance, page_orientation  # noqa: E402
 from api.services.ocr_helpers import to_flat_fields  # noqa: E402
+from api.services.vertex_retry import call_with_retry, is_rate_limited  # noqa: E402
 from normalize import to_po_contract  # noqa: E402
 from pipeline import get_client, load_pages, pil_to_part  # noqa: E402
 from vision_extract import VISION_PROMPT, build_response_schema, validate  # noqa: E402
@@ -86,33 +87,56 @@ def extract_document(
         if pages_out is not None:
             pages_out.extend(images)
     parts = [pil_to_part(img) for img in images]
+
+    # The confidence read runs alongside the main one, on the same pages, so
+    # it adds no time unless it is the slower of the two.
+    second_read = None
+    if settings.confidence_read:
+        from concurrent.futures import ThreadPoolExecutor
+
+        pool = ThreadPoolExecutor(max_workers=1)
+        second_read = pool.submit(confidence_read.read, list(images), list(parts), client)
+        pool.shutdown(wait=False)
+
     parts.append(types.Part.from_text(text=VISION_PROMPT))
 
     # Vertex AI intermittently drops the connection on long structured-schema
-    # calls. Retry a few times with backoff before giving up — the pipeline's
-    # own retry is coarser (30s/120s) and burns a full OCR re-run per attempt.
+    # calls, and also returns 429 when quota is hot. Rate limits use longer
+    # backoff (call_with_retry); other transient errors keep short 5/10s sleeps.
+    # The pipeline's own retry is coarser (30s/120s) and burns a full OCR re-run.
+    def _generate():
+        return client.models.generate_content(
+            model=VISION_MODEL,
+            contents=parts,
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                response_mime_type="application/json",
+                response_schema=build_response_schema(),
+                max_output_tokens=65535,
+            ),
+        )
+
     last_err: Exception | None = None
+    resp = None
     for attempt in range(3):
         try:
-            resp = client.models.generate_content(
-                model=VISION_MODEL,
-                contents=parts,
-                config=types.GenerateContentConfig(
-                    temperature=0.0,
-                    response_mime_type="application/json",
-                    response_schema=build_response_schema(),
-                    max_output_tokens=65535,
-                ),
-            )
+            resp = call_with_retry(_generate, what="OCR")
             break
         except Exception as e:  # noqa: BLE001 — Vertex drops show up as various errors
             last_err = e
+            if is_rate_limited(e):
+                # call_with_retry already exhausted its 429 budget.
+                raise
             if attempt < 2:
                 wait = 5 * (attempt + 1)
-                print(f"[OCR] Vertex call failed (attempt {attempt + 1}/3): {e}; retrying in {wait}s")
+                print(
+                    f"[OCR] Vertex call failed (attempt {attempt + 1}/3): {e}; "
+                    f"retrying in {wait}s"
+                )
                 time.sleep(wait)
     else:
         raise last_err  # type: ignore[misc]
+    assert resp is not None
 
     try:
         doc = json.loads(resp.text or "{}")
@@ -121,6 +145,28 @@ def extract_document(
 
     if not isinstance(doc, dict):
         doc = {"document_type": None}
+
+    if second_read is not None:
+        second = second_read.result()
+        doc = confidence_read.apply(doc, second)
+        doc["_confidence"] = second
+        if second.get("error"):
+            print(f"[OCR] confidence read failed ({second.get('model')}): {second['error']}")
+        else:
+            votes = second.get("votes") or {}
+            summary = [f"invoice {votes['invoice_number']['final'] or '?'} "
+                       f"{votes['invoice_number']['agree']}/{votes['invoice_number']['of']}"]
+            summary += [
+                f"#{ln['account']['final'] or '?'} {ln['account']['agree']}/{ln['account']['of']} "
+                f"{ln['amount']['final'] or '?'} {ln['amount']['agree']}/{ln['amount']['of']}"
+                for ln in votes.get("gl_lines") or []
+            ]
+            print(
+                f"[OCR] vote (2.5 Pro {second.get('seconds')}s, PaddleOCR "
+                f"{'%ss' % second['paddle']['seconds'] if second['paddle']['available'] else 'unavailable'}): "
+                + ", ".join(summary)
+                + (f" -- UNRESOLVED: {'; '.join(second['unresolved'])}" if second.get("unresolved") else "")
+            )
 
     doc["_pages"] = len(images)
     doc["_po_contract"] = to_po_contract(doc)

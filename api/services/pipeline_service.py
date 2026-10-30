@@ -3,9 +3,10 @@
 One document goes in, one `documents` row tracks it the whole way, and the
 upload folder decides which Tekion flow runs:
 
-    SUBLET         -> Sublet PO   + pre-invoice   (api/routes/tekion.py)
-    MISCELLANEOUS  -> Misc PO     + pre-invoice   (api/routes/tekion.py)
-    STOCK          -> Vendor stock order          (api/routes/tekion.py)
+    PO_INVOICE     -> look up existing Tekion PO by number; route from
+                      orderType; verify against the pre-invoiced Vendor Invoice
+                      (legacy SUBLET / MISCELLANEOUS / STOCK uploads alias here).
+                      Never creates a PO and never calls pre-invoice.
     OEM            -> Journal entry, posted or saved as draft by OEM_POST (api/services/je_creation.py)
     VEHICLE_MANUFACTURING -> Vehicle purchase journal entry from a
                       per-manufacturer template (api/services/vmi_je_creation.py)
@@ -13,10 +14,10 @@ upload folder decides which Tekion flow runs:
 None of those flows are reimplemented here — this module calls the existing
 functions unchanged.
 
-THE FOLDER IS AUTHORITATIVE
-    The folder the user uploaded into selects the pipeline, always. OCR's own
-    `document_type` is recorded as `ocr_document_type` so a disagreement is
-    visible for review, but it never changes routing and never blocks.
+THE FOLDER IS AUTHORITATIVE (with one exception)
+    OEM and Vehicle folders always select those flows. The PO_INVOICE inbox
+    looks up the Tekion PO and sets the concrete type from orderType. OCR's
+    own `document_type` never changes routing.
 
 RUNS AS A QUEUE JOB
     `run_job()` is called by the workers in api/services/worker.py, which claim
@@ -61,6 +62,9 @@ from api.services.tekion_lock import dealer_scope, tekion_scope
 FOLDER_SUBLET = "SUBLET"
 FOLDER_MISC = "MISCELLANEOUS"
 FOLDER_STOCK = "STOCK"
+# One inbox for Sublet / Misc / Vendor Stock: the Tekion PO's orderType decides
+# which pre-invoice path runs. OEM and Vehicle stay separate (journal entries).
+FOLDER_PO_INVOICE = "PO_INVOICE"
 FOLDER_OEM = "OEM"
 # Vehicle manufacturer invoices (Kia, Ford, Honda, Toyota). A journal entry
 # like OEM, but built from a per-manufacturer template rather than the invoice
@@ -68,15 +72,22 @@ FOLDER_OEM = "OEM"
 # receivables. See api/services/vmi_je_creation.py.
 FOLDER_VMI = "VEHICLE_MANUFACTURING"
 
-VALID_FOLDERS = {FOLDER_SUBLET, FOLDER_MISC, FOLDER_STOCK, FOLDER_OEM, FOLDER_VMI}
+# Concrete types after Tekion lookup; PO_INVOICE is only the upload bucket.
+_PO_INVOICE_TYPES = {FOLDER_SUBLET, FOLDER_MISC, FOLDER_STOCK}
 
-# Aliases so the frontend can send the friendlier folder names.
+VALID_FOLDERS = {FOLDER_PO_INVOICE, FOLDER_OEM, FOLDER_VMI} | _PO_INVOICE_TYPES
+
+# Aliases so the frontend can send the friendlier folder names. Legacy Sublet /
+# Misc / Stock uploads land in the unified inbox and are re-typed from Tekion.
 _FOLDER_ALIASES = {
-    "MISC": FOLDER_MISC,
-    "MISCELLANEOUS": FOLDER_MISC,
-    "SUBLET": FOLDER_SUBLET,
-    "STOCK": FOLDER_STOCK,
-    "VENDOR_STOCK": FOLDER_STOCK,
+    "PO_INVOICE": FOLDER_PO_INVOICE,
+    "PURCHASE_ORDER": FOLDER_PO_INVOICE,
+    "EXISTING_PO": FOLDER_PO_INVOICE,
+    "MISC": FOLDER_PO_INVOICE,
+    "MISCELLANEOUS": FOLDER_PO_INVOICE,
+    "SUBLET": FOLDER_PO_INVOICE,
+    "STOCK": FOLDER_PO_INVOICE,
+    "VENDOR_STOCK": FOLDER_PO_INVOICE,
     "OEM": FOLDER_OEM,
     "PARTS_STMT": FOLDER_OEM,
     "MANUFACTURER": FOLDER_OEM,
@@ -103,6 +114,9 @@ EX_OCR_FAILED = "OCR_FAILED"
 EX_FILE_MISSING = "SOURCE_FILE_MISSING"
 EX_MISSING_FIELD = "MISSING_REQUIRED_FIELD"
 EX_DUPLICATE = "DUPLICATE_DOCUMENT"
+# Tekion PRE_INVOICED list has another VI whose invoice # is the same digit core
+# with different letter wrapping (BLK123 vs 123). Manual verify before removal.
+EX_DUPLICATE_INVOICE = "DUPLICATE_INVOICE"
 EX_VENDOR_NOT_FOUND = "VENDOR_NOT_FOUND"
 # Vendor stock orders are invoiced against an existing PO. If the number on the
 # invoice does not resolve, there is nothing to attach to.
@@ -138,18 +152,31 @@ EX_GL_NOT_IN_CHART = "GL_ACCOUNT_NOT_FOUND"
 # The invoice's printed total is zero, e.g. a core credit memo for .00CR.
 # Nothing to post, which is different from a total that could not be read.
 EX_ZERO_TOTAL = "ZERO_TOTAL"
+# TESTING BRANCH: three readers voted on the invoice number and the handwritten
+# GL lines (api/services/confidence_read.py) and no two agreed on a value.
+EX_UNCLEAR_READING = "UNCLEAR_READING"
+
 # An OEM invoice with no GL account written on it. The account used to be
 # guessed from the parts, and on Honda credit memos marked "Credit # 2410" the
 # guess was 2430 -- posted, and not reversible. Every OEM invoice since 20 Sep
 # carried a handwritten account, so one without is a misread or a missing
 # annotation: either way a person decides, not a guess.
 EX_NO_GL_WRITTEN = "NO_GL_ACCOUNT_WRITTEN"
+# Vendor Invoice verify flow (no PO create / no pre-invoice): OCR vs Tekion VI.
+EX_INVOICE_NUMBER_MISMATCH = "INVOICE_NUMBER_MISMATCH"
+EX_PRE_INVOICE_MISSING = "PRE_INVOICE_MISSING"
+# Expense GL Control must be PO vendor (or RO for Sublet 2460); 7xxx need description.
+EX_JE_CONTROL_REQUIRED = "JE_CONTROL_REQUIRED"
+EX_VENDOR_MISMATCH = "VENDOR_MISMATCH"
+EX_INVOICE_DATE_MISMATCH = "INVOICE_DATE_MISMATCH"
+EX_PO_NUMBER_MISMATCH = "PO_NUMBER_MISMATCH"
 
 _SEVERITY = {
     EX_OCR_FAILED: "HIGH",
     EX_FILE_MISSING: "HIGH",
     EX_MISSING_FIELD: "HIGH",
     EX_DUPLICATE: "LOW",
+    EX_DUPLICATE_INVOICE: "HIGH",
     EX_VENDOR_NOT_FOUND: "HIGH",
     EX_PO_NOT_FOUND: "HIGH",
     EX_AMOUNT_MISMATCH: "HIGH",
@@ -161,11 +188,19 @@ _SEVERITY = {
     EX_SPLIT_FAILED: "HIGH",
     EX_GL_NOT_IN_CHART: "HIGH",
     EX_ZERO_TOTAL: "LOW",
+    EX_UNCLEAR_READING: "HIGH",
     EX_NO_GL_WRITTEN: "HIGH",
+    EX_INVOICE_NUMBER_MISMATCH: "HIGH",
+    EX_PRE_INVOICE_MISSING: "HIGH",
+    EX_JE_CONTROL_REQUIRED: "HIGH",
+    EX_VENDOR_MISMATCH: "HIGH",
+    EX_INVOICE_DATE_MISMATCH: "HIGH",
+    EX_PO_NUMBER_MISMATCH: "HIGH",
 }
 
-# Only OCR is retried, and only because it is free of side effects: reading a
-# document twice costs a Gemini call and changes nothing.
+# Only side-effect-free steps are retried: OCR, and a batch split that failed
+# because Vertex was rate-limiting (nothing posted yet). Bad segmentations that
+# are not quota errors stay terminal — retrying will not invent page boundaries.
 #
 # Tekion failures are deliberately NOT retried. A run can fail *after* Tekion
 # has already created a purchase order — that is exactly what happened when a
@@ -181,14 +216,21 @@ def _fail(session: Session, doc: Document, exception_type: str, error: str = "")
     # PO that turned out to be closed, a vendor Tekion no longer has -- must go
     # back through review on a re-run, not post whatever was approved before
     # the reason it failed was known.
+    from api.services.vertex_retry import is_rate_limited
+
     doc.review_approved = False
+    # BATCH_SPLIT_FAILED after a 429: still nothing in Tekion, and a later
+    # attempt often succeeds once quota cools — same class as OCR_FAILED.
+    rate_limited_split = (
+        exception_type == EX_SPLIT_FAILED and is_rate_limited(Exception(error))
+    )
     job_queue.fail(
         session,
         doc,
         exception_type,
         severity=_SEVERITY.get(exception_type, "MEDIUM"),
         error=error,
-        retryable=exception_type in _RETRYABLE,
+        retryable=exception_type in _RETRYABLE or rate_limited_split,
     )
 
 
@@ -332,6 +374,75 @@ def _store_enhanced_copy(doc: Document, source: str, pages: list) -> None:
         print(f"[PIPE] {doc.id} could not store the cleaned-up copy: {e}")
 
 
+def _gl_total_disagrees(ocr: dict[str, Any]) -> list[str]:
+    """The voted GL amounts against the printed invoice total (testing branch).
+
+    [] when they match, when there are no handwritten GL lines, or when no
+    total was read; otherwise one line saying both figures and what each
+    reader read, for the UNCLEAR_READING message.
+    """
+    votes = (ocr.get("_confidence") or {}).get("votes") or {}
+    lines = votes.get("gl_xlines") or []
+    total = ocr_helpers.get_total_amount(ocr)
+    if not lines or not total:
+        return []
+    try:
+        voted = round(sum(float(ln["amount"]["final"]) for ln in lines), 2)
+    except (TypeError, ValueError, KeyError):
+        return []
+    # Signed: a credit memo's lines are negative and so is its total.
+    signed_total = -round(float(total), 2) if ocr_helpers.is_credit_invoice(ocr) else round(float(total), 2)
+    if abs(voted - signed_total) <= 0.01:
+        return []
+    readings = []
+    for ln in lines:
+        said = {r: (v or {}).get("value") for r, v in ln["amount"]["readers"].items() if v}
+        readings.append(", ".join(f"{name} {said[r]!r}" for r, name in (
+            ("flash", "Gemini 3.6 Flash"), ("pro", "Gemini 2.5 Pro"), ("paddle", "PaddleOCR")) if said.get(r)))
+    return [
+        f"GL amounts (${voted:,.2f}) against the invoice total (${signed_total:,.2f}); "
+        f"the readers read {'; '.join(readings)}"
+    ]
+
+
+def _store_confidence(doc: Document, ocr: dict[str, Any]) -> None:
+    """Keep the confidence read beside the original in S3, for the detail page.
+
+    In S3 rather than a column, so this testing branch needs no migration and
+    the staging database stays usable by the staging branch. Best-effort.
+    """
+    second = ocr.get("_confidence")
+    if not second or not doc.s3_key or not s3_service.is_configured():
+        return
+    try:
+        local = Path(tempfile.gettempdir()) / f"{doc.id}.confidence.json"
+        local.write_text(json.dumps(second, default=str), encoding="utf-8")
+        s3_service.upload_file(local, s3_service.confidence_key(doc.s3_key))
+        local.unlink(missing_ok=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[PIPE] {doc.id} could not store the confidence read: {e}")
+
+
+def read_confidence(doc: Document) -> dict[str, Any]:
+    """The confidence read for this document: the OCR cache first, then S3. {} if none."""
+    cached = _load_cached_ocr(doc)
+    if cached and cached.get("_confidence"):
+        return cached["_confidence"]
+    if not doc.s3_key or not s3_service.is_configured():
+        return {}
+    key = s3_service.confidence_key(doc.s3_key)
+    if not s3_service.exists(key):
+        return {}
+    try:
+        local = Path(tempfile.gettempdir()) / f"{doc.id}.confidence.read.json"
+        s3_service.download_file(key, local)
+        data = json.loads(local.read_text(encoding="utf-8"))
+        local.unlink(missing_ok=True)
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -361,6 +472,9 @@ def _split_batch(
         # a 40-page batch became a single journal entry and looked fine.
         #
         # Hold it for a person instead. Nothing has been sent to Tekion.
+        # Vertex 429s are retried inside segment_documents and again by the
+        # queue (see _fail + is_rate_limited); other segmentation failures stay
+        # terminal exceptions.
         print(f"[SPLIT] {doc.id} could not be segmented ({e}); holding for review")
         _fail(
             session,
@@ -600,8 +714,17 @@ def _run(doc: Document, session: Session) -> None:
             print(f"[PIPE] OCR failed: {e}")
             _fail(session, doc, EX_OCR_FAILED, error=str(e))
             return
+        # Two readers can share a misreading: on a Toyota invoice 2.5 Pro and
+        # PaddleOCR both read a handwritten 474.56 as 474.50 and outvoted Flash.
+        # The printed total settles it. Not for vehicle invoices, whose
+        # handwritten amounts are holdback and fees rather than a split of the
+        # total. Recorded with the vote, so the confidence page shows it too.
+        second = ocr.get("_confidence")
+        if second and second.get("votes") and not second.get("unresolved") and doc.po_type != FOLDER_VMI:
+            second["unresolved"] = _gl_total_disagrees(ocr)
         _store_enhanced_copy(doc, source, enhanced_pages)
         _cache_ocr(doc, ocr)
+        _store_confidence(doc, ocr)
 
     # ── 3. Record what OCR found ─────────────────────────────────────────────
     doc.ocr_document_type = ocr_helpers.get_document_type(ocr)
@@ -621,9 +744,11 @@ def _run(doc: Document, session: Session) -> None:
     # ── 4. Idempotency ───────────────────────────────────────────────────────
     # Checked after OCR because the invoice number is only known now. A repeat
     # upload is held for a decision rather than posted twice to Tekion — see
-    # job_queue.hold_as_duplicate. A user who confirms gets `duplicate_override`
-    # set for exactly this run.
+    # job_queue.hold_as_duplicate. Ignore / confirm sets `duplicate_override`
+    # for exactly this run (also skips Tekion Pre Invoice near-dup check).
+    waive_dup_checks = False
     if doc.duplicate_override:
+        waive_dup_checks = True
         doc.duplicate_override = False
         session.add(doc)
         session.commit()
@@ -653,19 +778,54 @@ def _run(doc: Document, session: Session) -> None:
         print(f"[PIPE] {doc.id} deleted while processing -- nothing posted")
         return
 
+    # ── 4c. The readers disagree (testing branch) ────────────────────────────
+    # Gemini 3.6 Flash, Gemini 2.5 Pro and PaddleOCR each read the invoice
+    # number and the handwritten GL lines. A value no two of them agree on is
+    # a guess, so stop before Tekion and let a person look. Only on a fresh
+    # read: running it again -- with corrections or without -- is a person
+    # saying they have checked it.
+    #
+    # PO_INVOICE (VI verify): clerks are not writing GL on the PDF for now —
+    # expense GLs come from the Tekion pre-invoice. Ignore GL-line reader
+    # disagreements so a phantom "ELM1" / amount vote does not block verify.
+    unresolved = list((ocr.get("_confidence") or {}).get("unresolved") or [])
+    if doc.po_type in (FOLDER_PO_INVOICE, *_PO_INVOICE_TYPES):
+        unresolved = [u for u in unresolved if not str(u).startswith("GL line ")]
+    if cached is None and unresolved:
+        _fail(
+            session,
+            doc,
+            EX_UNCLEAR_READING,
+            error=(
+                "The readers did not agree on: " + "; ".join(unresolved)
+                + ". Nothing was sent to Tekion. Check these against the invoice, "
+                "correct any that are wrong, and run it again."
+            )[:1000],
+        )
+        return
+
     # ── 5. Dispatch on the folder ────────────────────────────────────────────
     if doc.po_type == FOLDER_VMI:
         _run_vehicle_journal_entry(doc, ocr, session)
     elif doc.po_type == FOLDER_OEM:
         _run_journal_entry(doc, ocr, session)
-    elif doc.po_type == FOLDER_STOCK:
-        # A vendor stock order is not created here — the PO already exists and
-        # the invoice arrives afterwards to be attached to it.
-        _run_stock_pre_invoice(doc, ocr, session, original)
+    elif doc.po_type in (FOLDER_PO_INVOICE, *_PO_INVOICE_TYPES):
+        # Unified PO inbox (and legacy Sublet/Misc/Stock uploads): look up the
+        # Tekion PO, set the concrete type from orderType, then pre-invoice.
+        _run_po_invoice(
+            doc,
+            ocr,
+            session,
+            original,
+            skip_near_duplicate_check=waive_dup_checks,
+        )
     else:
-        # `source` is handed on so the PO flow can attach the invoice PDF to the
-        # pre-invoice — we already have the file, so there is no reason not to.
-        _run_purchase_order(doc, ocr, session, original)
+        _fail(
+            session,
+            doc,
+            EX_MISSING_FIELD,
+            error=f"Unknown folder {doc.po_type!r}; nothing was posted.",
+        )
 
 
 # ── OEM -> Journal entry ──────────────────────────────────────────────────────
@@ -678,6 +838,12 @@ def _record_postings(
     lines: list[dict[str, Any]],
     reference: str = "",
     balance: float | None = None,
+    vi_match: dict[str, Any] | None = None,
+    invoice_amount: float | None = None,
+    tekion_amount: float | None = None,
+    invoice_date: str | None = None,
+    tekion_invoice_date: str | None = None,
+    vi_post: dict[str, bool] | None = None,
 ) -> None:
     """Record the accounting lines this document put into Tekion.
 
@@ -693,6 +859,10 @@ def _record_postings(
 
     Written on failures too. A refused entry is exactly when someone wants to
     see which lines were built and where they stopped adding up.
+
+    ``vi_match`` holds the Vendor Invoice header comparison (PO #, vendor,
+    invoice #, amount, date) for the three-way match UI. ``vi_post`` says what
+    the Vendor Invoice flow did in Tekion: {writes, attached, posted}.
     """
     clean = [
         {
@@ -708,16 +878,27 @@ def _record_postings(
     credit = round(sum(-l["amount"] for l in clean if l["amount"] < 0), 2)
     debit = round(sum(l["amount"] for l in clean if l["amount"] > 0), 2)
 
-    doc.posting_details = json.dumps(
-        {
-            "lines": clean,
-            "creditTotal": credit,
-            "debitTotal": debit,
-            "balance": round(debit - credit, 2) if balance is None else round(balance, 2),
-            "reference": reference,
-        },
-        default=str,
-    )[:8000]
+    payload: dict[str, Any] = {
+        "lines": clean,
+        "creditTotal": credit,
+        "debitTotal": debit,
+        "balance": round(debit - credit, 2) if balance is None else round(balance, 2),
+        "reference": reference,
+    }
+    if vi_match:
+        payload["viMatch"] = vi_match
+    if invoice_amount is not None:
+        payload["invoiceAmount"] = round(float(invoice_amount), 2)
+    if tekion_amount is not None:
+        payload["tekionAmount"] = round(float(tekion_amount), 2)
+    if invoice_date:
+        payload["invoiceDate"] = invoice_date
+    if tekion_invoice_date:
+        payload["tekionInvoiceDate"] = tekion_invoice_date
+    if vi_post is not None:
+        payload["viPost"] = vi_post
+
+    doc.posting_details = json.dumps(payload, default=str)[:8000]
     session.add(doc)
     session.commit()
 
@@ -852,12 +1033,20 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         gl_splits=gl_splits,
     )
 
+    # Same local/S3 restore path the VI verify flow uses for PDF attach.
+    source_path = _resolve_source(doc)
+
     try:
         # Serialized: create_journal_entry switches dealership on the shared client.
         with tekion_scope():
             client = get_client(session)
             result = create_journal_entry(
-                client, expected=expected, dry_run=False, post=settings.oem_post
+                client,
+                expected=expected,
+                dry_run=False,
+                post=settings.oem_post,
+                attachment_file_path=source_path,
+                attachment_file_name=doc.file_name or None,
             )
     except Exception as e:  # noqa: BLE001
         print(f"[PIPE] {doc.id} journal entry failed: {e}")
@@ -880,6 +1069,9 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         ],
         reference=result.transaction_number or result.reference or "",
         balance=result.balance,
+        # Persist the ticket date so the detail page can show Invoice Date
+        # (same value posted as Tekion scheduledTime / Accounting Date).
+        invoice_date=invoice_date,
     )
 
     # Checked before `balanced`: a refused entry never got as far as balancing,
@@ -1036,6 +1228,7 @@ def _run_vehicle_journal_entry(
         ],
         reference=result.transaction_number or facts.stock_number or "",
         balance=result.balance,
+        invoice_date=facts.invoice_date,
     )
 
     # Checked before the balance: a refused entry never reached the balance
@@ -1077,124 +1270,167 @@ def _run_stock_pre_invoice(
     session: Session,
     source_path: str | None = None,
 ) -> None:
-    """Attach the invoice to the purchase order it names, and pre-invoice it."""
-    from api.routes.tekion import get_client, reset_client
-    from api.services.vso_po_creation import (
-        ExpectedStockInvoice,
-        pre_invoice_stock_order,
+    """Hard-disabled: PO_INVOICE uses ``_run_vi_verify`` instead of pre-invoice."""
+    _fail(
+        session,
+        doc,
+        EX_TEKION_REJECTED,
+        error=(
+            "Stock pre-invoice from this app is turned off. Pre-invoice the "
+            "PO in Tekion first, then upload the invoice for Vendor Invoice "
+            "verification."
+        ),
     )
 
-    po_number = ocr_helpers.get_po_number(ocr)
-    invoice_number = doc.invoice_number
-    total = ocr_helpers.get_total_amount(ocr)
-    sales_tax = ocr_helpers.get_sales_tax(ocr)
 
-    # The PO number is what makes this flow possible at all.
-    if not po_number:
+# ── SUBLET / MISCELLANEOUS -> Purchase order ─────────────────────────────────
+
+
+def _run_po_invoice(
+    doc: Document,
+    ocr: dict[str, Any],
+    session: Session,
+    source_path: str | None,
+    *,
+    skip_near_duplicate_check: bool = False,
+) -> None:
+    """Verify the invoice against an already pre-invoiced Tekion VI.
+
+    The upload folder is a single inbox. Tekion's ``orderType`` / ``universalId``
+    set the concrete type after PO lookup. This path never creates a PO and
+    never calls pre-invoice — Parts do that in Tekion first.
+    """
+    existing_po, stop = _resolve_existing_po(doc, ocr, session)
+    if stop:
+        return
+    if not existing_po:
         _fail(
             session,
             doc,
             EX_PO_NOT_FOUND,
-            error="No purchase order number could be read from the invoice",
+            error=(
+                "No existing Tekion purchase order to verify against. "
+                "Create and pre-invoice the PO in Tekion first, then upload "
+                "this invoice."
+            ),
         )
         return
-    if not invoice_number or not total:
-        _fail(session, doc, EX_MISSING_FIELD, error="missing invoice number or total")
+
+    _run_vi_verify(
+        doc,
+        ocr,
+        session,
+        source_path,
+        skip_near_duplicate_check=skip_near_duplicate_check,
+    )
+
+
+def _run_vi_verify(
+    doc: Document,
+    ocr: dict[str, Any],
+    session: Session,
+    source_path: str | None,
+    *,
+    skip_near_duplicate_check: bool = False,
+) -> None:
+    """Compare OCR to the Tekion Vendor Invoice; on pass complete the VI."""
+    from api.routes.tekion import get_client, reset_client
+    from api.services.vi_verify import ViVerifyInput, verify_vendor_invoice
+
+    # PO # is optional here — verify finds the VI by invoice number first.
+    # doc.po_number is usually filled by _resolve_existing_po via that VI.
+    po_number = doc.po_number or ocr_helpers.get_po_number(ocr) or ""
+    invoice_number = doc.invoice_number or ocr_helpers.get_invoice_number(ocr)
+    total = ocr_helpers.get_total_amount(ocr)
+
+    if not invoice_number or total is None:
+        _fail(
+            session,
+            doc,
+            EX_MISSING_FIELD,
+            error="missing invoice number or total amount",
+        )
         return
 
-    # Record it now so the row shows which PO this is about, even if the run
-    # fails later.
-    doc.po_number = po_number
+    if po_number:
+        doc.po_number = po_number
+    doc.invoice_number = invoice_number
     session.add(doc)
     session.commit()
 
-    expected = ExpectedStockInvoice(
+    expected = ViVerifyInput(
         po_number=po_number,
         invoice_number=invoice_number,
-        invoice_amount=total,
-        sales_tax=sales_tax,
+        invoice_amount=float(total),
         dealership_name=doc.dealership_name,
+        po_type=doc.po_type or FOLDER_MISC,
+        ro_number=doc.ro_number or ocr_helpers.get_control_number(ocr) or None,
+        vendor_name=doc.vendor_name or ocr_helpers.get_vendor_name(ocr) or None,
         invoice_date=ocr_helpers.get_invoice_date(ocr) or None,
+        reference_number=invoice_number,
         invoice_file_path=source_path,
         invoice_file_name=doc.file_name or None,
-        # Only consulted if Tekion has no GL accounts of its own for these parts.
-        gl_account=ocr_helpers.get_document_gl_account(ocr),
-        # Accounts with their own amounts. These outrank Tekion's postings.
-        gl_splits=ocr_helpers.get_gl_amount_splits(ocr),
+        skip_near_duplicate_check=skip_near_duplicate_check,
     )
 
     try:
         with tekion_scope():
             client = get_client(session)
-            # TEKION_PO_WRITES off: the built-in dry run reads the PO and checks
-            # the amounts, then stops before attaching or posting anything.
-            result = pre_invoice_stock_order(client, expected, dry_run=not settings.tekion_po_writes)
+            # TEKION_PO_WRITES off: verify only — no attach / VI complete.
+            result = verify_vendor_invoice(
+                client, expected, dry_run=not settings.tekion_po_writes
+            )
     except Exception as e:  # noqa: BLE001
-        print(f"[PIPE] {doc.id} stock pre-invoice failed: {e}")
+        print(f"[PIPE] {doc.id} VI verify failed: {e}")
         reset_client()
         _fail(session, doc, EX_TEKION_ERROR, error=str(e))
         return
 
-    if not result.po_id:
-        _fail(
-            session,
+    # Always stash match + GL lines so the detail three-way panel has real $.
+    if result.gl_lines_for_doc or result.match:
+        _record_postings(
             doc,
-            EX_PO_NOT_FOUND,
-            error="; ".join(result.notes) or f"PO {po_number} not found",
-        )
-        return
-    if result.discrepancies:
-        _fail(
             session,
-            doc,
-            EX_AMOUNT_MISMATCH,
-            # The plain-language notes when there are any; the raw comparison
-            # ("gl_lines: invoice says ..., PO says ...") only as a fallback.
-            error="; ".join(result.notes) or "; ".join(str(d) for d in result.discrepancies),
+            lines=result.gl_lines_for_doc or [],
+            reference=result.po_number or po_number,
+            vi_match=result.match or None,
+            invoice_amount=float(total),
+            tekion_amount=result.tekion_amount,
+            invoice_date=result.invoice_date or expected.invoice_date,
+            tekion_invoice_date=result.tekion_invoice_date,
+            vi_post={
+                "writes": settings.tekion_po_writes,
+                "attached": result.attached,
+                "posted": result.completed,
+            },
         )
-        return
-    # A dry run (TEKION_PO_WRITES off) that matched the PO is a success here:
-    # everything up to the pre-invoice ran, and only the posting was skipped.
-    dry_run_ok = not settings.tekion_po_writes and result.matched
-    if not result.posted and not dry_run_ok:
-        _fail(session, doc, EX_TEKION_ERROR, error="; ".join(result.notes) or "not posted")
+
+    if not result.ok:
+        code = result.code or EX_TEKION_ERROR
+        # Tekion Pre Invoice near-dup → dashboard Duplicate (Discard / Ignore),
+        # not a hard EXCEPTION.
+        if code == EX_DUPLICATE_INVOICE:
+            job_queue.hold_as_tekion_duplicate(
+                session, doc, result.message or "; ".join(result.notes)
+            )
+            return
+        # Map VI codes onto pipeline constants (same string values).
+        _fail(session, doc, code, error=result.message or "; ".join(result.notes))
         return
 
     doc.po_number = result.po_number or po_number
     doc.vendor_name = result.vendor_name or doc.vendor_name
 
-    # A stock order's expense lines are Tekion's own -- one per part, each with
-    # the account that part belongs to -- so the split is not ours to describe.
-    # What IS ours is the net it was invoiced for against the A/P credit, which
-    # is the pair a person checks.
-    _record_postings(
-        doc,
-        session,
-        lines=[
-            {
-                "glAccount": "(per part)",
-                "glName": "Tekion's own postings, one per part on the order",
-                "amount": round(result.net_amount or 0, 2),
-                "source": "returned by Tekion",
-            },
-            {
-                "glAccount": "3002",
-                "glName": "A/P",
-                "amount": -round(total or 0, 2),
-                "source": "accounts payable",
-            },
-        ],
-        reference=result.po_number or po_number,
-    )
-
     job_queue.complete(session, doc)
-    if dry_run_ok:
-        print(f"[PIPE] {doc.id} -> PROCESSED (TEKION_PO_WRITES off: PO {doc.po_number} matched, nothing posted)")
+    if not settings.tekion_po_writes:
+        print(
+            f"[PIPE] {doc.id} -> PROCESSED (TEKION_PO_WRITES off: VI verified for "
+            f"PO {doc.po_number}, nothing posted)"
+        )
+    elif result.completed:
+        print(f"[PIPE] {doc.id} -> PROCESSED (VI completed for PO {doc.po_number})")
     else:
-        print(f"[PIPE] {doc.id} -> PROCESSED (pre-invoiced PO {doc.po_number})")
-
-
-# ── SUBLET / MISCELLANEOUS -> Purchase order ─────────────────────────────────
+        print(f"[PIPE] {doc.id} -> PROCESSED (VI verified for PO {doc.po_number})")
 
 
 def _resolve_existing_po(
@@ -1202,95 +1438,162 @@ def _resolve_existing_po(
     ocr: dict[str, Any],
     session: Session,
 ) -> tuple[dict[str, Any] | None, bool]:
-    """Decide whether this invoice should reuse a purchase order already in Tekion.
+    """Find the Tekion purchase order this invoice will be verified against.
 
-    Returns (existing_po, stop). `existing_po` is a PO to invoice instead of
-    creating one; `stop` means this run is over -- the document has been parked
-    for a decision or failed -- and the caller must return without posting.
+    Returns (existing_po, stop). `existing_po` is the PO behind the Vendor
+    Invoice; `stop` means this run is over (failed).
 
-    THE ORDER OF THE QUESTIONS, and why each one exits early:
+    Parts raise and pre-invoice the PO in Tekion first. We only look it up.
+    An invoice number already on the PO is expected (verify flow), not a block.
 
-      1. Is a PO number written on the invoice? No number means the invoice is
-         not referring to an existing order at all, and the normal flow is
-         simply right. This is the common case and costs one regex.
-
-      2. Did a person already answer for this run? "Create a new one" means
-         they looked and said no; honour it without asking twice. The answer is
-         consumed here, so a later upload is asked again.
-
-      3. Does that PO exist at THIS dealership? Only an exact match counts --
-         Tekion's search is fuzzy, and a near-miss must not be treated as the
-         PO the clerk meant.
-
-      4. Can it take this invoice? A cancelled PO cannot, and a PO already
-         carrying this invoice number must not. The second is not covered by
-         the duplicate check upstream: that catches a repeat of a document WE
-         processed, while this catches a PO invoiced in Tekion by hand, which
-         nothing in our own records would show.
-
-      5. Otherwise, ask. Nothing here decides on its own to post against an
-         order somebody else raised.
+      1. Prefer Vendor Invoice lookup by **invoice number** (Pre Invoice list),
+         then take the linked PO # — OCR often lacks PO # or misreads a date.
+      2. Fall back to PO # printed on the invoice when VI search finds nothing.
+      3. That PO must exist at THIS dealership.
+      4. It must not be closed / cancelled / voided.
+      5. ``doc.po_type`` is set from Tekion's orderType (Sublet / Misc / Stock).
     """
     from api.routes.tekion import _resolve_dealer, get_client
+    from api.services.ap_approval import ApApprovalService
+    from api.services.vi_verify import (
+        _po_num_from_vi_hit,
+        find_pre_invoice_by_invoice_number,
+    )
 
-    if doc.po_type not in (FOLDER_SUBLET, FOLDER_MISC):
+    if doc.po_type not in (FOLDER_PO_INVOICE, *_PO_INVOICE_TYPES):
         return None, False
 
-    po_number = ocr_helpers.get_po_number(ocr)
-    if not po_number:
-        return None, False
-
+    # Consume any leftover choice from documents held before create-PO was
+    # removed. "Create new" is no longer allowed; "Use existing" is the only
+    # path and matches what we do automatically now.
     choice = (doc.po_choice or "").upper()
     if choice:
-        # Consumed whichever way it went, so it applies to this attempt only.
         doc.po_choice = ""
         session.add(doc)
         session.commit()
-
     if choice == po_reuse.CHOICE_NEW:
-        print(f"[PIPE] {doc.id} PO {po_number} exists but a new one was requested")
-        return None, False
+        _fail(
+            session,
+            doc,
+            EX_TEKION_REJECTED,
+            error=(
+                "Creating a new purchase order is turned off. Raise and "
+                "pre-invoice the PO in Tekion first, then upload the invoice "
+                "so it can be verified."
+            ),
+        )
+        return None, True
+
+    ocr_po_number = ocr_helpers.get_po_number(ocr)
+    invoice_number = ocr_helpers.get_invoice_number(ocr)
+    if not invoice_number and not ocr_po_number:
+        _fail(
+            session,
+            doc,
+            EX_MISSING_FIELD,
+            error=(
+                "No invoice number or purchase order number could be read from "
+                "the document. Pre-invoice in Tekion with the invoice #, then "
+                "upload a clearer scan."
+            ),
+        )
+        return None, True
 
     # The lookup is per-dealership, so the switch has to happen first.
+    found = None
     with tekion_scope():
         client = get_client(session)
         _resolve_dealer(client, doc.dealership_name)
-        found = po_reuse.look_up(client, po_number)
+
+        # Invoice-first: Pre Invoice list → linked PO #.
+        if invoice_number:
+            hit = find_pre_invoice_by_invoice_number(
+                ApApprovalService(client), invoice_number
+            )
+            if hit:
+                via_inv = _po_num_from_vi_hit(hit)
+                if via_inv:
+                    found = po_reuse.look_up(client, via_inv)
+                    if found:
+                        print(
+                            f"[PIPE] {doc.id} resolved PO {found.po_number} via "
+                            f"Vendor Invoice {invoice_number!r}"
+                        )
+
+        # Fall back to OCR PO # when VI search did not resolve a PO.
+        if found is None and ocr_po_number:
+            found = po_reuse.look_up(client, ocr_po_number)
 
     if found is None:
-        print(f"[PIPE] {doc.id} PO {po_number!r} is not in Tekion -- creating a new one")
-        return None, False
+        if invoice_number:
+            _fail(
+                session,
+                doc,
+                EX_PRE_INVOICE_MISSING,
+                error=(
+                    f"No pre-invoiced Vendor Invoice found in Tekion for "
+                    f"{invoice_number!r}"
+                    + (
+                        f" (OCR also had PO {ocr_po_number!r}, not found)."
+                        if ocr_po_number
+                        else ". Create and pre-invoice the PO in Tekion first."
+                    )
+                ),
+            )
+        else:
+            _fail(
+                session,
+                doc,
+                EX_PO_NOT_FOUND,
+                error=(
+                    f"PO {ocr_po_number} was not found in Tekion at this dealership. "
+                    "Nothing was posted. Create or fix the purchase order in Tekion, "
+                    "then run this invoice again."
+                ),
+            )
+        return None, True
 
+    routed = po_reuse.pipeline_folder_for(found)
+    if not routed:
+        _fail(
+            session,
+            doc,
+            EX_TEKION_REJECTED,
+            error=(
+                f"PO {found.po_number} has Tekion type "
+                f"{found.order_type or found.universal_id or 'unknown'!r}, which "
+                "this inbox does not handle. Use the OEM or Vehicle folder for "
+                "journal-entry invoices."
+            ),
+        )
+        return None, True
+
+    doc.po_type = routed
     doc.po_number = found.po_number or po_number
+    if not doc.vendor_name and found.vendor_name:
+        doc.vendor_name = found.vendor_name
     session.add(doc)
     session.commit()
 
-    blocked_code, blocked = po_reuse.blocking(found, doc.invoice_number)
-
-    if choice == po_reuse.CHOICE_EXISTING:
-        if blocked:
-            # The PO changed between being offered and being chosen, or someone
-            # invoiced it in the meantime. Refusing beats posting anyway.
-            _fail(session, doc, blocked_code, error=blocked)
-            return None, True
-        print(f"[PIPE] {doc.id} reusing {po_reuse.describe(found)}")
-        return found.raw, False
-
-    if blocked:
-        # Nothing to ask: neither answer would help. A new PO is not the fix for
-        # an invoice that has already been posted against this one.
-        _fail(session, doc, blocked_code, error=blocked)
+    # Closed/cancelled POs cannot be verified. Same invoice already on the PO
+    # is fine — that is the VI we are about to check.
+    if found.is_dead:
+        _fail(
+            session,
+            doc,
+            po_reuse.BLOCK_CLOSED,
+            error=(
+                f"PO {found.po_number} exists in Tekion but is "
+                f"{found.status.lower()}"
+            ),
+        )
         return None, True
 
-    job_queue.hold_for_po_decision(
-        session,
-        doc,
-        found,
-        # The card beside this spells out the choice; the row only needs to say
-        # which PO it is about.
-        po_reuse.describe(found),
+    print(
+        f"[PIPE] {doc.id} verifying against {po_reuse.describe(found)} "
+        f"as {routed} (no PO created, no pre-invoice)"
     )
-    return None, True
+    return po_reuse.as_pre_invoice_po(found), False
 
 
 def _chart_by_number(dealer_id: str, session: Session) -> dict[str, str]:
@@ -1417,409 +1720,19 @@ def _run_purchase_order(
     ocr: dict[str, Any],
     session: Session,
     source_path: str | None = None,
+    existing_po: dict[str, Any] | None = None,
 ) -> None:
-    """Build the typed PO request from OCR and hand it to the existing flow.
-
-    `source_path` is the invoice file. The PO flow uploads it to Tekion's media
-    service and attaches it to the pre-invoice, which is the same thing a clerk
-    does by hand after creating the PO.
-    """
-    from fastapi import HTTPException
-
-    from api.models.schemas import (
-        CreateMiscPoRequest,
-        GlSplitInput,
-        CreateStockPoRequest,
-        CreateSubletPoRequest,
-        MiscLineItem,
-        StockPartInput,
-        SubletLineItem,
+    """Hard-disabled: PO_INVOICE uses ``_run_vi_verify`` (no PO create / pre-invoice)."""
+    _fail(
+        session,
+        doc,
+        EX_TEKION_REJECTED,
+        error=(
+            "Creating a purchase order from this app is turned off. Raise and "
+            "pre-invoice the PO in Tekion first, then upload the invoice for "
+            "Vendor Invoice verification."
+        ),
     )
-    from api.routes.tekion import _create_misc_po, _create_stock_po, _create_sublet_po, _resolve_dealer, get_client
-    from api.services.job_matching import match_line_items_to_jobs
-
-    total = ocr_helpers.get_total_amount(ocr)
-    sales_tax = ocr_helpers.get_sales_tax(ocr)
-    line_items = ocr_helpers.get_raw_line_items(ocr)
-
-    # What a person corrected on "Re-run & manual edit" outranks what was read,
-    # as on OEM: the invoice number, and the GL accounts with their amounts
-    # (applied where the GL lines are chosen, below).
-    corrected = manual_overrides(doc) if doc.po_type == FOLDER_MISC else {}
-    if str(corrected.get("invoice_number") or "").strip():
-        doc.invoice_number = str(corrected["invoice_number"]).strip()
-    corrected_gl = [
-        {"gl_account": str(account).strip().upper(), "amount": amount, "description": None}
-        for account, amount in (
-            (a, signed_amount(v)) for a, v in (corrected.get("gl_annotations") or {}).items()
-        )
-        if str(account).strip() and amount is not None
-    ]
-    if corrected:
-        print(
-            f"[PIPE] {doc.id} Misc corrections applied: number={doc.invoice_number!r} "
-            f"gl={[(g['gl_account'], g['amount']) for g in corrected_gl]}"
-        )
-
-    # ── MISC: posts straight away, like every other folder ────────────────
-    #
-    # Misc used to stop at AWAITING_REVIEW until a person approved the draft
-    # (dc7b655). It no longer waits: an upload goes to Tekion on the lines
-    # read off the invoice, the same as the other folders.
-    #
-    # A document that was ALREADY held for review before this change can still
-    # be approved, and then posts what the person approved -- so nothing that
-    # was waiting is stranded.
-    review: dict[str, Any] | None = None
-    if doc.po_type == FOLDER_MISC and doc.review_approved:
-        # Approved: post what the person approved, not what OCR first read.
-        review = misc_review.load(doc.review_draft)
-        approved_fields = review.get("fields") or {}
-        total = misc_review._money(approved_fields.get("invoiceAmount")) or total
-        sales_tax = misc_review._money(approved_fields.get("salesTax"))
-        doc.vendor_name = approved_fields.get("vendorName") or doc.vendor_name
-        doc.invoice_number = approved_fields.get("invoiceNumber") or doc.invoice_number
-        session.add(doc)
-        session.commit()
-
-    if not doc.vendor_name or not total:
-        _fail(session, doc, EX_MISSING_FIELD, error="missing vendor name or total amount")
-        return
-
-    # The purchase order must be worth exactly what the pre-invoice posts
-    # against it. The PO is built from OCR's line items while the pre-invoice
-    # uses the grand total less tax, and Tekion rejects the invoice outright
-    # ("unable to update PO") when the two disagree — after the PO has already
-    # been created, leaving an orphan.
-    #
-    # OCR line items are the unreliable half: a missed row or an unreadable
-    # unit price silently shrinks the PO. When they do not reconcile, fall back
-    # to a single line for the correct amount — less itemised, but truthful
-    # about what is owed, and it matches what the existing flow already does
-    # when OCR finds no line items at all.
-    # The rows AS READ, before the reconciliation below is allowed to discard
-    # them. A sublet invoice's repair order numbers live on these rows, and
-    # collapsing to a single line -- which is the right answer for the PO total
-    # -- would throw them away and leave the document reporting that it has no
-    # repair orders, when it plainly has eight written on it.
-    rows_as_read = list(line_items)
-
-    expected_po_total = round(total - sales_tax, 2)
-    line_total = round(sum(i["qty"] * i["unitPrice"] for i in line_items), 2)
-    if line_items and abs(line_total - expected_po_total) > 0.01:
-        print(
-            f"[PIPE] {doc.id} line items total {line_total} but invoice is "
-            f"{expected_po_total} (net of {sales_tax} tax) — using a single line"
-        )
-        line_items = []
-    elif line_items:
-        print(f"[PIPE] {doc.id} line items reconcile to {line_total}")
-
-    common = {
-        "dealership_name": doc.dealership_name,
-        "vendor_name": doc.vendor_name,
-        "vendor_codes": ocr_helpers.get_vendor_codes(ocr),
-        "invoice_number": doc.invoice_number,
-        "invoice_amount": total,
-        "sales_tax": sales_tax,
-        # Attached to the pre-invoice by the PO flow. Stock orders have no
-        # pre-invoice, so it is simply unused there.
-        "invoice_file_path": source_path,
-    }
-
-    existing_po, stop = _resolve_existing_po(doc, ocr, session)
-    if stop:
-        return
-
-    try:
-        if doc.po_type == FOLDER_SUBLET:
-            # Sublet invoices do not carry a trustworthy RO number, so the RO
-            # is found by VIN instead: switch to the invoice's dealership,
-            # search for repair orders on that VIN, and take the most recent
-            # one that is still open. Each job on that RO is then matched
-            # against the invoice's line-item descriptions by the LLM, using
-            # the job's captured concern + tech story text — the OCR'd RO
-            # number is no longer used at all.
-            #
-            # None of it applies to a PO somebody else already raised: that PO
-            # carries its own RO and job, and searching for another would at
-            # best find the same one and at worst fail the document over a step
-            # its outcome does not depend on.
-            if existing_po:
-                req = CreateSubletPoRequest(**common, line_items=[])
-                with tekion_scope():
-                    response = _create_sublet_po(req, session, existing_po=existing_po)
-                _finish_purchase_order(doc, response, session)
-                return
-
-            # THE INVOICE NAMES ITS OWN REPAIR ORDERS.
-            #
-            # The VIN search below exists because a sublet invoice usually bills
-            # one car and does not say which repair order it was, so the RO has
-            # to be found from the vehicle. Some vendors do say: a body shop
-            # billing eight cars at once writes the RO beside each row, because
-            # the invoice would be unreadable otherwise.
-            #
-            # When they are there, use them. They are better evidence than the
-            # VIN search is -- the clerk wrote down the RO this work was done
-            # on, rather than us inferring it from the most recent open RO on a
-            # vehicle -- and a page listing eight cars has no single VIN for the
-            # search to start from at all.
-            # From the rows as read: see rows_as_read. A sublet invoice whose
-            # prices failed to reconcile still names its repair orders, and the
-            # orders are what this path needs.
-            written_ros = [str(item.get("roNumber") or "") for item in rows_as_read]
-            if rows_as_read and all(written_ros):
-                with tekion_scope():
-                    client = get_client(session)
-                    _resolve_dealer(client, doc.dealership_name)
-                    items, problem = _sublet_items_from_written_ros(
-                        client, rows_as_read, written_ros
-                    )
-                if problem:
-                    _fail(session, doc, EX_TEKION_REJECTED, error=problem)
-                    return
-
-                # These lines come from the rows AS READ, not the reconciled
-                # ones, so nothing has yet made them add up. The purchase order
-                # is created first and the pre-invoice for the invoice total
-                # after it -- Tekion refuses a pre-invoice worth a different
-                # amount than its PO, leaving the PO behind as an orphan. Check
-                # before either is sent.
-                lines_total = round(
-                    sum((it.labor_amount or 0.0) + (it.parts_amount or 0.0) for it in items), 2
-                )
-                if round(abs(lines_total - expected_po_total), 2) > 0.01:
-                    _fail(
-                        session,
-                        doc,
-                        EX_AMOUNT_MISMATCH,
-                        error=(
-                            f"The repair order lines on this invoice add up to "
-                            f"${lines_total:,.2f}, but the invoice is "
-                            f"${expected_po_total:,.2f} before tax. Nothing was sent to "
-                            "Tekion — check the amounts read from each row, correct "
-                            "them, and run it again."
-                        ),
-                    )
-                    return
-
-                req = CreateSubletPoRequest(**common, line_items=items)
-                with tekion_scope():
-                    response = _create_sublet_po(req, session)
-                _finish_purchase_order(doc, response, session)
-                return
-
-            if not doc.vin:
-                _fail(
-                    session,
-                    doc,
-                    EX_MISSING_FIELD,
-                    error=(
-                        "this sublet invoice has no VIN and no repair order "
-                        "number on its rows, so there is nothing to attach the "
-                        "work to"
-                    ),
-                )
-                return
-
-            with tekion_scope():
-                client = get_client(session)
-                _resolve_dealer(client, doc.dealership_name)
-                ro = client.find_latest_open_ro_by_vin(doc.vin)
-                if not ro:
-                    _fail(session, doc, EX_TEKION_REJECTED, error=f"no open RO found for VIN {doc.vin}")
-                    return
-                jobs = client.get_ro_job_details(ro["id"])
-                if not jobs:
-                    _fail(session, doc, EX_TEKION_REJECTED, error=f"no jobs found on RO for VIN {doc.vin}")
-                    return
-
-                descriptions = [item["description"] or "Sublet repair" for item in line_items] or ["Sublet repair"]
-                job_numbers = match_line_items_to_jobs(descriptions, jobs)
-                ro_number = ro.get("roNo") or ""
-
-                if line_items:
-                    items = [
-                        SubletLineItem(
-                            ro_number=ro_number,
-                            job_number=job_numbers[i],
-                            description=item["description"] or "Sublet repair",
-                            labor_amount=0.0,
-                            parts_amount=item["totalPrice"] or item["unitPrice"],
-                        )
-                        for i, item in enumerate(line_items)
-                    ]
-                else:
-                    items = [
-                        SubletLineItem(
-                            ro_number=ro_number,
-                            job_number=job_numbers[0],
-                            description="Sublet repair",
-                            labor_amount=0.0,
-                            parts_amount=expected_po_total,
-                        )
-                    ]
-
-                req = CreateSubletPoRequest(**common, line_items=items)
-                response = _create_sublet_po(req, session)
-
-        elif doc.po_type == FOLDER_STOCK:
-            req = CreateStockPoRequest(
-                **common,
-                parts=[
-                    StockPartInput(
-                        part_number=item["description"],
-                        part_name=item["description"],
-                        qty=item["qty"],
-                        unit_price=item["unitPrice"],
-                        brand_code="",
-                    )
-                    for item in line_items
-                ],
-            )
-            with tekion_scope():
-                response = _create_stock_po(req, session)
-
-        else:  # MISCELLANEOUS
-            # A credit row -- a core return read as qty -1 or price -16.00 --
-            # cannot be a purchase order line: Tekion refuses the whole order
-            # ("items[0].qty must be greater than or equal to 0"). The rows
-            # still add up, so itemising looked safe; post the single line for
-            # the total instead, as Misc already does when rows don't add up.
-            if any(
-                (item.get("qty") or 0) < 0 or (item.get("unitPrice") or 0) < 0
-                for item in line_items
-            ):
-                print(
-                    f"[PIPE] {doc.id} a line is a credit (core return or similar) — "
-                    f"using a single line for {expected_po_total}"
-                )
-                line_items = []
-            misc_items = [
-                MiscLineItem(
-                    part_name=item["description"] or "Misc purchase",
-                    qty=item["qty"],
-                    unit_price=item["unitPrice"],
-                    gl_account=item.get("glAccount") or None,
-                )
-                for item in line_items
-            ] or [
-                MiscLineItem(
-                    part_name=f"Invoice {doc.invoice_number}" if doc.invoice_number else "Misc purchase",
-                    qty=1.0,
-                    unit_price=expected_po_total,
-                )
-            ]
-            if review is not None:
-                # What a person approved. Every line is posted as its own split
-                # with its own control, and against the account's REAL Tekion id
-                # from the chart rather than one built from the number.
-                chart = _chart_by_number(review.get("dealerId") or "", session)
-                splits = [
-                    GlSplitInput(
-                        gl_account=line["glAccount"],
-                        amount=line["amount"],
-                        description=line.get("description") or None,
-                        control=line.get("control") or None,
-                        account_id=chart.get(line["glAccount"]),
-                    )
-                    for line in review.get("lines") or []
-                ]
-                # Consumed here, before the call: whatever Tekion answers, this
-                # approval has now been used.
-                doc.review_approved = False
-                session.add(doc)
-                session.commit()
-            else:
-                # A person's corrections first, then what is written on the
-                # invoice -- see get_gl_amount_splits.
-                splits = [
-                    GlSplitInput(
-                        gl_account=sp["gl_account"],
-                        amount=sp["amount"],
-                        description=sp["description"],
-                    )
-                    for sp in (corrected_gl or ocr_helpers.get_gl_amount_splits(ocr))
-                ]
-                # Never guess the account, as on OEM. With nothing written, Misc
-                # used to fall back to accounts beside the rows and then to one
-                # chosen from the item descriptions. On staging 57 of 57 Misc
-                # invoices had their accounts written, so the guess only ever
-                # stood in for a miss. Reads from before posting_lines keep the
-                # old path.
-                if not splits and ocr_helpers.has_posting_lines(ocr):
-                    _fail(
-                        session,
-                        doc,
-                        EX_NO_GL_WRITTEN,
-                        error=(
-                            "No GL account was found written on this invoice, so nothing "
-                            "was posted. Add the account and amount on the correction "
-                            "form and run it again."
-                        ),
-                    )
-                    return
-
-            # The GL lines must add up to the invoice before anything is sent.
-            # Misc used to have a person approve every draft, and that was the
-            # only check; with the review gone (781c61f) a $112.64 invoice read
-            # as a $16 credit went to Tekion with a 2410 line of 112.64 against
-            # A/P of 16.00. Either total is accepted -- clerks split the whole
-            # invoice, or only the goods when tax is posted on its own.
-            if splits:
-                split_total = round(sum(float(sp.amount) for sp in splits), 2)
-                # Rounded before comparing: 112.64 - 112.63 is 0.0100000000005
-                # in floating point, which would refuse a one-cent difference.
-                if all(
-                    round(abs(split_total - target), 2) > 0.01
-                    for target in (round(total, 2), round(expected_po_total, 2))
-                ):
-                    before_tax = (
-                        f" (${expected_po_total:,.2f} before tax)" if sales_tax else ""
-                    )
-                    _fail(
-                        session,
-                        doc,
-                        EX_AMOUNT_MISMATCH,
-                        error=(
-                            f"The GL lines on this invoice add up to ${split_total:,.2f}, "
-                            f"but the invoice total read is ${total:,.2f}{before_tax}. "
-                            "Nothing was sent to Tekion. Check the total and the GL "
-                            "lines, correct them, and run it again."
-                        ),
-                    )
-                    return
-
-            req = CreateMiscPoRequest(
-                **common,
-                line_items=misc_items,
-                gl_splits=splits,
-            )
-            with tekion_scope():
-                response = _create_misc_po(req, session, existing_po=existing_po)
-
-    except HTTPException as e:
-        # An HTTPException here is Tekion (or our own validation) saying no:
-        # a 422 for an unmapped vendor, a 404 for a missing RO. None of that
-        # becomes true on a retry, so these are terminal — retrying would only
-        # re-run OCR and get the same answer three times.
-        detail = e.detail if isinstance(e.detail, dict) else {}
-        reason = str(detail.get("reason", "") or e.detail)
-        print(f"[PIPE] {doc.id} PO rejected: {reason}")
-        _fail(
-            session,
-            doc,
-            EX_VENDOR_NOT_FOUND if "mapping" in reason else EX_TEKION_REJECTED,
-            error=reason,
-        )
-        return
-    except Exception as e:  # noqa: BLE001
-        print(f"[PIPE] {doc.id} PO creation failed: {e}")
-        _fail(session, doc, EX_TEKION_ERROR, error=str(e))
-        return
-
-    _finish_purchase_order(doc, response, session)
 
 
 def _sublet_items_from_written_ros(

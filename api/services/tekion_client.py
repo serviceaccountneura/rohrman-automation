@@ -99,6 +99,8 @@ class TekionApiClient:
         self.dealers: list[dict[str, str]] = []
         self._db: Session | None = db_session
         self._logged_in = False
+        # dealerId -> IANA tz from dealerMaster (e.g. America/Chicago).
+        self._dealer_tz_by_id: dict[str, str] = {}
 
     @property
     def current_dealer_id(self) -> str:
@@ -468,10 +470,37 @@ class TekionApiClient:
         """Fetch the current dealer's default address from the bootstrap endpoint."""
         res = self._req_json("/api/api-platform/u/bootstrap")
         dm = (res.get("data") or {}).get("dealerMaster") or {}
+        # Cache timezone while we have dealerMaster — used for JE scheduledTime.
+        tz = str(dm.get("timeZone") or "").strip()
+        if tz and self.dealer_id:
+            self._dealer_tz_by_id[str(self.dealer_id)] = tz
         addresses = dm.get("dealerAddress") or []
         if not addresses:
             raise Exception(f"No dealer address found for dealer {self.dealer_id}")
         return addresses[0]
+
+    def get_dealer_timezone(self) -> str:
+        """IANA timezone for the current dealership (Tekion dealerMaster.timeZone).
+
+        Used when converting a calendar invoice date to epoch ms for JE
+        `scheduledTime` / pre-invoice dates. Falls back to America/Chicago
+        (Rohrman IL stores) if Tekion does not return a value.
+        """
+        fallback = "America/Chicago"
+        dealer_id = str(self.dealer_id or "")
+        cached = self._dealer_tz_by_id.get(dealer_id)
+        if cached:
+            return cached
+        try:
+            res = self._req_json("/api/api-platform/u/bootstrap")
+            dm = (res.get("data") or {}).get("dealerMaster") or {}
+            tz = str(dm.get("timeZone") or "").strip()
+            if tz and dealer_id:
+                self._dealer_tz_by_id[dealer_id] = tz
+                return tz
+        except Exception as exc:  # noqa: BLE001
+            print(f"[API] dealer timezone fetch failed ({exc}); using {fallback}")
+        return fallback
 
     def fetch_gl_accounts(self) -> list[dict[str, Any]]:
         """Fetch GL accounts for the current dealership from Tekion.
@@ -535,6 +564,8 @@ class TekionApiClient:
         file_path: str,
         mime_type: str | None = None,
         display_name: str | None = None,
+        module_name: str | None = None,
+        service_name: str | None = None,
     ) -> str:
         """Upload a document to Tekion's media service.
 
@@ -547,14 +578,20 @@ class TekionApiClient:
         filename — the caller usually holds the bytes in a temp file, and
         "tmp8h24mg32.jpg" means nothing to whoever opens the PO later.
 
+        `module_name` / `service_name` tag the upload for the destination
+        screen. Journal Entry capture (oem-je) sends ACCOUNTING / Journal Entry;
+        PO / Vendor Invoice uploads leave them unset.
+
         Flow:
           1. POST /api/media-v3/u/v2/initiate-upload → get presigned S3 URL + mediaId
           2. PUT the file directly to S3
           3. Poll GET /api/media-v3/u/upload-status/{mediaId} until COMPLETED
           4. POST /api/media-v3/u/v2/presignedurls → confirm upload
 
-        Returns the mediaId (used in preInvoice attachments).
+        Returns the mediaId (used in preInvoice / JE assetAttachmentDto).
         """
+        from urllib.parse import urlencode
+
         file_name = display_name or os.path.basename(file_path)
         # Tekion only previews PDFs. Convert anything else first, and keep the
         # converted file alive until the upload finishes.
@@ -565,22 +602,29 @@ class TekionApiClient:
 
         # Step 1: Initiate upload
         print(f"[API] Uploading {file_name} ({content_length} bytes)...")
+        initiate_body: dict[str, Any] = {
+            "generateThumbnail": False,
+            "folderName": "",
+            "globalMedia": False,
+            "stripMetadata": False,
+            "hlsVideoEnabled": False,
+            "moduleType": "CDMS",
+            "compressionEnabled": False,
+            "mimeType": mime_type,
+            "fileName": file_name,
+            "contentLength": content_length,
+            "fragment": False,
+        }
+        # Captured on the JE attach screen — without these Tekion still accepts
+        # the upload, but the draft's assetAttachmentDto is how the file shows.
+        if module_name:
+            initiate_body["moduleName"] = module_name
+        if service_name:
+            initiate_body["serviceName"] = service_name
         res = self._req_json(
             "/api/media-v3/u/v2/initiate-upload",
             method="POST",
-            body={
-                "generateThumbnail": False,
-                "folderName": "",
-                "globalMedia": False,
-                "stripMetadata": False,
-                "hlsVideoEnabled": False,
-                "moduleType": "CDMS",
-                "compressionEnabled": False,
-                "mimeType": mime_type,
-                "fileName": file_name,
-                "contentLength": content_length,
-                "fragment": False,
-            },
+            body=initiate_body,
         )
         upload_data = (res.get("data") or {})
         s3_url = upload_data.get("url", "")
@@ -614,9 +658,19 @@ class TekionApiClient:
                 raise Exception(f"Upload failed for mediaId={media_id}")
             time.sleep(1)
 
-        # Step 4: Confirm via presignedurls
+        # Step 4: Confirm via presignedurls (JE capture adds module query params)
+        confirm_path = "/api/media-v3/u/v2/presignedurls"
+        if module_name or service_name:
+            qs = urlencode(
+                {
+                    "attachment": "false",
+                    **({"moduleName": module_name} if module_name else {}),
+                    **({"serviceName": service_name} if service_name else {}),
+                }
+            )
+            confirm_path = f"{confirm_path}?{qs}"
         self._req_json(
-            "/api/media-v3/u/v2/presignedurls",
+            confirm_path,
             method="POST",
             body=[media_id],
         )
@@ -1168,8 +1222,13 @@ class TekionApiClient:
         else:
             invoice_date_ms = None
         if not invoice_date_ms:
+            # Calendar day at dealer-TZ midnight — not UTC (avoids −1 day in Central).
+            from api.services.je_creation import invoice_date_to_epoch_ms
+
             date_str = invoice_date or datetime.now(tz=timezone.utc).strftime("%m/%d/%Y")
-            invoice_date_ms = int(datetime.strptime(date_str, "%m/%d/%Y").replace(tzinfo=timezone.utc).timestamp() * 1000)
+            invoice_date_ms = invoice_date_to_epoch_ms(
+                date_str, tz_name=self.get_dealer_timezone()
+            )
         print(f"[API] Invoice date: {datetime.fromtimestamp(invoice_date_ms / 1000, tz=timezone.utc).strftime('%m/%d/%Y')}")
 
         # Step 2: Get due date
