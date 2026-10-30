@@ -1,0 +1,976 @@
+"""Vehicle manufacturer invoice -> Auto Posting journal entry.
+
+The fifth flow. A manufacturer invoice (Kia, Ford, Honda, Toyota) is downloaded
+from the manufacturer's site, annotated by hand, and dropped into the Vehicle
+Manufacturing folder. This turns it into a journal entry.
+
+HOW THIS DIFFERS FROM THE OEM FLOW
+    `je_creation.py` builds a *manual* entry: journal 76, two sides, the debit
+    split per part. Every line is derived from the invoice total.
+
+    A vehicle invoice is not shaped like that. One car produces seven lines
+    across inventory, notes payable, holdback receivable, incentive receivable
+    and internal fee accounts -- and which lines appear is a property of the
+    MANUFACTURER, not of the invoice total. So the entry is driven by a
+    per-manufacturer template instead:
+
+        journal 70          VEHICLE PURCHASES
+        document type 8     Vehicle Purchase Invoice
+        reference type      Stock Number
+        template            whichever auto-posting template at THAT dealership
+                            posts to journal 70 -- found by journal, not by
+                            name, because every store names its own
+
+WHAT COMES FROM WHERE
+    Printed on the invoice   VIN, dealer cost total, MSRP, options, freight
+    Written by hand          stock number, GL account numbers, and the amounts
+                             that are not printed (holdback, incentives, fees)
+
+    The handwriting is not a fallback -- it is the parts/accounting clerk
+    telling us values the manufacturer does not print. Ford's holdback is the
+    last 8 of the VIN against a computed amount; Honda's attachments change
+    monthly. That is why the meeting settled on "the human writes it on the
+    invoice and the AI reads it" rather than on parsing every manufacturer's
+    layout.
+
+THE ACCOUNTS ARE NOT OURS TO CHOOSE
+    An earlier version of this module carried a hardcoded set of GL accounts per
+    manufacturer. That was backwards, and it is gone.
+
+    Each dealership's own journal-70 auto-posting template already lists the
+    accounts that store posts to. The clerk annotating the invoice writes those
+    same account numbers on the page, with an arrow to the amount each one
+    takes: "2245" against KAC0780KAC means 780.00 belongs in holdback
+    receivable. So building the entry is a JOIN between the template and the
+    handwriting -- see api/services/vmi_template.py -- and the same code serves
+    Kia, Ford, Honda and Toyota without a per-make table.
+
+    What still refuses: an annotation naming an account the template has no line
+    for, and an entry that does not balance. Both mean money would land
+    somewhere nobody asked for, and a wrong journal entry is worse than none,
+    because nobody goes looking for one that already exists.
+
+THE WRITE PATH, FROM THE CAPTURE
+    Templates   POST /api/accounting/u/v2/transaction/upc/templates
+                {"templateTypes": ["DEFAULT"]}
+    Save draft  POST /api/accounting/u/v2/transaction/dealer/{id}/draft
+
+    Applying a template turned out to be client-side pre-fill only: the saved
+    transaction comes back with `templateId: null`. So the template decides
+    which lines exist, and the save is the same plain draft call the manual
+    journal entry already uses. There is no third call to make.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+from api.services.je_creation import (
+    Discrepancy,
+    JournalEntryService,
+    _parse_date,
+)
+from api.services import vmi_template
+from api.services.tekion_client import TekionApiClient
+
+# ── Tekion coordinates for this flow ─────────────────────────────────────────
+
+# The auto-posting template is found by its JOURNAL, never by its name. Every
+# dealership maintains its own templates with its own naming, so there is no one
+# name to look for -- but exactly one of them posts to journal 70, and that is
+# the one this flow wants. Matching on a name would work at one store and
+# silently pick the wrong template, or none, at the other eighteen.
+JOURNAL_NUMBER = "70"  # VEHICLE PURCHASES
+DOCUMENT_TYPE_SUFFIX = "document_type_8"  # Vehicle Purchase Invoice
+
+# From the capture, not a guess. The transaction's own refType is CUSTOM; the
+# per-line refType comes from the template and is VEHICLE on the vehicle
+# accounts, CUSTOM elsewhere. An earlier version sent "STOCK_NUMBER" for both,
+# which Tekion does not use anywhere in this flow.
+TRANSACTION_REF_TYPE = "CUSTOM"
+LINE_REF_TYPE_VEHICLE = "VEHICLE"
+LINE_REF_TYPE_CUSTOM = "CUSTOM"
+
+_SAVE_DRAFT_METHOD = "POST"
+_SAVE_DRAFT_PATH = "/api/accounting/u/v2/transaction/dealer/{dealer_id}/draft"
+
+# The dealership's auto-posting templates. Body {"templateTypes": ["DEFAULT"]}.
+_TEMPLATES_PATH = "/api/accounting/u/v2/transaction/upc/templates"
+
+# Some dealerships keep more than one template on journal 70 -- 1707 has both
+# "NEW VEHICLE" and "2024 HONDA PROLOGUE". Journal number alone does not
+# identify one there, so name the intended template per dealer here. Without an
+# entry the flow refuses and lists the candidates rather than picking one.
+# Add a store only when it genuinely keeps two journal-70 templates. An entry
+# was once made here for 1707 while processing a KIA invoice, because the dealer
+# switch above was missing and Kia was reading Honda's templates; Schaumburg Kia
+# has exactly one journal-70 template, "BILL", and needs no entry.
+TEMPLATE_PREFERENCE: dict[str, str] = {
+    # Schaumburg Honda. "2024 HONDA PROLOGUE" is a template for that one model;
+    # an ordinary new-vehicle invoice belongs on "NEW VEHICLE".
+    "1707": "NEW VEHICLE",
+}
+
+# The internal DOC fee, per dealership. It is not printed on the invoice, not
+# annotated, and not preset in every store's template -- Schaumburg Honda has it
+# in the template at 380.00, Schaumburg Kia leaves the line at zero -- so the
+# figure has to live somewhere, and a named constant beats a number appearing
+# inside the posting logic.
+#
+# Confirmed for 1710 only. A store that is not listed simply gets no DOC fee
+# lines, which is the right default: inventing one would post money nobody
+# asked for.
+# Every store charges it; only some keep it in their template. Ford has it
+# preset at 380.00 and uses that; Kia and Oakbrook Toyota leave the line at zero
+# and take this figure instead. It was per-store, which meant a store nobody had
+# listed silently produced no DOC fee lines at all -- which is what happened to
+# Oakbrook Toyota.
+DEFAULT_DOC_FEE = 380.00
+
+# Only for a store that genuinely differs from the default.
+STORE_DOC_FEE: dict[str, float] = {}
+
+_REF_TEXT_MAX = 50
+
+
+# ── Control numbers ──────────────────────────────────────────────────────────
+#
+# Each posting line carries a control value, and which one is a property of the
+# line. On the Kia sample: holdback keys off the last six of the VIN, the
+# incentive receivable off the full VIN, everything else off the stock number.
+
+
+class Control:
+    STOCK = "STOCK"
+    FULL_VIN = "FULL_VIN"
+    LAST_SIX_VIN = "LAST_SIX_VIN"
+    LAST_EIGHT_VIN = "LAST_EIGHT_VIN"
+
+
+def resolve_control(kind: str, facts: VehicleInvoiceFacts) -> str:
+    if kind == Control.STOCK:
+        return facts.stock_number
+    if kind == Control.FULL_VIN:
+        return facts.vin
+    if kind == Control.LAST_SIX_VIN:
+        return facts.vin[-6:] if len(facts.vin) >= 6 else ""
+    if kind == Control.LAST_EIGHT_VIN:
+        return facts.vin[-8:] if len(facts.vin) >= 8 else ""
+    raise ValueError(f"unknown control kind {kind!r}")
+
+
+# ── What we read off one invoice ─────────────────────────────────────────────
+
+
+@dataclass
+class VehicleInvoiceFacts:
+    """Everything a template is allowed to draw on.
+
+    Split by provenance on purpose. `printed` values can be re-read from the PDF
+    at any time; `annotated` values exist only because a person wrote them down,
+    so a missing one is a human step that did not happen -- a different problem
+    with a different fix, and the error message should say so.
+    """
+
+    # Identity.
+    invoice_number: str
+    invoice_date: str  # MM/DD/YYYY
+    dealership_name: str
+    manufacturer: str
+
+    vin: str = ""
+    stock_number: str = ""
+
+    # Printed on the invoice.
+    dealer_cost_total: float = 0.0
+    msrp_total: float = 0.0
+
+    # Written on the invoice by hand. Keyed by the name a template asks for.
+    annotated_amounts: dict[str, float] = field(default_factory=dict)
+    # GL account numbers written on the invoice, in the order they were found.
+    annotated_gl_accounts: list[str] = field(default_factory=list)
+    # For display only: {GL account -> amount}. An account written twice keeps
+    # only the last figure, which is why it is not what posts.
+    gl_annotations: dict[str, float] = field(default_factory=dict)
+    # THE REAL INPUT. Every account written on the invoice, in reading order,
+    # with the sign that was on the page and the word written beside it.
+    # Schaumburg Honda writes 2248 three times on one invoice -- DMA, HTB and
+    # FLOORASST -- against three separate 2248 lines in its template, and the
+    # label is the only thing that tells them apart.
+    gl_annotation_lines: list[vmi_template.GlAnnotation] = field(default_factory=list)
+    # Amounts the MANUFACTURER printed in cents with no decimal point, already
+    # divided by 100. Honda's "42800 4400 85590" beside MSRP is 428.00, 44.00
+    # and 855.90. Only ever consulted for a template line the handwriting left
+    # empty -- see where the holdback fallback is built.
+    coded_amounts: list[float] = field(default_factory=list)
+    # Accounts written on the invoice that OCR could not tie to a figure. Not a
+    # detail: an account a person wrote and the system dropped means the entry
+    # is short a line, and posting the rest is worse than posting nothing.
+    unpriced_gl_accounts: list[str] = field(default_factory=list)
+    # What OCR says each amount was read from ("PPO RESERVE"). Used to check
+    # the pairing against the account's own name -- see repair_by_label.
+    gl_annotation_labels: dict[str, str] = field(default_factory=dict)
+    # Accounts whose amount was pulled out of a sentence rather than off a
+    # labelled figure. Refused rather than posted -- see the guard below.
+    prose_sourced_accounts: list[str] = field(default_factory=list)
+
+    def amount(self, key: str) -> float | None:
+        value = self.annotated_amounts.get(key)
+        return None if value is None else round(float(value), 2)
+
+
+# ── Templates ────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class TemplateLine:
+    """One posting line.
+
+    `amount` is a callable rather than a number because most lines are derived:
+    the inventory debit is the dealer cost less the holdback, not a figure
+    printed anywhere. Returning None means "this line does not apply to this
+    invoice" and the line is dropped -- an invoice with no incentive should not
+    post a zero-dollar incentive line.
+    """
+
+    gl_number: str
+    control: str
+    amount: Callable[[VehicleInvoiceFacts], float | None]
+    description: str
+    # VEHICLE on the vehicle accounts (inventory, floor plan), CUSTOM on the
+    # rest. Tekion's own templates set this per line, so we do too.
+    ref_type: str = LINE_REF_TYPE_CUSTOM
+
+
+@dataclass
+class ManufacturerTemplate:
+    name: str
+    # Amount keys a human must have written on the invoice.
+    requires: tuple[str, ...]
+    lines: tuple[TemplateLine, ...]
+    # Set when the template is registered but not yet specified.
+    unspecified_reason: str = ""
+
+
+def _kia_lines() -> tuple[TemplateLine, ...]:
+    """The seven lines of the Kia entry, from the sample.
+
+    Invoice 1001948819 / stock SK6459, dealer cost $32,133.00:
+
+        2245  HOLDBACK RECEIVABLE KIA       +   780.00   last six of VIN
+        3300  N/P NEW VEHICLE & DEMOS       -32,133.00   stock
+        2320  NEW INV - KIA                 +31,353.00   stock
+        2102  KRS RECEIVABLE                +   290.00   full VIN
+        8011  KIA RETAIL SUPPORT INCOME     -   290.00   stock
+        2320  NEW INV - KIA                 +   380.00   stock
+        30000 Internal DOC fee payable      -   380.00   stock
+
+    Three pairs and a split. The note payable is credited the whole dealer cost;
+    that cost then lands as inventory (2320) plus holdback receivable (2245),
+    which is why the inventory line is cost MINUS holdback rather than cost. The
+    incentive and the DOC fee are each a debit/credit pair that nets to zero, so
+    they move the money without changing the total.
+    """
+
+    def holdback(f: VehicleInvoiceFacts) -> float | None:
+        return f.amount("holdback")
+
+    def note_payable(f: VehicleInvoiceFacts) -> float | None:
+        return -f.dealer_cost_total if f.dealer_cost_total else None
+
+    def inventory(f: VehicleInvoiceFacts) -> float | None:
+        hb = f.amount("holdback")
+        if not f.dealer_cost_total or hb is None:
+            return None
+        return round(f.dealer_cost_total - hb, 2)
+
+    def krs(f: VehicleInvoiceFacts) -> float | None:
+        return f.amount("krs")
+
+    def krs_income(f: VehicleInvoiceFacts) -> float | None:
+        value = f.amount("krs")
+        return None if value is None else -value
+
+    def doc_fee(f: VehicleInvoiceFacts) -> float | None:
+        return f.amount("doc_fee")
+
+    def doc_fee_payable(f: VehicleInvoiceFacts) -> float | None:
+        value = f.amount("doc_fee")
+        return None if value is None else -value
+
+    V, C = LINE_REF_TYPE_VEHICLE, LINE_REF_TYPE_CUSTOM
+    return (
+        TemplateLine("2245", Control.LAST_SIX_VIN, holdback, "Holdback receivable", C),
+        TemplateLine("3300", Control.STOCK, note_payable, "N/P new vehicle", V),
+        TemplateLine("2320", Control.STOCK, inventory, "New inventory", V),
+        TemplateLine("2102", Control.FULL_VIN, krs, "KRS receivable", C),
+        TemplateLine("8011", Control.STOCK, krs_income, "Retail support income", C),
+        TemplateLine("2320", Control.STOCK, doc_fee, "New inventory - DOC fee", V),
+        TemplateLine("30000", Control.STOCK, doc_fee_payable, "Internal DOC fee payable", C),
+    )
+
+
+_NOT_SPECIFIED = (
+    "the posting template for this manufacturer has not been specified yet. "
+    "Send an annotated invoice and the finished journal entry it should produce, "
+    "the way the Kia sample did."
+)
+
+TEMPLATES: dict[str, ManufacturerTemplate] = {
+    "KIA": ManufacturerTemplate(
+        name="KIA",
+        requires=("holdback", "krs", "doc_fee"),
+        lines=_kia_lines(),
+    ),
+    # Registered so the flow reports "not specified yet" instead of "unknown
+    # manufacturer" -- the first is a task, the second looks like a bug.
+    "FORD": ManufacturerTemplate("FORD", (), (), unspecified_reason=_NOT_SPECIFIED),
+    "HONDA": ManufacturerTemplate("HONDA", (), (), unspecified_reason=_NOT_SPECIFIED),
+    "TOYOTA": ManufacturerTemplate("TOYOTA", (), (), unspecified_reason=_NOT_SPECIFIED),
+}
+
+# Matched against the vendor name OCR read off the invoice header.
+_MANUFACTURER_PATTERNS = (
+    ("KIA", re.compile(r"\bKIA\b", re.I)),
+    ("FORD", re.compile(r"\bFORD\b", re.I)),
+    ("HONDA", re.compile(r"\bHONDA\b|\bACURA\b", re.I)),
+    ("TOYOTA", re.compile(r"\bTOYOTA\b|\bLEXUS\b", re.I)),
+)
+
+
+def detect_manufacturer(vendor_name: str, dealership_name: str = "") -> str:
+    """Which manufacturer's template applies.
+
+    The vendor name wins ("KIA AMERICA" on the header). The dealership name is
+    the fallback because a Rohrman store is named for its franchise -- "Bob
+    Rohrman Schaumburg Kia" -- which is right often enough to be useful and is
+    never used when the invoice itself says something.
+    """
+    for name, pattern in _MANUFACTURER_PATTERNS:
+        if pattern.search(vendor_name or ""):
+            return name
+    for name, pattern in _MANUFACTURER_PATTERNS:
+        if pattern.search(dealership_name or ""):
+            return name
+    return ""
+
+
+# ── Result ───────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class VehicleEntryResult:
+    dealer_id: str = ""
+    manufacturer: str = ""
+    # Which of the dealership's auto-posting templates matched journal 70.
+    # Recorded for the audit trail: the name differs at every store.
+    tekion_template_name: str = ""
+    # {GL account -> amount} as read off the invoice's handwriting.
+    gl_annotations: dict[str, float] = field(default_factory=dict)
+    # Which fields a person could supply to make this document work, set
+    # alongside every refusal.
+    #
+    # The refusal text is for reading; this is for acting on. The correction
+    # form used to guess at which inputs to show by searching the message for
+    # phrases like "stock number", which meant a reworded message silently
+    # started offering the wrong boxes. The code that decides to refuse is the
+    # only thing that actually knows.
+    #
+    # Empty means nothing a person can type will help -- a dealership with no
+    # journal-70 template needs configuring in Tekion, not a form.
+    needs: list[str] = field(default_factory=list)
+    postings: list[dict[str, Any]] = field(default_factory=list)
+    credit_total: float = 0.0
+    debit_total: float = 0.0
+    balance: float = 0.0
+    balanced: bool = False
+    problems: list[Discrepancy] = field(default_factory=list)
+    refusal: str = ""
+    transaction_id: str | None = None
+    transaction_number: str | None = None
+    journal_id: str | None = None
+    saved: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return not self.refusal and not self.problems and self.balanced
+
+
+# ── Service ──────────────────────────────────────────────────────────────────
+
+
+class VehicleJournalEntryService:
+    """Build and save the vehicle-purchase entry.
+
+    Wraps `JournalEntryService` rather than subclassing it: the GL chart lookup
+    and the balance check are identical and worth reusing, but the posting shape
+    is not, and inheriting would invite someone to call `build_postings` and get
+    a two-line parts entry with vehicle amounts in it.
+    """
+
+    def __init__(self, client: TekionApiClient) -> None:
+        self.client = client
+        self._je = JournalEntryService(client)
+
+    def resolve_gl_accounts(
+        self, template: ManufacturerTemplate
+    ) -> tuple[dict[str, dict[str, Any]], list[Discrepancy]]:
+        """Look every account the template names up in the live chart.
+
+        Resolved per dealership, never cached across them: 2320 is "NEW INV -
+        KIA" at a Kia store and something else entirely at a Ford store.
+        """
+        resolved: dict[str, dict[str, Any]] = {}
+        problems: list[Discrepancy] = []
+        for number in sorted({line.gl_number for line in template.lines}):
+            acc = self._je.find_gl_account(number)
+            if acc is None:
+                problems.append(
+                    Discrepancy(f"gl_{number}", number, "not in this dealership's chart")
+                )
+                continue
+            if not acc.get("active", True):
+                problems.append(Discrepancy(f"gl_{number}", f"{number} active", "inactive"))
+            resolved[number] = acc
+            print(f"[VMI] GL {number} -> {acc['account_id']}  {acc['account_name']}")
+        return resolved, problems
+
+    @staticmethod
+    def build_postings(
+        template: ManufacturerTemplate,
+        facts: VehicleInvoiceFacts,
+        resolved: dict[str, dict[str, Any]],
+        dealer_id: str,
+    ) -> list[dict[str, Any]]:
+        """Turn template lines into the wire format.
+
+        Amounts are DOLLARS -- the journal-entry API is the one Tekion endpoint
+        that does not use cents. Sign carries the direction and `amountCredited`
+        stays False on every line, matching the captured manual-JE payload.
+        """
+        postings: list[dict[str, Any]] = []
+        order = 0
+        for line in template.lines:
+            value = line.amount(facts)
+            if value is None or round(value, 2) == 0.0:
+                continue
+            acc = resolved.get(line.gl_number) or {}
+            control = resolve_control(line.control, facts)
+            postings.append(
+                {
+                    "dealerId": dealer_id,
+                    "glAccountId": acc.get("account_id"),
+                    "amount": round(value, 2),
+                    # CONTROLS ARE THE ONE UNVERIFIED PART. The captured draft
+                    # was a minimal test with no control values filled, so it
+                    # shows no refId -- while the finished Kia entry clearly
+                    # carries one per line (043152, SK6459, the full VIN).
+                    # refId is what the manual journal entry uses and is
+                    # accepted there, so it is what we send. The template
+                    # response also carries `controlNumberList` and
+                    # `control2Type`, which may be the real mechanism here.
+                    # Re-capture with the controls filled in to settle it.
+                    "refId": control,
+                    # Tekion's own payload puts the line label in `description`
+                    # and leaves refText off the posting entirely.
+                    "description": (line.description or None),
+                    "refType": line.ref_type,
+                    "countAdjusted": False,
+                    "postingOrder": order,
+                    "amountCredited": False,
+                    # Not sent -- kept so the printed trace is readable.
+                    "_glAccountNumber": line.gl_number,
+                    "_glAccountName": acc.get("account_name"),
+                    "_control": control,
+                }
+            )
+            order += 1
+        return postings
+
+    # What a line's control should be, from the template's own refType. This is
+    # the field that actually carries the answer:
+    #
+    #   VEHICLE   -> the stock number      (N/P, inventory)
+    #   FULL_VIN  -> the whole VIN         (KRS receivable)
+    #   CUSTOM    -> free text; see below
+    #
+    # An earlier version read control2Type instead, which Tekion returns as null
+    # on every template line, so every control silently became the stock number
+    # -- including the two lines that must not be.
+    _CONTROL_BY_REF_TYPE = {
+        LINE_REF_TYPE_VEHICLE: Control.STOCK,
+        "FULL_VIN": Control.FULL_VIN,
+        "VIN": Control.FULL_VIN,
+        "LAST_SIX_VIN": Control.LAST_SIX_VIN,
+        "LAST_EIGHT_VIN": Control.LAST_EIGHT_VIN,
+    }
+
+    # CUSTOM lines are free text, so the account decides. Holdback keys off the
+    # last six of the VIN -- that is what the finished Kia entry carries, and
+    # what the Control 2 column labels "LAST SIX OF VIN". Every other CUSTOM
+    # line on that entry uses the stock number.
+    _CONTROL_BY_ROLE = {
+        vmi_template.ROLE_HOLDBACK: Control.LAST_SIX_VIN,
+    }
+
+    @classmethod
+    def _control_for(cls, line: Any, facts: VehicleInvoiceFacts) -> str:
+        """The control value for one filled line.
+
+        Falls back to the stock number when a VIN-keyed line has no readable
+        VIN: an empty control reconciles to nothing, which is worse than a
+        coarse one.
+        """
+        ref_type = str(getattr(line, "ref_type", "") or "").upper()
+        kind = cls._CONTROL_BY_REF_TYPE.get(ref_type)
+        if kind is None:
+            role = vmi_template.role_of(
+                getattr(line, "description", ""), getattr(line, "description", "")
+            )
+            kind = cls._CONTROL_BY_ROLE.get(role, Control.STOCK)
+        return resolve_control(kind, facts) or facts.stock_number
+
+    @classmethod
+    def build_postings_from_template(
+        cls,
+        filled: "vmi_template.FillResult",
+        facts: VehicleInvoiceFacts,
+        dealer_id: str,
+    ) -> list[dict[str, Any]]:
+        """Turn filled template lines into the captured wire format.
+
+        Amounts are DOLLARS -- the journal-entry API is the one Tekion endpoint
+        that does not use cents. Sign carries the direction and `amountCredited`
+        stays False on every line, matching the captured payload.
+        """
+        postings: list[dict[str, Any]] = []
+        for order, line in enumerate(filled.lines):
+            control = cls._control_for(line, facts)
+            postings.append(
+                {
+                    "dealerId": dealer_id,
+                    # Straight from the template: no chart lookup needed, and no
+                    # chance of resolving to a different account than the store
+                    # configured.
+                    "glAccountId": line.gl_account_id,
+                    "amount": line.amount,
+                    # refId AND refText both carry the control value. The
+                    # manual journal entry capture is explicit about this: the
+                    # line that showed a control in Tekion sent
+                    # {"refId": "0526", "refText": "0526"}, and the line that
+                    # sent neither showed an empty Control box.
+                    #
+                    # Sending refId alone -- which is what the first vehicle
+                    # draft did -- posts an entry whose amounts are all correct
+                    # and whose Control column is blank on every line.
+                    "refId": control,
+                    "refText": control,
+                    # Separate field, separate column: this fills Description,
+                    # which is why that column looked right while Control did
+                    # not.
+                    "description": line.description or None,
+                    "refType": line.ref_type,
+                    "countAdjusted": False,
+                    "postingOrder": order,
+                    "amountCredited": False,
+                    # Not sent -- kept so the printed trace is readable.
+                    "_glAccountNumber": line.gl_number,
+                    "_control": control,
+                    "_source": line.source,
+                }
+            )
+        return postings
+
+    @staticmethod
+    def build_payload(
+        facts: VehicleInvoiceFacts,
+        postings: list[dict[str, Any]],
+        accounting_date_ms: int,
+        dealer_id: str,
+        transaction_amount: float,
+    ) -> dict[str, Any]:
+        wire = [{k: v for k, v in p.items() if not k.startswith("_")} for p in postings]
+        return {
+            "transactionType": "GENERAL",
+            "postings": wire,
+            "transactionAmount": transaction_amount,
+            "journalId": f"{dealer_id}_{JOURNAL_NUMBER}",
+            "description": f"{facts.manufacturer} {facts.stock_number}".strip(),
+            # Filled from the resolved template once the Auto Posting calls
+            # are captured; the journal id below already selects journal 70.
+            "metadata": {},
+            "refId": facts.stock_number,
+            "refType": TRANSACTION_REF_TYPE,
+            "refText": facts.stock_number,
+            "documentTypeId": f"{dealer_id}_{DOCUMENT_TYPE_SUFFIX}",
+            "franchiseId": dealer_id,
+            "scheduledTime": str(accounting_date_ms),
+            # Captured as {"attachments": []}, not {}.
+            "assetAttachmentDto": {"attachments": []},
+        }
+
+    def chart_by_account_id(self) -> dict[str, dict[str, Any]]:
+        """The dealership's chart of accounts, keyed by account_id.
+
+        Needed because a template line carries only `glAccountId`, and that id
+        is NOT the account number despite looking like one -- 1710_2246 is
+        account 2245. Without this the flow matches the clerk's handwriting
+        against accounts one digit off.
+        """
+        return {
+            str(a.get("account_id")): a
+            for a in self._je.gl_accounts()
+            if a.get("account_id")
+        }
+
+    def fetch_templates(self) -> list[dict[str, Any]]:
+        """Every auto-posting template configured at the current dealership."""
+        res = self.client._req_json(
+            _TEMPLATES_PATH, method="POST", body={"templateTypes": ["DEFAULT"]}
+        )
+        return (res.get("data") or {}).get("templateList") or []
+
+    def find_template(self, dealer_id: str) -> tuple[dict[str, Any] | None, str]:
+        """The dealership's auto-posting template for journal 70.
+
+        Returns (template, problem). Selected by journal, never by name: each
+        store names its own -- 1714 calls it "VEHICLE INVOICES", 1707 calls it
+        "NEW VEHICLE" -- so matching on a name works at one store and quietly
+        fails at the rest.
+
+        Journal number is not always unique either. 1707 keeps two templates on
+        journal 70, "NEW VEHICLE" and "2024 HONDA PROLOGUE", and taking the
+        first would post a Kia against a Honda-specific template. When more than
+        one matches this refuses and names them, unless TEMPLATE_PREFERENCE says
+        which one that dealer means.
+        """
+        wanted = f"{dealer_id}_{JOURNAL_NUMBER}"
+        matches = [t for t in self.fetch_templates() if t.get("journalId") == wanted]
+
+        if not matches:
+            return None, (
+                f"dealer {dealer_id} has no auto-posting template on journal "
+                f"{JOURNAL_NUMBER} (Vehicle Purchases)"
+            )
+        if len(matches) == 1:
+            return matches[0], ""
+
+        preferred = TEMPLATE_PREFERENCE.get(dealer_id)
+        if preferred:
+            for t in matches:
+                if str(t.get("templateName") or "").strip() == preferred:
+                    return t, ""
+            return None, (
+                f"TEMPLATE_PREFERENCE names {preferred!r} for dealer {dealer_id}, "
+                f"but no template on journal {JOURNAL_NUMBER} has that name"
+            )
+
+        names = ", ".join(repr(t.get("templateName")) for t in matches)
+        return None, (
+            f"dealer {dealer_id} has {len(matches)} templates on journal "
+            f"{JOURNAL_NUMBER} ({names}); add the intended one to "
+            "TEMPLATE_PREFERENCE in vmi_je_creation.py"
+        )
+
+    def save_draft(self, payload: dict[str, Any], dealer_id: str) -> dict[str, Any]:
+        """Persist as a draft.
+
+        Captured, not inferred: the Auto Posting screen posts to the same
+        endpoint the manual journal entry uses, with journal 70 and document
+        type 8. Applying a template is purely client-side pre-fill -- the saved
+        transaction comes back with `templateId: null` -- so the template is how
+        the lines are CHOSEN, never part of how they are SAVED.
+        """
+        path = _SAVE_DRAFT_PATH.format(dealer_id=dealer_id)
+        print(f"[VMI] Save as Draft: {_SAVE_DRAFT_METHOD} {path}")
+        res = self.client._req_json(path, method=_SAVE_DRAFT_METHOD, body=payload)
+        data = res.get("data") or {}
+        return data.get("transaction") or data
+
+
+# ── Orchestration ────────────────────────────────────────────────────────────
+
+
+def _holdback_from_coded_row(facts: VehicleInvoiceFacts) -> float | None:
+    """The holdback, for an invoice that prints it instead of annotating it.
+
+    Schaumburg Honda's clerk writes out every account except this one. The
+    figure IS on the page -- "42800 4400 85590" beside MSRP -- but it carries no
+    account number, so nothing above can place it.
+
+    What makes it placeable is the rest of the row. 428.00 and 44.00 are both
+    written out by hand against their accounts, so they are already spoken for;
+    855.90 is the only figure in the row that nothing claims, and the holdback
+    line is the only line left unfilled. One unclaimed figure for one empty
+    line is a match, not a guess.
+
+    Anything less certain returns None and the caller refuses, which is the
+    behaviour every other store already gets:
+      - nothing printed in the row
+      - two or more unclaimed figures, so which one is holdback is unknown
+      - a figure at or above the price of the car, which no holdback ever is
+
+    Only ever reached when the handwriting did NOT name the holdback account, so
+    this cannot displace an annotation at Kia, Ford or Oakbrook Toyota.
+    """
+    if not facts.coded_amounts:
+        return None
+
+    written = {round(abs(a.amount), 2) for a in facts.gl_annotation_lines}
+    unclaimed = [
+        value
+        for value in facts.coded_amounts
+        if value > 0 and round(value, 2) not in written
+    ]
+    if len(unclaimed) != 1:
+        return None
+
+    holdback = unclaimed[0]
+    ceiling = facts.dealer_cost_total or facts.msrp_total
+    if ceiling and holdback >= ceiling:
+        return None
+    return holdback
+
+
+def _role_accounts(
+    template: dict[str, Any], roles: list[str], chart: dict[str, dict[str, Any]]
+) -> list[vmi_template.FilledLine]:
+    """The template lines playing `roles`, so a refusal can name the account."""
+    found: list[vmi_template.FilledLine] = []
+    for p in template.get("postings") or []:
+        number = vmi_template.gl_number_of(p.get("glAccountId"), chart)
+        entry = chart.get(str(p.get("glAccountId"))) or {}
+        role = vmi_template.role_of(
+            p.get("description"), entry.get("account_name"), gl_number=number
+        )
+        if role in roles and not any(f.gl_number == number for f in found):
+            found.append(
+                vmi_template.FilledLine(
+                    gl_number=number,
+                    gl_account_id=str(p.get("glAccountId") or ""),
+                    amount=0.0,
+                    ref_type="",
+                    description=str(p.get("description") or ""),
+                    source=role,
+                )
+            )
+    return found
+
+
+def create_vehicle_journal_entry(
+    client: TekionApiClient,
+    facts: VehicleInvoiceFacts,
+    *,
+    dry_run: bool = True,
+) -> VehicleEntryResult:
+    """Build the entry from the dealership's own template, and save it as a draft.
+
+    Refuses -- rather than posting something approximate -- when the store has
+    no journal-70 template or more than one, when nothing was annotated on the
+    invoice, when an annotation names an account the template has no line for,
+    or when the finished lines do not balance to zero.
+    """
+    result = VehicleEntryResult(manufacturer=facts.manufacturer)
+    result.gl_annotations = dict(facts.gl_annotations)
+
+    if not facts.stock_number:
+        result.refusal = "no stock number on the invoice (write it on before uploading)"
+        result.needs = ["stock_number"]
+        return result
+    if facts.unpriced_gl_accounts:
+        accounts = ", ".join(facts.unpriced_gl_accounts)
+        result.refusal = (
+            f"account {accounts} is written on the invoice but no amount could be "
+            "read for it. Posting the other lines would leave the entry short, so "
+            "supply the amount and run it again"
+        )
+        result.needs = ["gl_annotations"]
+        return result
+
+    if not facts.gl_annotations:
+        result.refusal = (
+            "no GL accounts were read off the invoice. The clerk writes an account "
+            "number beside each amount it takes (2245 -> 780.00); without those "
+            "there is nothing to post"
+        )
+        result.needs = ["gl_annotations"]
+        return result
+
+    # ── Dealer context ───────────────────────────────────────────────────────
+    # Belt and braces: the pipeline already wraps this call in `dealer_scope`,
+    # which switches inside the Tekion lock. This repeat covers the other
+    # callers -- the dry-run script, a future route -- because the cost of
+    # getting it wrong is posting one store's money into another's books.
+    #
+    # THIS IS LOAD-BEARING. The Tekion client is a singleton whose dealership is
+    # mutable state, so current_dealer_id is whatever the LAST job left it at.
+    # Omitting this switch made a Schaumburg Kia invoice read Schaumburg Honda's
+    # templates, and had the accounts happened to match it would have posted a
+    # Kia purchase into Honda's books. Every flow that touches Tekion switches
+    # first; this one has to as well.
+    if facts.dealership_name:
+        dealer_id = client.find_dealer_by_name(facts.dealership_name)
+        if not dealer_id:
+            result.refusal = (
+                f"could not match dealership {facts.dealership_name!r} in Tekion"
+            )
+            result.needs = ["dealership_name"]
+            return result
+        client.switch_dealer(dealer_id)
+
+    dealer_id = client.current_dealer_id
+    result.dealer_id = dealer_id
+    print(f"[VMI] dealer {dealer_id} ({facts.dealership_name or 'from client'})")
+    service = VehicleJournalEntryService(client)
+
+    tekion_template, template_problem = service.find_template(dealer_id)
+    if template_problem:
+        # Nothing a person can type fixes this: the store either has no
+        # journal-70 template or has two, and both are Tekion configuration.
+        result.refusal = template_problem
+        return result
+    result.tekion_template_name = str(tekion_template.get("templateName") or "")
+    print(
+        f"[VMI] template {result.tekion_template_name!r} "
+        f"(journal {tekion_template.get('journalId')}), "
+        "annotations "
+        + ", ".join(
+            f"{a.account}={a.amount:,.2f}" + (f" [{a.label}]" if a.label else "")
+            for a in facts.gl_annotation_lines
+        )
+    )
+    # The template's own lines. Printed because the captured template list was
+    # truncated by the capture's body cap, so this is the only reliable view of
+    # what a store actually has configured.
+    _chart = service.chart_by_account_id()
+    for tp in tekion_template.get("postings") or []:
+        acc = _chart.get(str(tp.get("glAccountId"))) or {}
+        print(
+            f"[VMI]   template line {str(tp.get('glAccountId')):<14} "
+            f"-> GL {str(acc.get('account_number') or '?'):<7} "
+            f"preset={float(tp.get('amount') or 0):>11,.2f}  "
+            f"{tp.get('refType'):<9} {acc.get('account_name') or tp.get('description')}"
+        )
+
+    chart = service.chart_by_account_id()
+
+    # The account and label written on the invoice go to the template line that
+    # carries them, for the amount OCR read. Nothing is inferred, reassigned or
+    # second-guessed here: if an amount is wrong it is wrong in the reading, and
+    # correcting it downstream only hides where the fault is.
+    filled = vmi_template.fill(
+        tekion_template,
+        facts.gl_annotation_lines,
+        facts.dealer_cost_total,
+        chart,
+        doc_fee=STORE_DOC_FEE.get(dealer_id, DEFAULT_DOC_FEE),
+        holdback_fallback=_holdback_from_coded_row(facts),
+    )
+
+    # An annotation with nowhere to go is the clearest possible signal that this
+    # invoice and this template disagree. Posting the rest would quietly drop
+    # money a person explicitly placed.
+    if filled.unmatched_annotations:
+        pairs = ", ".join(
+            f"{a.account}={a.amount:,.2f}" + (f" ({a.label})" if a.label else "")
+            for a in filled.unmatched_annotations
+        )
+        result.refusal = (
+            f"the invoice annotates {pairs}, but template "
+            f"{result.tekion_template_name!r} has no line for "
+            f"{'those accounts' if len(filled.unmatched_annotations) > 1 else 'that account'}"
+        )
+        result.needs = ["gl_annotations"]
+        return result
+
+    # A role the template asks for that nothing filled. Worth its own message:
+    # the holdback line also feeds the invoice-price line computed from it, so
+    # losing it drops TWO lines and the entry fails the balance check further
+    # down with a figure that points nowhere near the cause.
+    #
+    # Schaumburg Honda is the case. Its invoice prints holdback in an unlabelled
+    # coded row beside MSRP -- "42800 4400 85590" -- which OCR does not read and
+    # which nothing should be guessing at. A person types the figure in.
+    _ROLE_LABELS = {
+        vmi_template.ROLE_HOLDBACK: "holdback",
+        vmi_template.ROLE_FLOOR_PLAN: "floor plan",
+        vmi_template.ROLE_INVOICE_PRICE: "invoice price",
+    }
+    dropped = list(filled.dropped_roles)
+    # The invoice price is COMPUTED from the holdback, so a missing holdback
+    # drops it too. Reporting both reads as two independent problems and sends
+    # whoever fixes it looking for a price to type in; there is only one.
+    if vmi_template.ROLE_HOLDBACK in dropped:
+        dropped = [r for r in dropped if r != vmi_template.ROLE_INVOICE_PRICE]
+    if dropped:
+        missing = ", ".join(_ROLE_LABELS.get(role, role) for role in dropped)
+        accounts = ", ".join(
+            line.gl_number
+            for line in _role_accounts(tekion_template, dropped, chart)
+        )
+        result.refusal = (
+            f"no {missing} amount could be read from this invoice, and template "
+            f"{result.tekion_template_name!r} has a line for it"
+            + (f" ({accounts})" if accounts else "")
+            + " -- add the account and amount below and run it again"
+        )
+        result.needs = ["gl_annotations"]
+        return result
+
+    if not filled.lines:
+        result.refusal = "the template produced no posting lines for this invoice"
+        result.needs = ["gl_annotations"]
+        return result
+
+    postings = service.build_postings_from_template(filled, facts, dealer_id)
+    result.postings = postings
+
+    credit, debit, balance = JournalEntryService.check_balance(postings)
+    result.credit_total, result.debit_total, result.balance = credit, debit, balance
+    result.balanced = abs(balance) < 0.005
+
+    print(
+        f"[VMI] {facts.manufacturer or 'vehicle'} {facts.stock_number}: "
+        f"{len(postings)} lines, credit {credit:,.2f} / debit {debit:,.2f}, "
+        f"balance {balance:.2f}"
+    )
+    for p in postings:
+        print(
+            f"[VMI]   {p['_glAccountNumber']:>6}  {p['amount']:>13,.2f}  "
+            f"{p['_control']:<20} {p['refType']:<9} {p['_source']}"
+        )
+
+    if not result.balanced:
+        result.refusal = (
+            f"the entry does not balance: credit {credit:,.2f} against debit "
+            f"{debit:,.2f} (off by {balance:.2f})"
+        )
+        # An imbalance is almost always a misread amount. Both the annotated
+        # figures and the invoice total can move it, so offer both.
+        result.needs = ["gl_annotations", "dealer_cost_total"]
+        return result
+
+    if dry_run:
+        return result
+
+    # Same dealer-TZ midnight as OEM JE — avoid UTC off-by-one on Accounting Date.
+    dealer_tz = None
+    get_tz = getattr(client, "get_dealer_timezone", None)
+    if callable(get_tz):
+        try:
+            dealer_tz = get_tz()
+        except Exception:  # noqa: BLE001
+            dealer_tz = None
+    accounting_date_ms = int(
+        _parse_date(facts.invoice_date, tz_name=dealer_tz).timestamp() * 1000
+    )
+    payload = service.build_payload(facts, postings, accounting_date_ms, dealer_id, debit)
+    transaction = service.save_draft(payload, dealer_id)
+    result.transaction_id = transaction.get("id") or transaction.get("transactionId")
+    result.transaction_number = str(
+        transaction.get("transactionNumber") or transaction.get("number") or ""
+    ) or None
+    result.journal_id = f"{dealer_id}_{JOURNAL_NUMBER}"
+    result.saved = bool(result.transaction_id)
+    return result

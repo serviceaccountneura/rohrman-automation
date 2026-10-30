@@ -1,0 +1,178 @@
+"""OCR service — wraps the existing Vertex AI vision_extract pipeline.
+
+Calls extract_vision() from main_pipeline/vision_extract.py to get structured
+JSON from a PDF/image, then returns it for the frontend to display and edit.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+MAIN_PIPELINE = Path(__file__).resolve().parent.parent.parent / "main_pipeline"
+if str(MAIN_PIPELINE) not in sys.path:
+    sys.path.insert(0, str(MAIN_PIPELINE))
+
+PROJECT_ROOT = MAIN_PIPELINE.parent
+if not os.environ.get("VERTEX_CREDENTIALS"):
+    creds = PROJECT_ROOT / "neura_vertex_ai.json"
+    if creds.exists():
+        os.environ["VERTEX_CREDENTIALS"] = str(creds)
+
+from google.genai import types  # noqa: E402
+
+from api.config import settings  # noqa: E402
+from api.services import confidence_read, page_enhance, page_orientation  # noqa: E402
+from api.services.ocr_helpers import to_flat_fields  # noqa: E402
+from api.services.vertex_retry import call_with_retry, is_rate_limited  # noqa: E402
+from normalize import to_po_contract  # noqa: E402
+from pipeline import get_client, load_pages, pil_to_part  # noqa: E402
+from vision_extract import VISION_PROMPT, build_response_schema, validate  # noqa: E402
+
+VISION_MODEL = "gemini-3.6-flash"
+# Gemini 3 models are only served from the global endpoint, not us-central1.
+VISION_LOCATION = "global"
+
+
+def _load_for_reading(path: Path) -> list:
+    """The pages as images: PDFs at the enhancement step's 350 DPI when it is on."""
+    if settings.ocr_enhance and path.suffix.lower() == ".pdf":
+        import fitz
+        from PIL import Image
+
+        scale = page_enhance.DPI / 72.0
+        pages = []
+        with fitz.open(str(path)) as doc:
+            for page in doc:
+                pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+                pages.append(Image.frombytes("RGB", (pix.width, pix.height), pix.samples))
+        return pages
+    return load_pages(path)
+
+
+def extract_document(
+    file_path: str | Path,
+    straighten: bool = True,
+    pages_out: list | None = None,
+) -> dict[str, Any]:
+    """Run vision-first extraction on a PDF/image file.
+
+    Returns the structured JSON dict (same shape as vision_extract.py produces).
+
+    `straighten=False` skips the orientation check, for a file the pipeline
+    has already turned upright (see page_orientation.upright_file) -- checking
+    it again would cost about two seconds a page to learn nothing.
+
+    `pages_out`, when given, receives the cleaned-up pages exactly as Gemini
+    saw them, so the pipeline can store them for the preview.
+    """
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    client = get_client(location=VISION_LOCATION)
+    # Upright before reading: a sideways scan is where small print -- the
+    # invoice number, above all -- gets misread. See page_orientation.
+    images = [
+        page_orientation.upright(img, f"{path.name} page {i}") if straighten else img
+        for i, img in enumerate(_load_for_reading(path), start=1)
+    ]
+    # Then cleaned up for reading -- the copy Gemini sees, nothing else.
+    if settings.ocr_enhance:
+        images = page_enhance.enhance_pages(images)
+        if pages_out is not None:
+            pages_out.extend(images)
+    parts = [pil_to_part(img) for img in images]
+
+    # The confidence read runs alongside the main one, on the same pages, so
+    # it adds no time unless it is the slower of the two.
+    second_read = None
+    if settings.confidence_read:
+        from concurrent.futures import ThreadPoolExecutor
+
+        pool = ThreadPoolExecutor(max_workers=1)
+        second_read = pool.submit(confidence_read.read, list(images), list(parts), client)
+        pool.shutdown(wait=False)
+
+    parts.append(types.Part.from_text(text=VISION_PROMPT))
+
+    # Vertex AI intermittently drops the connection on long structured-schema
+    # calls, and also returns 429 when quota is hot. Rate limits use longer
+    # backoff (call_with_retry); other transient errors keep short 5/10s sleeps.
+    # The pipeline's own retry is coarser (30s/120s) and burns a full OCR re-run.
+    def _generate():
+        return client.models.generate_content(
+            model=VISION_MODEL,
+            contents=parts,
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                response_mime_type="application/json",
+                response_schema=build_response_schema(),
+                max_output_tokens=65535,
+            ),
+        )
+
+    last_err: Exception | None = None
+    resp = None
+    for attempt in range(3):
+        try:
+            resp = call_with_retry(_generate, what="OCR")
+            break
+        except Exception as e:  # noqa: BLE001 — Vertex drops show up as various errors
+            last_err = e
+            if is_rate_limited(e):
+                # call_with_retry already exhausted its 429 budget.
+                raise
+            if attempt < 2:
+                wait = 5 * (attempt + 1)
+                print(
+                    f"[OCR] Vertex call failed (attempt {attempt + 1}/3): {e}; "
+                    f"retrying in {wait}s"
+                )
+                time.sleep(wait)
+    else:
+        raise last_err  # type: ignore[misc]
+    assert resp is not None
+
+    try:
+        doc = json.loads(resp.text or "{}")
+    except json.JSONDecodeError:
+        doc = {"document_type": None, "_parse_error": (resp.text or "")[:500]}
+
+    if not isinstance(doc, dict):
+        doc = {"document_type": None}
+
+    if second_read is not None:
+        second = second_read.result()
+        doc = confidence_read.apply(doc, second)
+        doc["_confidence"] = second
+        if second.get("error"):
+            print(f"[OCR] confidence read failed ({second.get('model')}): {second['error']}")
+        else:
+            votes = second.get("votes") or {}
+            summary = [f"invoice {votes['invoice_number']['final'] or '?'} "
+                       f"{votes['invoice_number']['agree']}/{votes['invoice_number']['of']}"]
+            summary += [
+                f"#{ln['account']['final'] or '?'} {ln['account']['agree']}/{ln['account']['of']} "
+                f"{ln['amount']['final'] or '?'} {ln['amount']['agree']}/{ln['amount']['of']}"
+                for ln in votes.get("gl_lines") or []
+            ]
+            print(
+                f"[OCR] vote (2.5 Pro {second.get('seconds')}s, PaddleOCR "
+                f"{'%ss' % second['paddle']['seconds'] if second['paddle']['available'] else 'unavailable'}): "
+                + ", ".join(summary)
+                + (f" -- UNRESOLVED: {'; '.join(second['unresolved'])}" if second.get("unresolved") else "")
+            )
+
+    doc["_pages"] = len(images)
+    doc["_po_contract"] = to_po_contract(doc)
+    doc["_validation"] = validate(doc)
+    doc["_needs_review"] = doc["_validation"]["needs_review"]
+    # Flat, predictable field names for callers that should not have to dig
+    # through identifiers[]/totals[] themselves — notably the frontend.
+    doc["_fields"] = to_flat_fields(doc)
+    return doc

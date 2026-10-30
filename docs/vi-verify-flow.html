@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Vendor Invoice Verify — Flow</title>
+    <script type="module">
+      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+      mermaid.initialize({
+        startOnLoad: true,
+        theme: "neutral",
+        flowchart: { curve: "basis", htmlLabels: true },
+      });
+    </script>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f6f5f2;
+        --card: #fff;
+        --ink: #1a1a1a;
+        --muted: #5c5c5c;
+        --line: #e5e2db;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font-family: "Segoe UI", system-ui, sans-serif;
+        background: var(--bg);
+        color: var(--ink);
+        line-height: 1.45;
+      }
+      main {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 2rem 1.25rem 3rem;
+      }
+      h1 {
+        font-size: 1.5rem;
+        margin: 0 0 0.35rem;
+      }
+      .sub {
+        color: var(--muted);
+        font-size: 0.95rem;
+        margin-bottom: 1.5rem;
+      }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 1.25rem;
+        margin-bottom: 1.25rem;
+        overflow-x: auto;
+      }
+      h2 {
+        font-size: 1.05rem;
+        margin: 0 0 0.75rem;
+      }
+      ul {
+        margin: 0;
+        padding-left: 1.2rem;
+        color: var(--muted);
+        font-size: 0.9rem;
+      }
+      li {
+        margin-bottom: 0.35rem;
+      }
+      .mermaid {
+        display: flex;
+        justify-content: center;
+      }
+      footer {
+        color: var(--muted);
+        font-size: 0.8rem;
+        margin-top: 0.5rem;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Vendor Invoice Verify — End-to-end flow</h1>
+      <p class="sub">
+        Rohrman · PO_INVOICE path (Miscellaneous / Stock / Sublet). No PO create,
+        no pre-invoice — verify only against Tekion, then optionally attach &amp;
+        complete when writes are on.
+      </p>
+
+      <div class="card">
+        <div class="mermaid">
+flowchart TD
+  A[Upload invoice<br/>PO_INVOICE folder] --> B[OCR read]
+  B --> C{PO # + Invoice # + Amount<br/>readable?}
+  C -->|No| X1[EXCEPTION<br/>missing fields]
+  C -->|Yes| D[Lookup PO in Tekion]
+
+  D --> E{PO found?}
+  E -->|No| X2[EXCEPTION · Waiting<br/>PO_NOT_FOUND]
+  E -->|Yes| F{Already pre-invoiced?}
+
+  F -->|No| X3[EXCEPTION · Waiting<br/>PRE_INVOICE_MISSING]
+  F -->|Yes| G[Find Vendor Invoice<br/>Pre Invoice list]
+
+  G --> H{VI found?}
+  H -->|No| X3
+  H -->|Yes| I[Header checks — yellow fields]
+
+  I --> I1[PO #]
+  I --> I2[Vendor]
+  I --> I3[Invoice #]
+  I --> I4[Invoice amount]
+  I --> I5[Invoice date]
+
+  I1 & I2 & I3 & I4 & I5 --> J{All match?}
+  J -->|No| X4[EXCEPTION · PO / Invoice<br/>clear mismatch message]
+  J -->|Yes| K{Near-duplicate?<br/>e.g. BLK123 vs 123}
+
+  K -->|Yes| X5[EXCEPTION · Duplicate]
+  K -->|No| L[Load JE / GL postings]
+
+  L --> M{Expense GLs present?}
+  M -->|No| X6[EXCEPTION · PO<br/>NO_GL]
+  M -->|Yes| N[Control checks]
+
+  N --> N1{GL = 2460 Sublet?}
+  N1 -->|Yes| N2{Control = RO #?}
+  N1 -->|No| N3{Control = PO vendor name?}
+  N2 -->|No| X7[EXCEPTION · Journal entry<br/>JE_CONTROL_REQUIRED]
+  N3 -->|No| X7
+  N2 -->|Yes| N4[Control OK]
+  N3 -->|Yes| N5{GL starts with 7?}
+  N5 -->|Yes| N6{Description filled?}
+  N6 -->|No| X7
+  N6 -->|Yes| N4
+  N5 -->|No| N4
+
+  N4 --> O{TEKION_PO_WRITES on?}
+  O -->|No — test mode| P[PROCESSED<br/>verify only — nothing posted]
+  O -->|Yes| Q[Attach PDF + complete VI]
+  Q --> R[PROCESSED]
+
+  X1 & X2 & X3 & X4 & X5 & X6 & X7 --> S[Exceptions UI<br/>by category + three-way match]
+  P & R --> T[Folder queue · Checks passed]
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Header fields verified (Vendor Invoice screen)</h2>
+        <ul>
+          <li>PO Number</li>
+          <li>Vendor Number / Name</li>
+          <li>Invoice Number (full, including letters/suffixes)</li>
+          <li>Invoice Amount (to the cent)</li>
+          <li>Invoice Date</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <h2>Journal Entry — Control rules</h2>
+        <ul>
+          <li>Most expense GLs: <strong>Control = PO vendor name</strong></li>
+          <li>Sublet GL <strong>2460</strong>: <strong>Control = Repair Order #</strong></li>
+          <li>GLs starting with <strong>7</strong>: also need a Description</li>
+        </ul>
+      </div>
+
+      <footer>
+        File: docs/vi-verify-flow.html · Open in any browser (needs internet for
+        Mermaid CDN). Print or screenshot to share without the file.
+      </footer>
+    </main>
+  </body>
+</html>

@@ -1,0 +1,699 @@
+"""Pydantic models for FastAPI request/response schemas."""
+from __future__ import annotations
+
+from datetime import datetime
+from enum import Enum
+from typing import Annotated, Any, Literal, Union
+from uuid import UUID
+
+from typing import Any
+
+from pydantic import BaseModel, Field, EmailStr
+
+
+# ── OCR ──────────────────────────────────────────────────────────────────────
+
+
+class OcrJobStatus(str, Enum):
+    QUEUED = "queued"
+    PROCESSING = "processing"
+    DONE = "done"
+    ERROR = "error"
+
+
+class OcrJobResponse(BaseModel):
+    job_id: str
+    status: OcrJobStatus
+    # The documents row tracking this extraction. Pass it to POST /api/tekion/po
+    # so the PO result is recorded against the same row.
+    document_id: UUID | None = None
+
+
+class OcrFields(BaseModel):
+    """Flat, predictable field names extracted from the raw OCR output.
+
+    The raw `result` is nested and label-driven (vendor:{name},
+    identifiers:[{label,value}], totals:[{label,value}]) because the model
+    chooses its own field names. Use this instead of digging through it.
+    """
+
+    document_type: str = ""
+    dealership_name: str = ""
+    vendor_name: str = ""
+    invoice_number: str = ""
+    invoice_date: str = ""  # MM/DD/YYYY
+    invoice_amount: float = 0.0
+    sales_tax: float = 0.0
+    ro_number: str = ""
+    line_items: list[dict[str, Any]] = Field(default_factory=list)
+    needs_review: bool = False
+
+
+class OcrJobResult(BaseModel):
+    job_id: str
+    status: OcrJobStatus
+    result: dict[str, Any] | None = None
+    # Same values as `result`, flattened. Prefer this in clients.
+    fields: OcrFields | None = None
+    error: str | None = None
+
+
+# ── Tekion ───────────────────────────────────────────────────────────────────
+
+
+class PoType(str, Enum):
+    SUBLET = "SUBLET"
+    MISCELLANEOUS = "MISCELLANEOUS"
+    STOCK = "STOCK"
+
+
+# ── Line items (per PO type) ──────────────────────────────────────────────────
+
+
+class StockPartInput(BaseModel):
+    part_number: str = Field(alias="partNumber")
+    part_name: str = Field(alias="partName")
+    qty: float = 1.0
+    unit_price: float = Field(alias="unitPrice")
+    brand_code: str = Field(alias="brandCode")
+
+    model_config = {"populate_by_name": True}
+
+
+class MiscLineItem(BaseModel):
+    part_name: str = Field(alias="partName")
+    qty: float = 1.0
+    unit_price: float = Field(alias="unitPrice")
+    # Optional — auto-resolved from vendor table + department fallback if omitted.
+    gl_account: str | None = Field(default=None, alias="glAccount")
+
+    model_config = {"populate_by_name": True}
+
+
+class SubletLineItem(BaseModel):
+    ro_number: str = Field(alias="roNo")
+    job_number: str = Field(alias="jobNo")
+    description: str
+    opcode: str = "SUBLET"
+    labor_amount: float = Field(default=0.0, alias="laborAmount")
+    parts_amount: float = Field(default=0.0, alias="partsAmount")
+
+    model_config = {"populate_by_name": True}
+
+
+# ── Discriminated union: po_type selects the schema ───────────────────────────
+
+
+class _CreatePoBase(BaseModel):
+    dealership_name: str = Field(alias="dealershipName")
+    vendor_name: str = Field(alias="vendorName")
+    # Dealer-vendor codes written on the invoice ("1707-310"). One for the
+    # dealership being posted to picks the vendor ahead of the name.
+    vendor_codes: list[str] = Field(default_factory=list, alias="vendorCodes")
+    invoice_number: str = Field(alias="invoiceNumber")
+    invoice_amount: float = Field(alias="invoiceAmount")
+    sales_tax: float = Field(default=0.0, alias="salesTax")
+    # Optional: local file path or S3 key of the invoice PDF to attach to the
+    # pre-invoice. An S3 key (as returned by /api/invoices/upload-url) is
+    # downloaded server-side before being uploaded to Tekion.
+    invoice_file_path: str | None = Field(default=None, alias="invoiceFilePath")
+    # Optional: the documents row from POST /api/ocr/extract. When given, the PO
+    # result is recorded against it so this flow is tracked like the pipeline's.
+    document_id: UUID | None = Field(default=None, alias="documentId")
+
+    model_config = {"populate_by_name": True}
+
+
+class CreateSubletPoRequest(_CreatePoBase):
+    # po_type is the discriminator — no alias so it matches the JSON key directly.
+    po_type: Literal["SUBLET"] = "SUBLET"
+    line_items: list[SubletLineItem] = Field(default_factory=list, alias="lineItems")
+
+
+class GlSplitInput(BaseModel):
+    """One GL account and the share of the invoice it takes."""
+
+    gl_account: str = Field(alias="glAccount")
+    amount: float
+    description: str | None = None
+    # The control this line carries in Tekion. Per line, because a person
+    # reviewing a split may give each account its own reference.
+    control: str | None = None
+    # The account's REAL Tekion id, when it is known. An id is not always
+    # "{dealer}_{number}" -- at Schaumburg Kia 1710_2246 is account 2245 -- so
+    # a line resolved against the chart of accounts says which it is rather
+    # than having one built from the number.
+    account_id: str | None = Field(default=None, alias="accountId")
+
+    model_config = {"populate_by_name": True}
+
+
+class CreateMiscPoRequest(_CreatePoBase):
+    po_type: Literal["MISCELLANEOUS"] = "MISCELLANEOUS"
+    line_items: list[MiscLineItem] = Field(default_factory=list, alias="lineItems")
+    # Accounts and amounts written on the invoice as a block, e.g.
+    # "GL# 7193 $2,378.11 / GL# 3142 $202.12". When present these ARE the
+    # posting split -- they say how the invoice divides, which the line items
+    # cannot: nothing in a parts table says which account the sales tax
+    # belongs in.
+    gl_splits: list[GlSplitInput] = Field(default_factory=list, alias="glSplits")
+
+
+class CreateStockPoRequest(_CreatePoBase):
+    """Vendor stock order — create + submit only, no pre-invoice."""
+    po_type: Literal["STOCK"] = "STOCK"
+    parts: list[StockPartInput] = Field(default_factory=list, alias="parts")
+
+
+# FastAPI / Pydantic dispatches to the correct schema based on po_type.
+CreatePoRequest = Annotated[
+    Union[CreateSubletPoRequest, CreateMiscPoRequest, CreateStockPoRequest],
+    Field(discriminator="po_type"),
+]
+
+
+class VendorCandidate(BaseModel):
+    id: str
+    name: str
+    display_id: str = Field(alias="displayId")
+    site_id: str = Field(default="", alias="siteId")
+    phone: str = ""
+    email: str = ""
+
+    model_config = {"populate_by_name": True}
+
+
+class GlLine(BaseModel):
+    """One accounting line as it was sent to Tekion.
+
+    The same shape for every flow, so one component can render a Misc
+    invoice's split, an OEM journal entry and a vehicle purchase alike.
+    """
+
+    gl_account: str = ""
+    gl_name: str = ""
+    # Signed: negative is a credit, which is how every flow already carries it.
+    amount: float = 0.0
+    control: str = ""
+    # Where the figure came from, in words -- "written on the invoice",
+    # "template preset". Only the flows that have something to say fill it in.
+    source: str = ""
+
+
+class CreatePoResponse(BaseModel):
+    success: bool
+    po_number: str | None = None
+    po_id: int | None = None
+    po_status: str | None = None
+    invoice_id: str | None = None
+    vendor_name: str | None = None
+    error: str | None = None
+    # When vendor could not be resolved from the mapping, these are set:
+    needs_review: bool = False
+    review_reason: str | None = None
+    vendor_candidates: list[VendorCandidate] = Field(default_factory=list)
+    # The accounting lines this PO's pre-invoice carried. Reported so the
+    # document can record what it posted; nothing in the PO response said where
+    # the money went, so a Misc invoice's split was only visible in Tekion.
+    gl_lines: list[GlLine] = Field(default_factory=list)
+
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+
+class UserCreate(BaseModel):
+    email: str = Field(min_length=3, max_length=255)
+    password: str = Field(min_length=8, max_length=128)
+    full_name: str | None = Field(default=None, max_length=255)
+    invite_code: str | None = Field(default=None, max_length=32)
+
+
+class CreateInviteRequest(BaseModel):
+    email: EmailStr
+    role: str = Field(default="AP_CLERK", max_length=50)
+    full_name: str | None = Field(default=None, max_length=255)
+    # Dealerships to grant. None means every dealership; a list restricts to
+    # those names. An empty list is rejected rather than treated as "all" -- a
+    # form that forgot to send its selection must not hand out everything.
+    dealerships: list[str] | None = None
+
+
+class InviteResponse(BaseModel):
+    invite_code: str
+    invite_url: str
+    email: str
+    role: str
+    full_name: str | None
+    # Empty means every dealership.
+    dealerships: list[str] = Field(default_factory=list)
+    expires_at: datetime
+    # False when mail is not configured or the send failed. The invite is still
+    # valid -- the UI shows the link so an admin can pass it on by hand.
+    email_sent: bool = False
+    email_error: str = ""
+
+
+class PendingInviteItem(BaseModel):
+    id: UUID
+    email: str
+    role: str
+    full_name: str | None = None
+    # Empty means every dealership.
+    dealerships: list[str] = Field(default_factory=list)
+    invited_by: str = ""
+    created_at: datetime
+    expires_at: datetime
+    # True once the 24-hour window has passed. Kept in the list rather than
+    # filtered out: "expired" is why nobody signed up, and hiding it makes an
+    # invitation look like it was never sent.
+    expired: bool = False
+
+
+class PendingInviteListResponse(BaseModel):
+    items: list[PendingInviteItem]
+    total: int
+
+
+class UpdateMeRequest(BaseModel):
+    full_name: str | None = Field(default=None, max_length=255)
+    current_password: str | None = None
+    new_password: str | None = Field(default=None, min_length=8, max_length=128)
+
+
+class CurrentUserResponse(BaseModel):
+    id: UUID
+    email: str
+    full_name: str | None = None
+    role: str
+    is_admin: bool = False
+    dealerships: list[str] = Field(default_factory=list)
+    all_dealerships: bool = True
+
+
+class PasswordResetRequest(BaseModel):
+    """Ask for a reset link."""
+
+    email: EmailStr
+
+
+class PasswordResetConfirm(BaseModel):
+    """Redeem a reset link."""
+
+    token: str
+    # Same floor as signup. Anything shorter is not worth the round trip.
+    password: str = Field(min_length=8, max_length=128)
+
+
+class PasswordResetValidateResponse(BaseModel):
+    """Whether a reset link is still good, for the page behind it."""
+
+    valid: bool
+    email: str = ""
+    reason: str = ""
+
+
+class InviteValidateResponse(BaseModel):
+    valid: bool
+    # Shown on the signup page and used as the account's address, so the person
+    # cannot register under a different one.
+    email: str | None = None
+    role: str | None = None
+    full_name: str | None = None
+    expires_at: datetime | None = None
+    reason: str | None = None
+
+
+class UserLogin(BaseModel):
+    email: str = Field(min_length=3, max_length=255)
+    password: str = Field(min_length=1)
+
+
+class UserRead(BaseModel):
+    id: UUID
+    email: str
+    full_name: str | None = None
+    role: str
+    is_active: bool
+    is_superuser: bool
+    created_at: datetime
+
+
+class UserListItem(BaseModel):
+    id: UUID
+    full_name: str | None
+    email: str
+    role: str
+    dealerships: list[str] = Field(default_factory=list)
+    status: str  # ACTIVE / INACTIVE
+
+
+class UserListResponse(BaseModel):
+    items: list[UserListItem]
+    total: int
+
+
+class UpdateUserStatusRequest(BaseModel):
+    # Both optional so one call can change either without disturbing the other.
+    # An omitted field is left alone; sending is_active alone must not wipe a
+    # dealership assignment.
+    is_active: bool | None = None
+    # null grants every dealership; a list restricts to those names. An empty
+    # list is refused rather than read as "all".
+    dealerships: list[str] | None = None
+    # Distinguishes "do not change the dealerships" from "grant all of them",
+    # which `dealerships: null` alone cannot express.
+    update_dealerships: bool = False
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int  # seconds until the token expires; then sign in again
+
+
+class MessageResponse(BaseModel):
+    message: str
+
+
+# ── Invoice upload ────────────────────────────────────────────────────────────
+
+
+class UploadUrlRequest(BaseModel):
+    file_name: str = Field(alias="fileName")
+    dealership_name: str | None = Field(default=None, alias="dealershipName")
+
+    model_config = {"populate_by_name": True}
+
+
+class UploadUrlResponse(BaseModel):
+    upload_url: str = Field(alias="uploadUrl")
+    s3_key: str = Field(alias="s3Key")
+    file_name: str = Field(alias="fileName")
+
+    model_config = {"populate_by_name": True}
+
+
+# ── Upload pipeline ───────────────────────────────────────────────────────────
+
+
+class PipelineFolder(str, Enum):
+    """The frontend folder the invoice was uploaded into.
+
+    This selects the Tekion flow and is authoritative — OCR's own document_type
+    is recorded for review but never changes the routing.
+    """
+
+    SUBLET = "SUBLET"
+    MISCELLANEOUS = "MISCELLANEOUS"
+    STOCK = "STOCK"
+    OEM = "OEM"
+    VEHICLE_MANUFACTURING = "VEHICLE_MANUFACTURING"
+
+
+class ReviewEdit(BaseModel):
+    """A correction to a Misc invoice held for review.
+
+    `fields` merges into what is there; `lines` replaces the whole table,
+    because removing a line is an edit and a merge could not express it. Either
+    may be omitted to leave that half alone.
+    """
+
+    fields: dict[str, Any] | None = None
+    lines: list[dict[str, Any]] | None = None
+
+
+class PoDecisionRequest(BaseModel):
+    """Which purchase order to invoice against.
+
+    "existing" invoices the PO already in Tekion; "new" raises a fresh one, the
+    behaviour before this check existed. Honoured for one run either way.
+    """
+
+    choice: Literal["existing", "new"]
+
+
+class RerunRequest(BaseModel):
+    """Corrections to apply before running a refused document again.
+
+    Everything is optional and blank values are ignored, so a form with three
+    of eight boxes filled corrects three fields rather than clearing five.
+    """
+
+    stock_number: str = Field(default="", alias="stockNumber")
+    vin: str = ""
+    invoice_number: str = Field(default="", alias="invoiceNumber")
+    invoice_date: str = Field(default="", alias="invoiceDate")
+    dealership_name: str = Field(default="", alias="dealershipName")
+    manufacturer: str = ""
+    dealer_cost_total: str = Field(default="", alias="dealerCostTotal")
+    # {"2245": "904.00"} -- the GL account a clerk wrote, and the amount it
+    # points at. Merged into what OCR read rather than replacing it.
+    gl_annotations: dict[str, str] = Field(default_factory=dict, alias="glAnnotations")
+
+    model_config = {"populate_by_name": True}
+
+
+class PipelineAcceptedResponse(BaseModel):
+    """Returned immediately on upload, before OCR runs."""
+
+    document_id: UUID = Field(alias="documentId")
+    status: str
+    folder: str
+    file_name: str = Field(alias="fileName")
+
+    model_config = {"populate_by_name": True}
+
+
+class PipelineStatusResponse(BaseModel):
+    document_id: UUID = Field(alias="documentId")
+    status: str
+    folder: str = ""
+    file_name: str = Field(default="", alias="fileName")
+    s3_key: str = Field(default="", alias="s3Key")
+    dealership_name: str = Field(default="", alias="dealershipName")
+    vendor_name: str = Field(default="", alias="vendorName")
+    invoice_number: str = Field(default="", alias="invoiceNumber")
+    ro_number: str = Field(default="", alias="roNumber")
+    # Set when the folder was SUBLET / MISCELLANEOUS / STOCK.
+    po_number: str = Field(default="", alias="poNumber")
+    # Set when the folder was OEM (journal entry).
+    transaction_id: str = Field(default="", alias="transactionId")
+    transaction_number: str = Field(default="", alias="transactionNumber")
+    journal_id: str = Field(default="", alias="journalId")
+    # What OCR thought the document was — for review when it disagrees.
+    ocr_document_type: str = Field(default="", alias="ocrDocumentType")
+    # Set when status is DUPLICATE: the already-processed document this repeats.
+    duplicate_of: UUID | None = Field(default=None, alias="duplicateOf")
+    # Set when status is PO_DECISION: the purchase order this invoice names,
+    # which already exists in Tekion. Carries its number, vendor, total, status
+    # and the invoices already on it, so the choice can be made without opening
+    # Tekion and without this endpoint calling it.
+    po_candidate: dict[str, Any] | None = Field(default=None, alias="poCandidate")
+    # Set when status is AWAITING_REVIEW: what the flow would post -- the fields
+    # read and the GL lines chosen -- plus how those lines add up. Kept after
+    # posting as the record of what was approved.
+    review_draft: dict[str, Any] | None = Field(default=None, alias="reviewDraft")
+    # What a person typed in on a previous re-run, so the form comes back filled
+    # rather than blank on the second correction.
+    manual_fields: dict[str, Any] = Field(default_factory=dict, alias="manualFields")
+    # What the vehicle flow read, matched and built. Present on refusals too.
+    vehicle_details: dict[str, Any] = Field(default_factory=dict, alias="vehicleDetails")
+    # What was read off the document in any folder -- invoice date, and the
+    # handwritten GL lines with their signs -- for the correction form.
+    read_fields: dict[str, Any] = Field(default_factory=dict, alias="readFields")
+    # What this document posted to Tekion -- the GL accounts, the amount against
+    # each, and the totals. The same shape for every flow, so one component
+    # renders a Misc split, a journal entry and a vehicle purchase alike.
+    confidence: dict[str, Any] = Field(default_factory=dict, alias="confidence")
+    posting_details: dict[str, Any] = Field(
+        default_factory=dict, alias="postingDetails"
+    )
+    # Exactly which fields would fix this document, named by the code that
+    # refused it. The correction form renders these and nothing else.
+    needs_fields: list[str] = Field(default_factory=list, alias="needsFields")
+    # Set when this document was cut out of a batch scan: the batch it came
+    # from, and which of its pages this is ("1-2", "3").
+    split_from: UUID | None = Field(default=None, alias="splitFrom")
+    page_range: str = Field(default="", alias="pageRange")
+    # Set when status is SPLIT: the documents this batch was broken into. The
+    # parent does no work of its own, so this is what the user follows instead.
+    children: list[UUID] = Field(default_factory=list)
+    exception_type: str | None = Field(default=None, alias="exceptionType")
+    severity: str | None = None
+    # Queue bookkeeping — how many times it has been tried and why it last failed.
+    attempts: int = 0
+    last_error: str = Field(default="", alias="lastError")
+    # Display name (or email) of the user who uploaded it; "" if unknown.
+    uploaded_by: str = Field(default="", alias="uploadedBy")
+    created_at: datetime = Field(alias="createdAt")
+    processed_at: datetime | None = Field(default=None, alias="processedAt")
+    # Set when the document was deleted. Kept on record, shown greyed out.
+    deleted_at: datetime | None = Field(default=None, alias="deletedAt")
+
+    model_config = {"populate_by_name": True}
+
+
+# ── Dashboard ─────────────────────────────────────────────────────────────────
+
+
+
+class TrendPoint(BaseModel):
+    """One month on the processing trend chart."""
+
+    # "Jan", "Feb" ... for the axis, plus the real month so the client can sort
+    # or label a year boundary without parsing the short name back.
+    month: str
+    year: int
+    month_number: int
+    total: int
+    processed: int
+    exceptions: int
+    auto_resolved: int
+
+
+class TrendsResponse(BaseModel):
+    points: list[TrendPoint]
+    # Totals across the whole window, for the breakdown beside the chart.
+    total: int
+    processed: int
+    exceptions: int
+    auto_resolved: int
+
+
+class DashboardSummary(BaseModel):
+    total: int
+    processed: int
+    exceptions: int
+    auto_resolved: int
+
+
+class DocumentsByType(BaseModel):
+    """Document counts per intake folder.
+
+    One field per value of PipelineFolder. A folder missing here is counted by
+    the database and then dropped on the way out -- which is what happened to
+    VEHICLE_MANUFACTURING, whose card on Document Intake read zero while its
+    own page listed the documents. Add the field whenever a folder is added.
+    """
+
+    PO_INVOICE: int = 0
+    SUBLET: int = 0
+    MISCELLANEOUS: int = 0
+    STOCK: int = 0
+    # OEM documents become journal entries rather than POs, but they are counted
+    # here too so the dashboard shows every folder.
+    OEM: int = 0
+    VEHICLE_MANUFACTURING: int = 0
+
+
+class ExceptionItem(BaseModel):
+    id: UUID
+    vendor: str
+    invoice_number: str
+    po_number: str
+    exception_type: str
+
+
+class DashboardResponse(BaseModel):
+    summary: DashboardSummary
+    by_type: DocumentsByType
+    recent_exceptions: list[ExceptionItem]
+
+
+class DocumentItem(BaseModel):
+    id: UUID
+    # Set when status is DUPLICATE — the already-processed document this
+    # repeats. Exposed on the list so the table can pair them up and offer the
+    # decision without opening each row.
+    duplicate_of: UUID | None = None
+    # Set when the row was deleted. It stays in the list, greyed out -- the
+    # record is kept, it is only taken out of the way.
+    deleted_at: datetime | None = None
+    deleted_by: str = ""
+    file_name: str
+    dealership_name: str
+    vendor_name: str
+    invoice_number: str
+    vin: str
+    ro_number: str
+    po_number: str
+    # The journal entry an OEM or vehicle document created. With po_number, it
+    # is how the table can say WHAT a deleted row left behind in Tekion.
+    transaction_number: str = ""
+    po_type: str
+    status: str
+    exception_type: str | None
+    created_at: datetime
+    processed_at: datetime | None
+    # Vendor Invoice flow only: {writes, attached, posted}, so the table can
+    # tell a verified invoice from a posted one. None for every other flow.
+    vi_post: dict[str, bool] | None = None
+
+
+class DocumentListResponse(BaseModel):
+    items: list[DocumentItem]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
+class ExceptionListItem(BaseModel):
+    id: UUID
+    vendor_name: str
+    invoice_number: str
+    vin: str
+    po_number: str
+    ro_number: str
+    exception_type: str | None
+    # PO | JE | DUPLICATE | OTHER — Parts vs AP vs duplicate buckets.
+    exception_category: str = "OTHER"
+    severity: str | None
+    detected_on: datetime
+    document_type: str
+    status: str
+    duplicate_of: UUID | None = None
+
+
+class ExceptionListResponse(BaseModel):
+    items: list[ExceptionListItem]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+    # Counts per category across the filtered set (before pagination).
+    by_category: dict[str, int] = {}
+
+
+class ExceptionTypeCount(BaseModel):
+    exception_type: str
+    count: int
+
+
+class ExceptionAnalyticsResponse(BaseModel):
+    total_exceptions: int
+    critical: int
+    medium: int
+    low: int
+    auto_resolved: int
+    by_exception_type: list[ExceptionTypeCount]
+
+
+class NotificationItem(BaseModel):
+    id: UUID
+    title: str
+    message: str
+    category: str
+    severity: str
+    is_read: bool
+    document_id: UUID | None = None
+    created_at: datetime
+
+
+class NotificationListResponse(BaseModel):
+    items: list[NotificationItem]
+    total: int
+    unread_count: int
+    page: int
+    page_size: int
+    total_pages: int

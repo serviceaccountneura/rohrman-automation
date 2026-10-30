@@ -1,0 +1,25 @@
+# Anything not needed to run the API. Keeps the build context small and, more
+# importantly, keeps credentials out of the image.
+.venv/
+node_modules/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+
+# Secrets. Supplied at runtime through the environment or a mount -- never
+# baked into a layer, where they survive in the image history.
+.env
+.env.*
+neura_vertex_ai.json
+tekion-auth.json
+
+# Development-only: browser capture recordings, traces, scratch output.
+captured/
+ocr_testing/
+docs/
+*.har
+*.zip
+
+# Frontend lives in its own repo and its own image.
+src/playwright/

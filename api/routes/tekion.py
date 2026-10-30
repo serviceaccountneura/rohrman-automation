@@ -1,0 +1,670 @@
+"""Tekion routes — PO helpers + vendor mapping management.
+
+POST /api/tekion/po        — create a STOCK PO only (Sublet/Misc create is off;
+                             those invoices pre-invoice an existing Tekion PO
+                             via the upload pipeline)
+GET  /api/tekion/vendors/{dealer_id}  — list vendor mappings for a dealer
+POST /api/tekion/vendors   — add/update a vendor mapping (after human review)
+"""
+from __future__ import annotations
+
+import threading
+from datetime import datetime, timedelta, timezone
+from typing import Annotated, Any
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlmodel import Session, select
+
+from api.config import settings
+from api.db import get_session
+from api.deps import CurrentUserDep
+from api.models.db import Document, VendorMapping
+from api.services import access, file_source
+from api.models.schemas import (
+    CreateMiscPoRequest,
+    CreatePoRequest,
+    CreatePoResponse,
+    GlLine,
+    CreateStockPoRequest,
+    CreateSubletPoRequest,
+    VendorCandidate,
+)
+from api.services.tekion_client import TekionApiClient
+from api.services.tekion_lock import tekion_scope
+from api.services.vendor_service import _normalize, resolve_vendor
+from api.services.gl_service import resolve_gl
+from api.services.gl_service_misc import refresh_gl_accounts as refresh_gl_cache
+
+router = APIRouter(prefix="/api/tekion", tags=["tekion"])
+
+# Shared client — hydrated from DB session, re-logs in lazily on 401.
+_client: TekionApiClient | None = None
+_client_lock = threading.Lock()
+
+
+def get_client(db_session: Session) -> TekionApiClient:
+    global _client
+    with _client_lock:
+        if _client is None:
+            _client = TekionApiClient(db_session=db_session)
+            # Try to restore the saved session before logging in.
+            if not _client.load_session():
+                _client.login()
+        else:
+            # Keep the DB session reference current (each request has its own).
+            _client._db = db_session
+        return _client
+
+
+def reset_client() -> None:
+    global _client
+    with _client_lock:
+        _client = None
+
+
+# ── Dealer list cache ─────────────────────────────────────────────────────────
+# The roster changes rarely and answering from a cold client costs a Tekion
+# login, so hold it for a day. GET /api/tekion/dealers?refresh=true busts it.
+_dealers_cache: list[dict[str, str]] | None = None
+_dealers_cached_at: datetime | None = None
+_dealers_lock = threading.Lock()
+_DEALERS_TTL = timedelta(hours=24)
+
+
+def _resolve_dealer(client: TekionApiClient, dealership_name: str) -> str:
+    dealer_id = client.find_dealer_by_name(dealership_name)
+    if dealer_id:
+        client.switch_dealer(dealer_id)
+        return dealer_id
+    raise HTTPException(
+        status_code=400,
+        detail=f"Could not match dealership '{dealership_name}' to any dealer",
+    )
+
+
+def _resolve_vendor(
+    client: TekionApiClient,
+    dealer_id: str,
+    vendor_name: str,
+    session: Session,
+    vendor_codes: list[str] | None = None,
+) -> dict:
+    result = resolve_vendor(dealer_id, vendor_name, session, client, vendor_codes)
+    if result["resolved"]:
+        return result["vendor"]
+
+    candidates = [
+        VendorCandidate(
+            id=c["id"],
+            name=c["name"],
+            displayId=c["displayId"],
+            siteId=c.get("siteId", ""),
+            phone=c.get("phone", ""),
+            email=c.get("email", ""),
+        )
+        for c in result.get("candidates", [])
+    ]
+    reason = result.get("reason", "not_in_mapping")
+    detail = {
+        "message": (
+            f"Vendor '{vendor_name}' is not in the mapping for dealer {dealer_id}."
+            if reason == "not_in_mapping"
+            else f"Vendor displayId '{result.get('vendor_display_id')}' from mapping "
+            f"was not found in Tekion (stale mapping)."
+        ),
+        "reason": reason,
+        "dealer_id": dealer_id,
+        "vendor_name": vendor_name,
+        "candidates": [c.model_dump(by_alias=True) for c in candidates],
+    }
+    raise HTTPException(status_code=422, detail=detail)
+
+
+# ── Unified PO creation ───────────────────────────────────────────────────────
+
+
+def _record_po_result(
+    document_id: UUID,
+    req: CreatePoRequest,
+    response: CreatePoResponse,
+    session: Session,
+) -> None:
+    """Write the PO outcome onto the documents row from POST /api/ocr/extract.
+
+    Lets the presigned-upload flow land in the same table the pipeline uses, so
+    the dashboard and exception queue cover both paths.
+    """
+    doc = session.get(Document, document_id)
+    if doc is None:
+        print(f"[PO] document {document_id} not found; result not recorded")
+        return
+
+    doc.po_type = doc.po_type or req.po_type
+    doc.dealership_name = doc.dealership_name or req.dealership_name
+    doc.invoice_number = doc.invoice_number or req.invoice_number
+    if response.success:
+        doc.po_number = response.po_number or ""
+        doc.vendor_name = response.vendor_name or doc.vendor_name
+        doc.status = "PROCESSED"
+        doc.exception_type = None
+        doc.severity = None
+    else:
+        doc.status = "EXCEPTION"
+        doc.exception_type = "TEKION_ERROR"
+        doc.severity = "HIGH"
+        doc.last_error = (response.error or "")[:1000]
+    doc.processed_at = datetime.now(timezone.utc)
+    session.add(doc)
+    session.commit()
+
+
+@router.post("/po", response_model=CreatePoResponse)
+def create_po(
+    req: CreatePoRequest,
+    session: Annotated[Session, Depends(get_session)],
+) -> CreatePoResponse:
+    # Sublet/Misc no longer create POs via this route — only STOCK still does.
+    # Invoice uploads go through the pipeline, which matches an existing PO.
+    if isinstance(req, (CreateSubletPoRequest, CreateMiscPoRequest)):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Creating Sublet/Miscellaneous purchase orders is turned off. "
+                "Raise the PO in Tekion, then upload the invoice through Document "
+                "Intake so it can be pre-invoiced against that PO."
+            ),
+        )
+
+    # invoice_file_path may be an S3 key (the frontend uploads there directly and
+    # never has a local path). Resolve it to a real file for the duration of the
+    # call; anything downloaded is cleaned up on the way out.
+    with file_source.resolve(req.invoice_file_path) as local_path:
+        if local_path != req.invoice_file_path:
+            req = req.model_copy(update={"invoice_file_path": local_path})
+
+        # Serialized: the flows below switch dealership on a shared client, so two
+        # concurrent requests for different dealerships would otherwise interleave
+        # and post to the wrong one. The flow logic itself is unchanged.
+        with tekion_scope():
+            if isinstance(req, CreateStockPoRequest):
+                response = _create_stock_po(req, session)
+            else:
+                raise HTTPException(status_code=400, detail="Unsupported PO type")
+
+    if req.document_id is not None:
+        _record_po_result(req.document_id, req, response, session)
+
+    return response
+
+
+def _gl_lines_posted(
+    *,
+    dealer_id: str,
+    ap_gl_account_id: str,
+    invoice_amount: float,
+    gl_splits: list[dict] | None,
+    gl_account_id: str,
+    net_amount: float,
+    source: str,
+) -> list[GlLine]:
+    """The accounting lines a pre-invoice carried, as Tekion shows them.
+
+    Debits first, then the A/P credit -- the order and the signs of the
+    "Accounting Details" panel in Tekion, so what the document records and what
+    a clerk sees on screen are the same thing read twice.
+
+    Nothing is recomputed here. These are the figures that were sent; if they
+    are wrong they are wrong in Tekion too, which is the point of recording
+    them.
+    """
+    lines: list[GlLine] = []
+    if gl_splits:
+        for split in gl_splits:
+            lines.append(
+                GlLine(
+                    gl_account=str(split.get("gl_account_id") or "").split("_")[-1],
+                    gl_name=str((split.get("resolved") or {}).get("account_name") or ""),
+                    amount=round(float(split.get("amount") or 0), 2),
+                    source=source,
+                )
+            )
+    elif gl_account_id:
+        lines.append(
+            GlLine(
+                gl_account=gl_account_id.split("_")[-1],
+                amount=round(net_amount, 2),
+                source=source,
+            )
+        )
+
+    lines.append(
+        GlLine(
+            gl_account=ap_gl_account_id.split("_")[-1],
+            gl_name="A/P",
+            amount=-round(invoice_amount, 2),
+            source="accounts payable",
+        )
+    )
+    return lines
+
+
+# What a purchase order looks like to the rest of the flow when nothing was
+# created in Tekion (TEKION_PO_WRITES off): no number, no id.
+_PO_NOT_CREATED = {"poNumber": "", "poId": None, "status": "NOT_CREATED", "universalId": ""}
+
+
+def _create_sublet_po(
+    req: CreateSubletPoRequest,
+    session: Session,
+    existing_po: dict | None = None,
+) -> CreatePoResponse:
+    """Pre-invoice an existing sublet PO in Tekion.
+
+    New Sublet POs are not created here -- parts raise them in Tekion first.
+    `existing_po` is required (see api/services/po_reuse.py).
+    """
+    if not existing_po:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Creating a sublet purchase order is turned off. Raise the PO in "
+                "Tekion first, then upload the invoice to pre-invoice against it."
+            ),
+        )
+    try:
+        from api.services import po_reuse
+
+        client = get_client(session)
+        dealer_id = _resolve_dealer(client, req.dealership_name)
+        po = existing_po
+        vendor = po_reuse.vendor_from_po(po) or _resolve_vendor(
+            client, dealer_id, req.vendor_name, session, req.vendor_codes
+        )
+
+        # Pre-invoice — GL 2460 for sublet, AP GL 3002.
+        gl_account_id = f"{dealer_id}_2460"
+        ap_gl_account_id = f"{dealer_id}_3002"
+        # Control from the invoice RO if present, else the one already on the PO.
+        ref_text = (
+            req.line_items[0].ro_number
+            if req.line_items
+            else str(po.get("controlNumber") or "")
+        )
+
+        # Upload invoice document if provided.
+        attachment_media_ids: list[str] = []
+        if req.invoice_file_path and settings.tekion_po_writes:  # TEKION_PO_WRITES
+            media_id = client.upload_document(req.invoice_file_path)
+            attachment_media_ids.append(media_id)
+
+        result = {"invoiceId": None} if not settings.tekion_po_writes else client.pre_invoice(  # TEKION_PO_WRITES
+            vendor_id=vendor["id"],
+            vendor_site_id=vendor["siteId"],
+            vendor_name=vendor["name"],
+            vendor_display_id=vendor["displayId"],
+            dealer_id=dealer_id,
+            po_id=po["poId"],
+            po_number=po["poNumber"],
+            universal_id=po["universalId"],
+            invoice_number=req.invoice_number,
+            invoice_amount=req.invoice_amount,
+            gl_account_id=gl_account_id,
+            ap_gl_account_id=ap_gl_account_id,
+            ref_text=ref_text,
+            po_type="SUBLET",
+            sales_tax=req.sales_tax,
+            # Reused orders have no SALES TAX line we raised; do not consume
+            # more of their PO than this invoice is entitled to.
+            po_covers_tax=False,
+            attachment_media_ids=attachment_media_ids or None,
+        )
+
+        return CreatePoResponse(
+            success=True,
+            po_number=po["poNumber"],
+            po_id=po["poId"],
+            po_status=po["status"],
+            invoice_id=result["invoiceId"],
+            vendor_name=vendor["name"],
+            gl_lines=_gl_lines_posted(
+                dealer_id=dealer_id,
+                ap_gl_account_id=ap_gl_account_id,
+                invoice_amount=req.invoice_amount,
+                gl_splits=None,
+                gl_account_id=gl_account_id,
+                net_amount=req.invoice_amount - req.sales_tax,
+                source="sublet repairs payable",
+            ),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        reset_client()
+        return CreatePoResponse(success=False, error=str(e))
+
+
+def _create_misc_po(
+    req: CreateMiscPoRequest,
+    session: Session,
+    existing_po: dict | None = None,
+) -> CreatePoResponse:
+    """Pre-invoice an existing misc PO in Tekion.
+
+    New Misc POs are not created here -- parts raise them in Tekion first.
+    `existing_po` is required. GL prefers Tekion ``preInvoicing/postings``,
+    then the PO's misc lines, then any splits written on the invoice.
+    """
+    if not existing_po:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Creating a miscellaneous purchase order is turned off. Raise "
+                "the PO in Tekion first, then upload the invoice to pre-invoice "
+                "against it."
+            ),
+        )
+    try:
+        from api.services import po_reuse
+
+        client = get_client(session)
+        dealer_id = _resolve_dealer(client, req.dealership_name)
+        po = existing_po
+        vendor = po_reuse.vendor_from_po(po) or _resolve_vendor(
+            client, dealer_id, req.vendor_name, session, req.vendor_codes
+        )
+
+        ap_gl_account_id = f"{dealer_id}_3002"
+        gl_splits: list[dict] | None = None
+        gl_account_id: str | None = None
+        gl_source = "tekion postings"
+
+        ocr_gl_items = [li for li in req.line_items if li.gl_account]
+
+        if req.gl_splits:
+            # Clerk corrections / handwritten splits still win when present.
+            gl_splits = [
+                {
+                    "gl_account_id": sp.account_id or f"{dealer_id}_{sp.gl_account}",
+                    "amount": sp.amount,
+                    "description": sp.description,
+                    "ref_text": sp.control or "",
+                }
+                for sp in req.gl_splits
+            ]
+            written = sum(sp.amount for sp in req.gl_splits)
+            gl_source = "written on the invoice"
+            print(
+                f"[Misc] Using {len(gl_splits)} GL split(s) written on the invoice, "
+                f"totalling {written:,.2f} against an invoice of {req.invoice_amount:,.2f}"
+            )
+            if abs(written - req.invoice_amount) > 0.01:
+                print(
+                    f"[Misc] WARNING: splits differ from the invoice total by "
+                    f"{written - req.invoice_amount:,.2f}"
+                )
+        elif ocr_gl_items:
+            gl_totals: dict[str, float] = {}
+            for li in ocr_gl_items:
+                gl_num = li.gl_account or ""
+                line_total = li.qty * li.unit_price
+                gl_totals[gl_num] = gl_totals.get(gl_num, 0) + line_total
+
+            gl_splits = [
+                {
+                    "gl_account_id": f"{dealer_id}_{gl_num}",
+                    "amount": amt,
+                    "description": None,
+                }
+                for gl_num, amt in gl_totals.items()
+            ]
+            gl_source = "read from the line items"
+            print(f"[Misc] Using OCR GL splits: {len(gl_splits)} GL account(s)")
+        else:
+            # Fallback if Tekion postings come back empty.
+            gl_splits = po_reuse.misc_gl_splits_from_po(po) or None
+            if gl_splits:
+                gl_source = "from the Tekion PO lines"
+                print(f"[Misc] Using {len(gl_splits)} GL split(s) from the Tekion PO")
+            else:
+                gl_account_id = f"{dealer_id}_2410"
+                gl_source = "default parts inventory"
+                print(f"[Misc] No PO GL lines; falling back to {gl_account_id}")
+
+        # Upload invoice document if provided.
+        attachment_media_ids: list[str] = []
+        if req.invoice_file_path and settings.tekion_po_writes:  # TEKION_PO_WRITES
+            media_id = client.upload_document(req.invoice_file_path)
+            attachment_media_ids.append(media_id)
+
+        # Prefer what Tekion returns from preInvoicing/postings (same as Stock).
+        use_postings = not req.gl_splits and not ocr_gl_items
+        result = {"invoiceId": None} if not settings.tekion_po_writes else client.pre_invoice(  # TEKION_PO_WRITES
+            vendor_id=vendor["id"],
+            vendor_site_id=vendor["siteId"],
+            vendor_name=vendor["name"],
+            vendor_display_id=vendor["displayId"],
+            dealer_id=dealer_id,
+            po_id=po["poId"],
+            po_number=po["poNumber"],
+            universal_id=po["universalId"],
+            invoice_number=req.invoice_number,
+            invoice_amount=req.invoice_amount,
+            gl_account_id=gl_account_id or "",
+            ap_gl_account_id=ap_gl_account_id,
+            ref_text="",
+            po_type="MISCELLANEOUS",
+            sales_tax=req.sales_tax,
+            po_covers_tax=False,
+            attachment_media_ids=attachment_media_ids or None,
+            gl_splits=gl_splits,
+            use_returned_postings=use_postings,
+        )
+
+        return CreatePoResponse(
+            success=True,
+            po_number=po["poNumber"],
+            po_id=po["poId"],
+            po_status=po["status"],
+            invoice_id=result["invoiceId"],
+            vendor_name=vendor["name"],
+            gl_lines=_gl_lines_posted(
+                dealer_id=dealer_id,
+                ap_gl_account_id=ap_gl_account_id,
+                invoice_amount=req.invoice_amount,
+                gl_splits=gl_splits,
+                gl_account_id=gl_account_id or "",
+                net_amount=req.invoice_amount - req.sales_tax,
+                source=gl_source,
+            ),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        reset_client()
+        return CreatePoResponse(success=False, error=str(e))
+
+
+def _create_stock_po(
+    req: CreateStockPoRequest,
+    session: Session,
+) -> CreatePoResponse:
+    try:
+        client = get_client(session)
+        dealer_id = _resolve_dealer(client, req.dealership_name)
+        vendor = _resolve_vendor(
+            client, dealer_id, req.vendor_name, session, req.vendor_codes
+        )
+
+        if not req.parts:
+            raise HTTPException(
+                status_code=422,
+                detail="Stock PO requires at least one part",
+            )
+
+        # Fetch dealer address for shipping/billing
+        dealer_address = client.get_dealer_address()
+
+        order = client.create_stock_order(
+            vendor_id=int(vendor["id"]),
+            vendor_name=vendor["name"],
+            vendor_display_id=vendor["displayId"],
+            vendor_site_id=vendor["siteId"],
+            vendor_phone=vendor["phone"],
+            vendor_email=vendor["email"],
+            parts=[p.model_dump(by_alias=True) for p in req.parts],
+            dealer_address=dealer_address,
+        )
+
+        return CreatePoResponse(
+            success=True,
+            po_number=str(order.get("orderNumber") or ""),
+            po_id=order.get("orderId"),
+            po_status=order.get("status"),
+            vendor_name=order.get("vendorName") or vendor["name"],
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        reset_client()
+        return CreatePoResponse(success=False, error=str(e))
+
+
+@router.get("/dealers")
+def list_dealers(
+    session: Annotated[Session, Depends(get_session)],
+    current_user: CurrentUserDep,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """Every dealership this Tekion login can reach.
+
+    The login response carries the full dealer list, but nothing exposed it —
+    so callers were left guessing at dealership names. `name` is Tekion's own
+    display name and is exactly what `dealership_name` expects elsewhere in this
+    API; sending anything else risks a fuzzy match onto the wrong store.
+
+    Cached for a day: the roster changes rarely, and a cold client would
+    otherwise re-login to Tekion just to answer this. Pass `?refresh=true` to
+    force a re-fetch after a dealership is added or renamed.
+    """
+    global _dealers_cache, _dealers_cached_at
+
+    now = datetime.now(timezone.utc)
+    with _dealers_lock:
+        fresh_enough = (
+            _dealers_cache is not None
+            and _dealers_cached_at is not None
+            and now - _dealers_cached_at < _DEALERS_TTL
+        )
+        if fresh_enough and not refresh:
+            # The cache holds the FULL roster and is shared by everyone; the
+            # narrowing happens per response, never in the cache itself.
+            return {
+                "dealers": access.visible_dealerships(current_user, _dealers_cache),
+                "cached": True,
+                "fetchedAt": _dealers_cached_at.isoformat(),
+            }
+
+    try:
+        client = get_client(session)
+        if not client.dealers:
+            # A restored session carries the list; a cold one has to log in.
+            client.login()
+        dealers = [
+            {"dealerId": d["dealerId"], "name": d["dealerDisplayName"]}
+            for d in sorted(client.dealers, key=lambda d: d["dealerDisplayName"])
+        ]
+    except Exception as e:
+        reset_client()
+        with _dealers_lock:
+            # Serve a stale list rather than breaking the picker outright.
+            if _dealers_cache:
+                print(f"[TEKION] dealer refresh failed ({e}); serving cached list")
+                return {
+                    "dealers": access.visible_dealerships(current_user, _dealers_cache),
+                    "cached": True,
+                    "stale": True,
+                    "fetchedAt": (
+                        _dealers_cached_at.isoformat() if _dealers_cached_at else None
+                    ),
+                }
+        raise HTTPException(status_code=502, detail=f"Could not load dealers: {e}")
+
+    with _dealers_lock:
+        _dealers_cache = dealers
+        _dealers_cached_at = now
+
+    print(f"[TEKION] dealer list refreshed ({len(dealers)} dealerships)")
+    return {
+        "dealers": access.visible_dealerships(current_user, dealers),
+        "cached": False,
+        "fetchedAt": now.isoformat(),
+    }
+
+
+@router.get("/vendors/{dealer_id}")
+def list_vendor_mappings(
+    dealer_id: str,
+    session: Annotated[Session, Depends(get_session)],
+) -> list[dict]:
+    """List all vendor mappings for a dealership."""
+    rows = session.exec(
+        select(VendorMapping).where(VendorMapping.dealer_id == dealer_id)
+    ).all()
+    return [
+        {"vendor_name": r.vendor_name, "vendor_display_id": r.vendor_display_id}
+        for r in rows
+    ]
+
+
+@router.post("/vendors")
+def add_vendor_mapping(
+    dealer_id: str,
+    vendor_name: str,
+    vendor_display_id: str,
+    session: Annotated[Session, Depends(get_session)],
+) -> dict:
+    """Add or update a vendor mapping. Used after human review picks a candidate."""
+    normalized = _normalize(vendor_name)
+    existing = session.exec(
+        select(VendorMapping).where(
+            VendorMapping.dealer_id == dealer_id,
+            VendorMapping.vendor_name == normalized,
+        )
+    ).first()
+
+    if existing:
+        existing.vendor_display_id = vendor_display_id
+        session.add(existing)
+    else:
+        session.add(
+            VendorMapping(
+                dealer_id=dealer_id,
+                vendor_name=normalized,
+                vendor_display_id=vendor_display_id,
+            )
+        )
+    session.commit()
+    return {"message": "Vendor mapping saved"}
+
+
+@router.post("/gl-accounts/{dealer_id}/refresh")
+def refresh_gl_accounts(
+    dealer_id: str,
+    session: Annotated[Session, Depends(get_session)],
+) -> dict:
+    """Force-refresh cached GL accounts for a dealership from Tekion."""
+    try:
+        client = get_client(session)
+        accounts = refresh_gl_cache(dealer_id, client, session)
+        return {
+            "message": "GL accounts refreshed",
+            "dealer_id": dealer_id,
+            "count": len(accounts),
+        }
+    except Exception as e:
+        reset_client()
+        raise HTTPException(status_code=500, detail=str(e))

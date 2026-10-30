@@ -1,0 +1,392 @@
+"""SQLModel table definitions — auth + vendor mappings + Tekion sessions + documents + GL mappings."""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from uuid import UUID, uuid4
+
+from sqlalchemy import UniqueConstraint
+from sqlmodel import Field, SQLModel
+
+
+# Timestamps are stored NAIVE, and naive means UTC.
+#
+# That was already the assumption everywhere that reads one back
+# (`exp.replace(tzinfo=timezone.utc)`), but it was not true on write: handing an
+# aware datetime to a TIMESTAMP WITHOUT TIME ZONE column makes psycopg convert
+# it to the session's timezone first and store the local wall clock. On a
+# machine at UTC+5 an invite written to expire in 24 hours came back reading
+# five hours later than intended, and a password reset link that had expired
+# still validated as good.
+#
+# Stripping the offset here makes what is stored match what every reader
+# already believes. It also makes the behaviour identical wherever the app runs,
+# rather than silently depending on the server's timezone.
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _utcnow_plus_hours(hours: int) -> datetime:
+    from datetime import timedelta
+
+    return _utcnow() + timedelta(hours=hours)
+
+
+def as_utc(value: datetime) -> datetime:
+    """A stored timestamp as an aware UTC datetime."""
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+
+def is_expired(expires_at: datetime) -> bool:
+    """Whether a stored expiry has passed. The one place that decides."""
+    return as_utc(expires_at) < datetime.now(timezone.utc)
+
+
+class User(SQLModel, table=True):
+    __tablename__ = "users"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    email: str = Field(index=True, unique=True, max_length=255)
+    full_name: str | None = Field(default=None, max_length=255)
+    hashed_password: str
+    role: str = Field(default="AP_CLERK", max_length=50, index=True)
+    # Dealerships this user may see, as a JSON array of Tekion display names.
+    # An EMPTY string means every dealership -- the historical behaviour, and
+    # what admins get. A populated array restricts to exactly those names.
+    #
+    # Stored as JSON rather than a join table: the list is short, it is always
+    # read whole, and nothing queries across it.
+    dealerships: str = Field(default="", max_length=4000)
+    is_active: bool = Field(default=True)
+    is_superuser: bool = Field(default=False)
+    # Tokens issued before this are refused. There is no server-side session
+    # to revoke -- a login is one signed token, good for 7 days -- so this is
+    # how a password reset still signs out every existing session. NULL means
+    # every unexpired token is good.
+    tokens_valid_after: datetime | None = Field(default=None)
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class VendorMapping(SQLModel, table=True):
+    """Maps (dealer_id, vendor_name) → Tekion vendorDisplayId.
+
+    Seeded per-dealership so PO creation resolves the exact vendor
+    instead of fuzzy-searching Tekion and taking the first hit.
+    """
+
+    __tablename__ = "vendor_mappings"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    dealer_id: str = Field(index=True, max_length=20)
+    # Normalized vendor name — uppercase, stripped. Used for lookups.
+    vendor_name: str = Field(index=True, max_length=255)
+    # Tekion vendorDisplayId, e.g. "1707_160"
+    vendor_display_id: str = Field(max_length=100)
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("dealer_id", "vendor_name", name="uq_vendor_mapping_dealer_vendor"),
+    )
+
+
+class TekionSession(SQLModel, table=True):
+    """Persisted Tekion API session — avoids re-logging in on every request.
+
+    The client tries the saved session first; if Tekion returns 401/403,
+    it re-logs in and updates this row.
+    """
+
+    __tablename__ = "tekion_sessions"
+
+    # Singleton row — always id=1.
+    id: int = Field(default=1, primary_key=True)
+    cookies: str = Field(default="", max_length=10000)
+    api_token: str = Field(default="", max_length=1000)
+    user_id: str = Field(default="", max_length=100)
+    dealer_id: str = Field(default="", max_length=20)
+    site_id: str = Field(default="", max_length=30)
+    dealers_json: str = Field(default="[]", max_length=10000)
+    created_at: datetime = Field(default_factory=_utcnow)
+    last_used_at: datetime = Field(default_factory=_utcnow)
+
+
+class Document(SQLModel, table=True):
+    """Tracks each document (invoice/PO/parts ticket) through the automation pipeline.
+
+    Powers the dashboard stats and exception queue.
+    """
+
+    __tablename__ = "documents"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    file_name: str = Field(default="", max_length=500)
+    # Where the uploaded file landed in S3, so the row points at the source doc.
+    s3_key: str = Field(default="", max_length=1000)
+    dealership_name: str = Field(default="", max_length=255, index=True)
+    vendor_name: str = Field(default="", max_length=255, index=True)
+    invoice_number: str = Field(default="", max_length=100)
+    vin: str = Field(default="", max_length=20)
+    ro_number: str = Field(default="", max_length=100)
+    po_number: str = Field(default="", max_length=100)
+    # SUBLET, MISCELLANEOUS, STOCK, OEM, VEHICLE_MANUFACTURING. Set from the
+    # upload folder, which is authoritative: it selects the pipeline even when
+    # OCR disagrees.
+    #
+    # 40, not 20: VEHICLE_MANUFACTURING is 21 characters and broke every upload
+    # into that folder with a 500 at the INSERT. Room for the next folder name.
+    po_type: str = Field(default="", max_length=40, index=True)
+    # AP_INVOICE, PO, PARTS_TICKET, JOURNAL, GL_REPORT, STATEMENT, REPAIR_ORDER, MANUFACTURER_INVOICE
+    document_type: str = Field(default="", max_length=30, index=True)
+    # What OCR actually detected. Kept alongside po_type so a folder/OCR
+    # mismatch stays visible without blocking the run.
+    ocr_document_type: str = Field(default="", max_length=100)
+    # ── Journal entry results (OEM folder) ────────────────────────────────────
+    # Tekion's transaction id / human-facing number / "{dealerId}_{journal}".
+    transaction_id: str = Field(default="", max_length=50)
+    transaction_number: str = Field(default="", max_length=50)
+    journal_id: str = Field(default="", max_length=50)
+    # QUEUED, PROCESSING, PROCESSED, EXCEPTION, DUPLICATE, PO_DECISION,
+    # AUTO_RESOLVED
+    # (PENDING is retained for rows created before the queue existed.)
+    #
+    # DUPLICATE is a decision point, not a failure: OCR matched an invoice that
+    # was already processed, so the run is held until someone confirms or
+    # discards it. Nothing was sent to Tekion.
+    #
+    # PO_DECISION is the same idea for a different question: the invoice names a
+    # purchase order that already exists in Tekion, and whether to use it or
+    # raise a new one is a person's call. Nothing was sent to Tekion.
+    status: str = Field(default="QUEUED", max_length=20, index=True)
+    # VENDOR_NOT_FOUND, PO_MISMATCH, AMOUNT_MISMATCH, LOW_OCR_CONFIDENCE, etc.
+    exception_type: str | None = Field(default=None, max_length=100)
+    # HIGH, MEDIUM, LOW
+    severity: str | None = Field(default=None, max_length=10, index=True)
+    # Who uploaded it. Null for rows created before this was tracked, and if the
+    # uploader's account is later deleted (the FK is ON DELETE SET NULL).
+    uploaded_by_id: UUID | None = Field(
+        default=None, foreign_key="users.id", index=True
+    )
+    created_at: datetime = Field(default_factory=_utcnow, index=True)
+    processed_at: datetime | None = Field(default=None)
+
+    # ── Soft delete ───────────────────────────────────────────────────────────
+    # Removed from view, kept on record. A document that reached Tekion is part
+    # of the audit trail whether or not anyone wants it in the list, and the
+    # OCR, the corrections and the PO number it produced are the only account of
+    # what happened.
+    #
+    # The timestamp IS the flag -- NULL means live. A separate boolean could
+    # disagree with it, and then neither would be trustworthy.
+    deleted_at: datetime | None = Field(default=None, index=True)
+    deleted_by_id: UUID | None = Field(
+        default=None, foreign_key="users.id"
+    )
+
+    @property
+    def is_deleted(self) -> bool:
+        return self.deleted_at is not None
+
+    # ── Queue bookkeeping ─────────────────────────────────────────────────────
+    # This table doubles as the job queue: workers claim rows with
+    # SELECT ... FOR UPDATE SKIP LOCKED, so status lives in one place and the
+    # dashboard sees queue state for free.
+    #
+    # Where the uploaded file is on disk for the worker to read. Falls back to
+    # downloading s3_key when the temp file is gone (e.g. after a restart).
+    source_path: str = Field(default="", max_length=1000)
+    # SHA-256 of the uploaded bytes — used to spot a re-upload of the same file.
+    file_hash: str = Field(default="", max_length=64, index=True)
+    attempts: int = Field(default=0)
+    # Set while a worker holds the row; cleared when it finishes.
+    locked_at: datetime | None = Field(default=None)
+    locked_by: str = Field(default="", max_length=100)
+    # Retry backoff — the row is invisible to claims until this passes.
+    next_attempt_at: datetime | None = Field(default=None, index=True)
+    last_error: str = Field(default="", max_length=1000)
+
+    # ── Duplicate handling ────────────────────────────────────────────────────
+    # The already-processed document this one repeats. Set alongside the
+    # DUPLICATE status so the UI can show what it collides with.
+    duplicate_of: UUID | None = Field(default=None, foreign_key="documents.id")
+    # Skip the duplicate check for exactly one run. Set when a user confirms a
+    # duplicate should be reprocessed anyway; cleared as soon as it is honoured,
+    # so a later upload is still checked normally.
+    duplicate_override: bool = Field(default=False)
+
+    # ── Reusing an existing purchase order (SUBLET / MISCELLANEOUS) ───────────
+    # What the PO lookup found, as JSON: number, vendor, total, status and the
+    # invoices already on it. Stored so the queue can show the choice without
+    # going back to Tekion, and so resuming does not look it up twice.
+    po_candidate: str = Field(default="", max_length=2000)
+    # EXISTING or NEW -- what a person chose. Honoured for exactly one run and
+    # then cleared, like duplicate_override, so a later upload is asked again.
+    po_choice: str = Field(default="", max_length=20)
+
+    # ── Batch scans ───────────────────────────────────────────────────────────
+    # Several invoices scanned into one file are split into one document each.
+    # The parent keeps the original file and the SPLIT status; each child points
+    # back here and owns the pages it was cut from. A child is never re-split.
+    # What a person typed in after a refusal, as JSON. Overlaid on the OCR
+    # result when the document runs again. Separate from the OCR-derived fields
+    # on purpose: "the invoice says this" and "a person asserted this" are
+    # different claims and the difference is worth keeping.
+    manual_fields: str = Field(default="", max_length=4000)
+    # What the vehicle flow read, matched and built, as JSON. Written on every
+    # attempt including refusals -- those are the ones somebody needs to look
+    # at, and nothing else here records why an entry came out as it did.
+    vehicle_details: str = Field(default="", max_length=8000)
+    # What this document posted to Tekion, in one shape for every flow: the GL
+    # accounts, the amount against each, and what they total. Written on every
+    # attempt including failures -- a refusal is exactly when somebody wants to
+    # see which lines were built and where they stopped adding up.
+    #
+    # Separate from vehicle_details because that one also carries stock numbers,
+    # templates and handwritten annotations, none of which mean anything to a
+    # Misc invoice.
+    posting_details: str = Field(default="", max_length=8000)
+
+    # ── Review before posting (MISCELLANEOUS) ─────────────────────────────────
+    # What the flow decided it WOULD post -- the fields read and the GL lines
+    # chosen -- plus every correction a person makes to it. See
+    # api/services/misc_review.py for the shape.
+    review_draft: str = Field(default="", max_length=8000)
+    # Set when a person releases the draft to Tekion. Cleared once posting is
+    # attempted, so an approval covers exactly one attempt.
+    review_approved: bool = Field(default=False)
+    split_from: UUID | None = Field(default=None, foreign_key="documents.id")
+    # Which pages of the parent this document is, e.g. "1-2" or "3". Empty for
+    # anything that was not split out of a batch.
+    page_range: str = Field(default="", max_length=20)
+
+
+class DocumentAlias(SQLModel, table=True):
+    """An upload that was folded into an earlier document, and which one.
+
+    A re-scan of an invoice that already failed does not become a second row:
+    once OCR has read the invoice number, the new upload moves onto the failed
+    document and is processed there. The new row is dropped -- but the screen
+    that uploaded it is still asking about its id, so that id has to keep
+    leading somewhere. This is where.
+    """
+
+    __tablename__ = "document_aliases"
+
+    alias_id: UUID = Field(primary_key=True)
+    document_id: UUID = Field(foreign_key="documents.id", index=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class GlVendorMapping(SQLModel, table=True):
+    """Master Miscellaneous Vendor-to-GL lookup table.
+
+    Applies across all dealerships when generating a Miscellaneous PO.
+    If a vendor is not in this table, the department fallback is used.
+    """
+
+    __tablename__ = "gl_vendor_mappings"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    # Normalized vendor name (uppercase, stripped) for lookups.
+    vendor_name: str = Field(index=True, unique=True, max_length=255)
+    gl_account: str = Field(max_length=10)
+    description: str = Field(default="", max_length=255)
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class TekionGlAccount(SQLModel, table=True):
+    """Cached GL accounts per dealership, fetched from Tekion.
+
+    Used by the misc PO GL resolver to give the LLM real account names
+    to match against line item descriptions.
+    """
+
+    __tablename__ = "tekion_gl_accounts"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    dealer_id: str = Field(index=True, max_length=20)
+    # Full Tekion GL account ID, e.g. "1708_7473"
+    account_id: str = Field(max_length=50)
+    # Account number only, e.g. "7473"
+    account_number: str = Field(max_length=20)
+    # Human-readable name, e.g. "OFF SUPPLY & EXP - SRV"
+    account_name: str = Field(max_length=255)
+    # e.g. "OPERATING_EXPENSE", "ASSET", "LIABILITY"
+    account_type: str = Field(default="", max_length=50)
+    # e.g. "SERVICE", "PARTS", "VEHICLE_SALES"
+    department_type: str = Field(default="", max_length=50)
+    active: bool = Field(default=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("dealer_id", "account_id", name="uq_tekion_gl_dealer_account"),
+    )
+
+
+class Notification(SQLModel, table=True):
+    """User notifications — exceptions, processing events, system alerts."""
+
+    __tablename__ = "notifications"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    user_id: UUID = Field(foreign_key="users.id", index=True)
+    title: str = Field(max_length=255)
+    message: str = Field(default="", max_length=1000)
+    # EXCEPTION, PO_CREATED, PROCESSED, SYSTEM, etc.
+    category: str = Field(default="SYSTEM", max_length=50, index=True)
+    # INFO, WARNING, ERROR
+    severity: str = Field(default="INFO", max_length=10)
+    is_read: bool = Field(default=False, index=True)
+    # Optional link to a document
+    document_id: UUID | None = Field(default=None, foreign_key="documents.id")
+    created_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
+class PasswordReset(SQLModel, table=True):
+    """A single-use link for resetting a forgotten password.
+
+    Its own table rather than columns on User: a reset token is a credential
+    with its own lifetime, and storing it beside the password hash makes it
+    easy to leak one while reading the other.
+
+    Rows are kept after use rather than deleted, so a second click on the same
+    link can be told it was already used instead of "invalid", which is what
+    sends people to support.
+    """
+
+    __tablename__ = "password_resets"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    token: str = Field(index=True, unique=True, max_length=64)
+    user_id: UUID = Field(foreign_key="users.id", index=True)
+    expires_at: datetime
+    used: bool = Field(default=False)
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class InviteCode(SQLModel, table=True):
+    """Single-use invite codes for user registration.
+
+    Created by an admin, expires in 24 hours, consumed on signup.
+    """
+
+    __tablename__ = "invite_codes"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    code: str = Field(index=True, unique=True, max_length=32)
+    # Who it was sent to. Signup must use this address, so an invite cannot be
+    # forwarded and redeemed by someone else.
+    email: str = Field(default="", index=True, max_length=255)
+    # Role to assign when the invite is used
+    role: str = Field(default="AP_CLERK", max_length=50)
+    # Dealerships to grant on signup. Same encoding as User.dealerships.
+    dealerships: str = Field(default="", max_length=4000)
+    # Pre-filled name (optional — user can override on signup)
+    full_name: str | None = Field(default=None, max_length=255)
+    # Who created the invite. Nulled rather than blocking when that admin is
+    # deleted -- the invite record itself is still worth keeping.
+    created_by: UUID | None = Field(default=None, foreign_key="users.id")
+    used: bool = Field(default=False, index=True)
+    used_by: UUID | None = Field(default=None, foreign_key="users.id")
+    used_at: datetime | None = Field(default=None)
+    expires_at: datetime = Field(default_factory=lambda: _utcnow_plus_hours(24), index=True)
+    created_at: datetime = Field(default_factory=_utcnow)

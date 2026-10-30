@@ -1,0 +1,133 @@
+{% extends "base.html" %}
+{% set page_title = "Document Intake" %}
+{% block content %}
+
+<div class="card">
+  <div class="card-head">
+    <h2 class="section-title flush">Document Intake</h2>
+    <button class="btn-primary sm" onclick="document.getElementById('uploadModal').classList.add('open')">+ Upload Invoice</button>
+  </div>
+
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Vendor</th><th>Invoice</th><th>Store</th><th>Amount</th>
+        <th>Edited by</th><th>Source</th><th>Confidence</th><th>Date</th><th>Action</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr>
+        <td>{{ r.vendor }}</td>
+        <td>{{ r.invoice }}</td>
+        <td>{{ r.store }}</td>
+        <td>{{ r.amount }}</td>
+        <td>{{ r.edited_by }}</td>
+        <td>{{ r.source }}</td>
+        <td>
+          {% if r.confidence is not none %}
+          <div class="conf">
+            <div class="conf-track"><div class="conf-fill {{ 'hi' if r.confidence >= 90 else 'mid' }}" style="width: {{ r.confidence }}%"></div></div>
+            <span class="conf-pct">{{ r.confidence }}%</span>
+          </div>
+          {% else %}<span class="muted">—</span>{% endif %}
+        </td>
+        <td>{{ r.date_human }}</td>
+        <td><a class="eye" href="{{ url_for('document', rec_id=r.id) }}" title="View">👁</a></td>
+      </tr>
+      {% else %}
+      <tr><td colspan="9" class="empty">No invoices yet. Click <b>Upload Invoice</b> to get started.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<!-- Upload modal -->
+<div class="modal" id="uploadModal">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h3>Upload</h3>
+      <span class="modal-x" onclick="document.getElementById('uploadModal').classList.remove('open')">×</span>
+    </div>
+    <form method="post" action="{{ url_for('upload') }}" enctype="multipart/form-data" id="uploadForm">
+      <label class="dropzone" id="dropzone">
+        <input type="file" name="file" id="fileInput" accept=".pdf,.png,.jpg,.jpeg,.webp,.tiff,.bmp" hidden>
+        <div class="dz-ico">⤓</div>
+        <div class="dz-title">Drag &amp; Drop PDF file</div>
+        <div class="dz-sub" id="dzSub">or click to browse</div>
+      </label>
+
+      <div class="progress-wrap" id="progressWrap" hidden>
+        <div class="progress-label" id="progressLabel">Uploading…</div>
+        <div class="progress"><div class="progress-bar" id="progressBar"></div></div>
+      </div>
+
+      <div class="modal-actions" id="modalActions">
+        <button type="button" class="btn-ghost" onclick="document.getElementById('uploadModal').classList.remove('open')">Cancel</button>
+        <button type="submit" class="btn-primary sm" id="uploadBtn">Upload</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+{% endblock %}
+{% block scripts %}
+<script>
+  const dz = document.getElementById('dropzone');
+  const input = document.getElementById('fileInput');
+  const sub = document.getElementById('dzSub');
+  dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag'); });
+  dz.addEventListener('dragleave', () => dz.classList.remove('drag'));
+  dz.addEventListener('drop', e => {
+    e.preventDefault(); dz.classList.remove('drag');
+    input.files = e.dataTransfer.files;
+    if (input.files[0]) sub.textContent = input.files[0].name;
+  });
+  input.addEventListener('change', () => { if (input.files[0]) sub.textContent = input.files[0].name; });
+
+  const form = document.getElementById('uploadForm');
+  const wrap = document.getElementById('progressWrap');
+  const bar = document.getElementById('progressBar');
+  const plabel = document.getElementById('progressLabel');
+  const btn = document.getElementById('uploadBtn');
+
+  function setBar(pct, label) { bar.style.width = pct + '%'; if (label) plabel.textContent = label; }
+  function showError(msg) {
+    setBar(100, 'Failed: ' + msg); bar.classList.add('err');
+    document.getElementById('dropzone').hidden = false;
+    document.getElementById('modalActions').hidden = false;
+    btn.disabled = false;
+  }
+
+  async function poll(recId) {
+    try {
+      const r = await fetch(`/status/${recId}`);
+      const s = await r.json();
+      if (s.error && s.stage === 'error') { showError(s.error); return; }
+      setBar(s.percent || 0, s.label);
+      if (s.done && s.redirect) { setBar(100, 'Done'); window.location = s.redirect; return; }
+      setTimeout(() => poll(recId), 700);
+    } catch (e) { setTimeout(() => poll(recId), 1000); }
+  }
+
+  const dropzone = document.getElementById('dropzone');
+  const actions = document.getElementById('modalActions');
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (!input.files[0]) { sub.textContent = 'Please choose a file first.'; return; }
+    // Once processing starts, show only the progress bar.
+    dropzone.hidden = true; actions.hidden = true;
+    wrap.hidden = false; setBar(8, 'Uploading…');
+    const fd = new FormData(form);
+    try {
+      const r = await fetch(form.action, { method: 'POST', body: fd });
+      const data = await r.json();
+      if (!r.ok) { showError(data.error || 'upload error'); return; }
+      poll(data.rec_id);
+    } catch (err) {
+      showError('upload failed');
+    }
+  });
+</script>
+{% endblock %}

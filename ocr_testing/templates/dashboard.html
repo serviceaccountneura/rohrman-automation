@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% set page_title = "Dashboard" %}
+{% block content %}
+
+<div class="stat-grid">
+  <div class="stat-card">
+    <div class="stat-top"><span class="stat-ico">▣</span><span class="delta up">▲ +12%</span></div>
+    <div class="stat-num">{{ stats.new_invoices }}</div>
+    <div class="stat-label">New Invoices</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-top"><span class="stat-ico">✓</span><span class="delta up">▲ +5%</span></div>
+    <div class="stat-num">{{ stats.completed }}</div>
+    <div class="stat-label">Processed</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-top"><span class="stat-ico">⚠</span><span class="delta down">▼ {{ stats.needs_review }}</span></div>
+    <div class="stat-num">{{ stats.needs_review }}</div>
+    <div class="stat-label">Needs Review</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-top"><span class="stat-ico">◷</span><span class="delta up">▲</span></div>
+    <div class="stat-num">{{ stats.no_po }}</div>
+    <div class="stat-label">Missing Invoice No.</div>
+  </div>
+</div>
+
+<h2 class="section-title">Queue Status</h2>
+<div class="queue-grid">
+  <div class="queue-card">
+    <div class="queue-head"><span class="chip blue">Avg 0.4 days</span></div>
+    <div class="stat-num">{{ stats.new_invoices }}</div>
+    <div class="stat-label">Invoices Ingested</div>
+    <a class="queue-link" href="{{ url_for('intake') }}">Open queue →</a>
+  </div>
+  <div class="queue-card">
+    <div class="queue-head"><span class="chip red">{{ stats.needs_review }} to review</span></div>
+    <div class="stat-num">{{ stats.needs_review }}</div>
+    <div class="stat-label">Exceptions</div>
+    <a class="queue-link" href="{{ url_for('intake') }}">Open queue →</a>
+  </div>
+  <div class="queue-card">
+    <div class="queue-head"><span class="chip green">Up to date</span></div>
+    <div class="stat-num">{{ stats.completed }}</div>
+    <div class="stat-label">Posted / Completed</div>
+    <a class="queue-link" href="{{ url_for('intake') }}">Open queue →</a>
+  </div>
+</div>
+
+{% endblock %}

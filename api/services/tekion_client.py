@@ -1,0 +1,1441 @@
+"""Tekion API client — direct REST calls (no browser automation).
+
+Python port of src/api/tekionApi.ts. Uses requests + pyotp instead of
+fetch + otplib.
+
+Flow:
+  1. login()          -> identity-provider -> password -> MFA -> tokens
+  2. switchDealer()   -> set dealer context headers
+  3. searchVendor()   -> lookup/search VENDOR by name
+  4. searchRO()       -> lookup/search REPAIR_ORDER_ASSET by RO number
+  5. getROJobs()      -> service-module/u/ro/{roId} -> job list
+  6. createSubletPO() -> partTrade/u/sublet/order/v2/create
+  7. createMiscPO()   -> partTrade/u/misc/order
+  8. preInvoice()     -> getInvoiceDate -> dueDate -> postings -> post
+
+Env: TEKION_USERNAME, TEKION_PASSWORD, TEKION_TOTP_SECRET
+"""
+from __future__ import annotations
+
+import json
+import mimetypes
+import tempfile
+import os
+import time
+import uuid
+from datetime import datetime, timezone
+from typing import Any
+
+import pyotp
+import requests
+from sqlmodel import Session
+
+from api.models.db import TekionSession
+
+BASE = "https://app.tekioncloud.com"
+TENANT = "rohrmanautomotivegroup"
+
+
+
+def _as_pdf(file_path: str, file_name: str) -> tuple[str, str, Any]:
+    """Return the file as a PDF, converting it if it is an image.
+
+    Tekion's viewer only renders PDFs. Returns the path to use, the name to
+    show, and the NamedTemporaryFile holding the conversion — the caller must
+    keep that third value referenced until the upload completes, or the file is
+    deleted out from under it.
+
+    A conversion failure is not fatal: an unviewable attachment beats a failed
+    invoice, so the original is uploaded instead.
+    """
+    if os.path.splitext(file_path)[1].lower() == ".pdf":
+        return file_path, file_name, None
+    try:
+        from PIL import Image
+
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        tmp.close()
+        with Image.open(file_path) as img:
+            # PDF has no alpha channel; RGBA and palette images need flattening.
+            img.convert("RGB").save(tmp.name, "PDF", resolution=200.0)
+        pdf_name = f"{os.path.splitext(file_name)[0]}.pdf"
+        print(f"[API] converted {file_name} to PDF for Tekion's viewer")
+        return tmp.name, pdf_name, tmp
+    except Exception as e:  # noqa: BLE001
+        print(f"[API] could not convert {file_name} to PDF ({e}); uploading as-is")
+        return file_path, file_name, None
+
+def _with_tax_line(
+    items: list[dict[str, Any]], sales_tax: float
+) -> list[dict[str, Any]]:
+    """Append a sales-tax line to a purchase order's items.
+
+    Tekion totals a misc or sublet order from its lines, and the tax was never
+    one of them -- so the order was worth the goods while the invoice posted
+    against it was worth the goods plus tax, and the two figures on screen never
+    agreed. Whoever checked the PO against the paperwork had to do the addition
+    themselves every time.
+
+    A line, not the tax configuration on the order. Nothing at Rohrman uses that
+    configuration -- 1,200 purchase orders across the four stores and not one
+    carries a tax amount on it -- so a line is what matches how these orders are
+    actually kept, and it needs no per-store tax setup to be right.
+    """
+    if not sales_tax or round(sales_tax, 2) <= 0:
+        return items
+    return list(items) + [
+        {"description": "SALES TAX", "qty": 1, "price": round(sales_tax, 2)}
+    ]
+
+
+class TekionApiClient:
+    def __init__(self, db_session: Session | None = None) -> None:
+        self.session = requests.Session()
+        self.cookies: str = ""
+        self.api_token: str = ""
+        self.user_id: str = ""
+        self.dealer_id: str = ""
+        self.site_id: str = ""
+        self.dealers: list[dict[str, str]] = []
+        self._db: Session | None = db_session
+        self._logged_in = False
+        # dealerId -> IANA tz from dealerMaster (e.g. America/Chicago).
+        self._dealer_tz_by_id: dict[str, str] = {}
+
+    @property
+    def current_dealer_id(self) -> str:
+        return self.dealer_id
+
+    # ── Request helper ────────────────────────────────────────────────────────
+
+    def _req(
+        self,
+        path: str,
+        method: str = "GET",
+        body: Any = None,
+        extra_headers: dict[str, str] | None = None,
+    ) -> requests.Response:
+        url = path if path.startswith("http") else f"{BASE}{path}"
+
+        headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "clientid": "web",
+            "Accept": "application/json, text/plain, */*",
+            "Origin": BASE,
+            "Referer": f"{BASE}/",
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/138.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+            "sec-ch-ua": '"Chromium";v="138", "Google Chrome";v="138"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"macOS"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+        }
+        if self.cookies:
+            headers["Cookie"] = self.cookies
+        if self.api_token:
+            headers["tekion-api-token"] = self.api_token
+        if self.user_id:
+            headers["userid"] = self.user_id
+            headers["original-userid"] = self.user_id
+        if self.dealer_id:
+            headers["dealerid"] = self.dealer_id
+            headers["roleid"] = f"{self.dealer_id}_APClerk"
+            headers["tek-siteid"] = self.site_id
+        headers["applicationid"] = "ARC_NA"
+        headers["productids"] = "ARC"
+        headers["program"] = "DEFAULT"
+        headers["subapplicationid"] = "US"
+        headers["locale"] = "en_US"
+        headers["original-tenantid"] = TENANT
+        headers["tenantname"] = TENANT
+        if extra_headers:
+            headers.update(extra_headers)
+
+        resp = self.session.request(
+            method=method,
+            url=url,
+            headers=headers,
+            json=body if body is not None else None,
+        )
+
+        # Capture Set-Cookie headers
+        set_cookies = resp.raw.headers.getlist("Set-Cookie") if resp.raw else []
+        if set_cookies:
+            new_cookies = "; ".join(c.split(";")[0] for c in set_cookies)
+            self.cookies = f"{self.cookies}; {new_cookies}" if self.cookies else new_cookies
+            names = [c.split("=")[0].split(";")[0] for c in set_cookies]
+            print(f"[API] Cookies captured: {', '.join(names)}")
+
+        return resp
+
+    def _req_json(
+        self,
+        path: str,
+        method: str = "GET",
+        body: Any = None,
+        extra_headers: dict[str, str] | None = None,
+        _relogin: bool = True,
+    ) -> Any:
+        resp = self._req(path, method=method, body=body, extra_headers=extra_headers)
+        if not resp.ok:
+            # 401/403 → session expired. Re-login once and retry.
+            if resp.status_code in (401, 403) and _relogin and not path.startswith("/api/loginservice"):
+                print(f"[API] Got {resp.status_code} on {method} {path} -- re-logging in...")
+                # login() resets dealer_id to the account default (the dealer on
+                # loginData). Since _req() rebuilds the dealerid/roleid/tek-siteid
+                # headers from that field on every call, letting it stand would
+                # silently retarget this retry — and everything after it — at the
+                # wrong dealership. Worse, a path with the dealer in the URL
+                # (e.g. .../transaction/dealer/1711/draft) would then carry 1711
+                # in the URL and 1707 in the headers.
+                previous_dealer = self.dealer_id
+                self.login()
+                if previous_dealer and previous_dealer != self.dealer_id:
+                    print(f"[API] Restoring dealer {previous_dealer} after re-login "
+                          f"(login defaulted to {self.dealer_id})")
+                    self.switch_dealer(previous_dealer)
+                return self._req_json(
+                    path, method=method, body=body, extra_headers=extra_headers, _relogin=False
+                )
+            raise Exception(f"{method} {path} -> {resp.status_code}: {resp.text[:300]}")
+        return resp.json()
+
+    # ── Auth ──────────────────────────────────────────────────────────────────
+
+    def login(self) -> list[dict[str, str]]:
+        email = os.environ.get("TEKION_USERNAME", "")
+        password = os.environ.get("TEKION_PASSWORD", "")
+        totp_secret = os.environ.get("TEKION_TOTP_SECRET", "")
+
+        if not email or not password or not totp_secret:
+            raise Exception("TEKION_USERNAME, TEKION_PASSWORD, TEKION_TOTP_SECRET required in .env")
+
+        # Reset session state for a clean login.
+        self.cookies = ""
+        self.api_token = ""
+        self.user_id = ""
+        self.session = requests.Session()
+
+        # Step 1: identity-provider
+        print("[API] Login: identity-provider...")
+        self._req_json(
+            "/api/loginservice/p/identity-provider",
+            method="POST",
+            body={"email": email},
+            _relogin=False,
+        )
+
+        # Step 2: password
+        print("[API] Login: password...")
+        pw_res = self._req_json(
+            "/api/loginservice/p/authenticate/password",
+            method="POST",
+            body={"email": email, "password": password},
+            _relogin=False,
+        )
+        pw_data = pw_res.get("data") or {}
+        mfa_response = pw_data.get("mfaResponse") or pw_data
+        mfa_token = mfa_response.get("mfaToken")
+        user_id = mfa_response.get("userId")
+        if not mfa_token:
+            raise Exception("No mfaToken in password response")
+        if not user_id:
+            raise Exception("No userId in password response")
+
+        # Step 3: MFA
+        totp = pyotp.TOTP(totp_secret.replace(" ", ""))
+        otp = totp.now()
+        print(f"[API] Login: MFA (otp={otp})...")
+        mfa_res = self._req_json(
+            "/api/loginservice/p/authenticate/mfa",
+            method="POST",
+            body={
+                "tenantId": TENANT,
+                "userId": user_id,
+                "mfaToken": mfa_token,
+                "authenticatorType": "GOOGLE_AUTHENTICATOR",
+                "otp": otp,
+            },
+            _relogin=False,
+        )
+
+        login_data = (
+            (mfa_res.get("data") or {}).get("loginData")
+            or (mfa_res.get("data") or {}).get("mfaResponse", {}).get("loginData")
+        )
+        if not login_data:
+            raise Exception("No loginData in MFA response")
+
+        self.dealer_id = login_data["dealerId"]
+        self.user_id = login_data.get("id") or user_id
+        self.api_token = login_data.get("access_token", "")
+        self.dealers = [
+            {
+                "dealerId": d["dealerId"],
+                "dealerDisplayName": d["dealerDisplayName"],
+                "dealerChars": d.get("dealerChars", ""),
+            }
+            for d in login_data.get("dealer", [])
+        ]
+        self.site_id = f"-1_{self.dealer_id}"
+        self._logged_in = True
+
+        print(f"[API] Logged in as {login_data.get('displayName')}, default dealer: {self.dealer_id}")
+        print(f"[API] Available dealers: {len(self.dealers)}")
+
+        # Persist the session so we don't re-login next time.
+        self._save_session()
+
+        return self.dealers
+
+    # ── Session persistence ────────────────────────────────────────────────────
+
+    def _save_session(self) -> None:
+        """Upsert the current session into the DB."""
+        if not self._db:
+            return
+        existing = self._db.get(TekionSession, 1)
+        now = datetime.now(timezone.utc)
+        if existing:
+            existing.cookies = self.cookies
+            existing.api_token = self.api_token
+            existing.user_id = self.user_id
+            existing.dealer_id = self.dealer_id
+            existing.site_id = self.site_id
+            existing.dealers_json = json.dumps(self.dealers)
+            existing.last_used_at = now
+            self._db.add(existing)
+        else:
+            row = TekionSession(
+                id=1,
+                cookies=self.cookies,
+                api_token=self.api_token,
+                user_id=self.user_id,
+                dealer_id=self.dealer_id,
+                site_id=self.site_id,
+                dealers_json=json.dumps(self.dealers),
+                created_at=now,
+                last_used_at=now,
+            )
+            self._db.add(row)
+        self._db.commit()
+        print(f"[API] Session saved to DB (dealer={self.dealer_id})")
+
+    def load_session(self) -> bool:
+        """Hydrate from the DB session. Returns True if a session was found."""
+        if not self._db:
+            return False
+        row = self._db.get(TekionSession, 1)
+        if not row or not row.api_token:
+            return False
+        self.cookies = row.cookies
+        self.api_token = row.api_token
+        self.user_id = row.user_id
+        self.dealer_id = row.dealer_id
+        self.site_id = row.site_id
+        try:
+            self.dealers = json.loads(row.dealers_json) if row.dealers_json else []
+        except (json.JSONDecodeError, TypeError):
+            self.dealers = []
+        self._logged_in = True
+        # Update last_used_at
+        row.last_used_at = datetime.now(timezone.utc)
+        self._db.add(row)
+        self._db.commit()
+        print(f"[API] Session loaded from DB (dealer={self.dealer_id}, "
+              f"saved {row.created_at.isoformat() if row.created_at else 'unknown'})")
+        return True
+
+    def switch_dealer(self, dealer_id: str) -> None:
+        self.dealer_id = dealer_id
+        self.site_id = f"-1_{dealer_id}"
+        print(f"[API] Switched to dealer {dealer_id}")
+
+    def find_dealer_by_name(self, name: str) -> str | None:
+        lower = name.lower().strip()
+        # Exact match
+        for d in self.dealers:
+            if d["dealerDisplayName"].lower() == lower:
+                return d["dealerId"]
+        # Contains match
+        for d in self.dealers:
+            dn = d["dealerDisplayName"].lower()
+            if lower in dn or dn in lower:
+                return d["dealerId"]
+        # Keyword match
+        keywords = [w for w in lower.split() if len(w) > 2]
+        for d in self.dealers:
+            dn = d["dealerDisplayName"].lower()
+            if all(k in dn for k in keywords):
+                return d["dealerId"]
+        return None
+
+    # ── Lookups ───────────────────────────────────────────────────────────────
+
+    def search_vendor(self, search_text: str) -> list[dict[str, str]]:
+        res = self._req_json(
+            "/api/lookup/search",
+            method="POST",
+            body={
+                "VENDOR": {
+                    "filters": [
+                        {
+                            "field": "vendorStatus",
+                            "operator": "NIN",
+                            "values": ["DRAFT", "INACTIVE", "ON_HOLD"],
+                            "key": "vendorStatus",
+                        }
+                    ],
+                    "searchText": search_text,
+                    "pageInfo": {"start": 0, "rows": 20},
+                    "sort": [],
+                }
+            },
+        )
+
+        results = self._extract_lookup_results(res, "VENDOR")
+        vendors = []
+        for v in results:
+            sites = v.get("sites") or []
+            site = sites[0] if sites else {}
+            contacts = site.get("pointOfContacts") or []
+            contact = contacts[0] if contacts else {}
+            vendors.append(
+                {
+                    "id": str(v.get("id", "")),
+                    "name": v.get("vendorName", ""),
+                    "displayId": v.get("vendorDisplayId", ""),
+                    "siteId": str(site.get("id", "")),
+                    "phone": contact.get("phone") or contact.get("mobile") or "",
+                    "email": contact.get("email") or "",
+                }
+            )
+        return vendors
+
+    def get_vendor_by_display_id(self, vendor_display_id: str) -> dict[str, str] | None:
+        """Fetch a single vendor by its Tekion vendorDisplayId (e.g. '1707_160').
+
+        Returns the same shape as search_vendor() entries, or None if not found.
+        """
+        res = self._req_json(
+            "/api/lookup/search",
+            method="POST",
+            body={
+                "VENDOR": {
+                    "filters": [
+                        {
+                            "field": "vendorStatus",
+                            "operator": "NIN",
+                            "values": ["DRAFT", "INACTIVE", "ON_HOLD"],
+                            "key": "vendorStatus",
+                        },
+                        {
+                            "field": "vendorDisplayId",
+                            "operator": "IN",
+                            "values": [vendor_display_id],
+                            "key": "vendorDisplayId",
+                        },
+                    ],
+                    "searchText": "",
+                    "pageInfo": {"start": 0, "rows": 5},
+                    "sort": [],
+                }
+            },
+        )
+
+        results = self._extract_lookup_results(res, "VENDOR")
+        for v in results:
+            if str(v.get("vendorDisplayId", "")) == vendor_display_id:
+                sites = v.get("sites") or []
+                site = sites[0] if sites else {}
+                contacts = site.get("pointOfContacts") or []
+                contact = contacts[0] if contacts else {}
+                return {
+                    "id": str(v.get("id", "")),
+                    "name": v.get("vendorName", ""),
+                    "displayId": v.get("vendorDisplayId", ""),
+                    "siteId": str(site.get("id", "")),
+                    "phone": contact.get("phone") or contact.get("mobile") or "",
+                    "email": contact.get("email") or "",
+                }
+        return None
+
+    def get_dealer_address(self) -> dict[str, Any]:
+        """Fetch the current dealer's default address from the bootstrap endpoint."""
+        res = self._req_json("/api/api-platform/u/bootstrap")
+        dm = (res.get("data") or {}).get("dealerMaster") or {}
+        # Cache timezone while we have dealerMaster — used for JE scheduledTime.
+        tz = str(dm.get("timeZone") or "").strip()
+        if tz and self.dealer_id:
+            self._dealer_tz_by_id[str(self.dealer_id)] = tz
+        addresses = dm.get("dealerAddress") or []
+        if not addresses:
+            raise Exception(f"No dealer address found for dealer {self.dealer_id}")
+        return addresses[0]
+
+    def get_dealer_timezone(self) -> str:
+        """IANA timezone for the current dealership (Tekion dealerMaster.timeZone).
+
+        Used when converting a calendar invoice date to epoch ms for JE
+        `scheduledTime` / pre-invoice dates. Falls back to America/Chicago
+        (Rohrman IL stores) if Tekion does not return a value.
+        """
+        fallback = "America/Chicago"
+        dealer_id = str(self.dealer_id or "")
+        cached = self._dealer_tz_by_id.get(dealer_id)
+        if cached:
+            return cached
+        try:
+            res = self._req_json("/api/api-platform/u/bootstrap")
+            dm = (res.get("data") or {}).get("dealerMaster") or {}
+            tz = str(dm.get("timeZone") or "").strip()
+            if tz and dealer_id:
+                self._dealer_tz_by_id[dealer_id] = tz
+                return tz
+        except Exception as exc:  # noqa: BLE001
+            print(f"[API] dealer timezone fetch failed ({exc}); using {fallback}")
+        return fallback
+
+    def fetch_gl_accounts(self) -> list[dict[str, Any]]:
+        """Fetch GL accounts for the current dealership from Tekion.
+
+        Uses POST /api/lookup/search with GL_ACCOUNT_ASSET, paginated.
+        Server-side filter: active=True only (NIN filters are flaky from API client).
+        Client-side filter: exclude MEMO type and AP account ({dealer}_3002).
+        This matches the Tekion pre-invoice UI flow the Rohrman team uses.
+        Returns a list of dicts with: account_id, account_number, account_name,
+        account_type, department_type, active.
+        """
+        accounts: list[dict[str, Any]] = []
+        start = 0
+        rows = 100
+        ap_account_id = f"{self.dealer_id}_3002"
+
+        while True:
+            res = self._req_json(
+                "/api/lookup/search",
+                method="POST",
+                body={
+                    "GL_ACCOUNT_ASSET": {
+                        "filters": [
+                            {"field": "active", "operator": "IN", "values": [True], "key": "active"},
+                        ],
+                        "searchText": "",
+                        "pageInfo": {"start": start, "rows": rows},
+                        "sort": [],
+                    }
+                },
+            )
+            data = (res.get("data") or {}).get("GL_ACCOUNT_ASSET") or {}
+            entities = data.get("entities") or []
+            count = data.get("count", 0)
+
+            for e in entities:
+                d = e.get("data") or {}
+                acct_type = d.get("accountTypeId", "")
+                acct_id = d.get("id", "")
+                # Client-side filter: skip MEMO + AP account
+                if acct_type == "MEMO" or acct_id == ap_account_id:
+                    continue
+                accounts.append({
+                    "account_id": acct_id,
+                    "account_number": d.get("accountNumber", ""),
+                    "account_name": d.get("accountName", ""),
+                    "account_type": acct_type,
+                    "department_type": d.get("departmentType", ""),
+                    "active": d.get("active", True),
+                })
+
+            start += rows
+            if start >= count or len(entities) == 0:
+                break
+
+        print(f"[API] Fetched {len(accounts)} GL accounts for dealer {self.dealer_id}")
+        return accounts
+
+    def upload_document(
+        self,
+        file_path: str,
+        mime_type: str | None = None,
+        display_name: str | None = None,
+        module_name: str | None = None,
+        service_name: str | None = None,
+    ) -> str:
+        """Upload a document to Tekion's media service.
+
+        Tekion's document viewer renders PDFs and nothing else, so an image is
+        converted to one before it goes up. Uploading a JPEG as-is stores the
+        bytes intact but leaves the clerk looking at "Failed to load PDF file"
+        forever — the format is the problem, not the mimeType we declare.
+
+        `display_name` is the name shown in Tekion. Pass the invoice's original
+        filename — the caller usually holds the bytes in a temp file, and
+        "tmp8h24mg32.jpg" means nothing to whoever opens the PO later.
+
+        `module_name` / `service_name` tag the upload for the destination
+        screen. Journal Entry capture (oem-je) sends ACCOUNTING / Journal Entry;
+        PO / Vendor Invoice uploads leave them unset.
+
+        Flow:
+          1. POST /api/media-v3/u/v2/initiate-upload → get presigned S3 URL + mediaId
+          2. PUT the file directly to S3
+          3. Poll GET /api/media-v3/u/upload-status/{mediaId} until COMPLETED
+          4. POST /api/media-v3/u/v2/presignedurls → confirm upload
+
+        Returns the mediaId (used in preInvoice / JE assetAttachmentDto).
+        """
+        from urllib.parse import urlencode
+
+        file_name = display_name or os.path.basename(file_path)
+        # Tekion only previews PDFs. Convert anything else first, and keep the
+        # converted file alive until the upload finishes.
+        file_path, file_name, _tmp_pdf = _as_pdf(file_path, file_name)
+        content_length = os.path.getsize(file_path)
+        if not mime_type:
+            mime_type = mimetypes.guess_type(file_path)[0] or "application/pdf"
+
+        # Step 1: Initiate upload
+        print(f"[API] Uploading {file_name} ({content_length} bytes)...")
+        initiate_body: dict[str, Any] = {
+            "generateThumbnail": False,
+            "folderName": "",
+            "globalMedia": False,
+            "stripMetadata": False,
+            "hlsVideoEnabled": False,
+            "moduleType": "CDMS",
+            "compressionEnabled": False,
+            "mimeType": mime_type,
+            "fileName": file_name,
+            "contentLength": content_length,
+            "fragment": False,
+        }
+        # Captured on the JE attach screen — without these Tekion still accepts
+        # the upload, but the draft's assetAttachmentDto is how the file shows.
+        if module_name:
+            initiate_body["moduleName"] = module_name
+        if service_name:
+            initiate_body["serviceName"] = service_name
+        res = self._req_json(
+            "/api/media-v3/u/v2/initiate-upload",
+            method="POST",
+            body=initiate_body,
+        )
+        upload_data = (res.get("data") or {})
+        s3_url = upload_data.get("url", "")
+        media_id = upload_data.get("mediaId", "")
+        http_method = upload_data.get("httpMethod", "PUT")
+
+        if not s3_url or not media_id:
+            raise Exception(f"initiate-upload failed: {res}")
+
+        # Step 2: Upload file to S3
+        with open(file_path, "rb") as f:
+            s3_resp = requests.request(
+                http_method,
+                s3_url,
+                data=f,
+                headers={"Content-Type": mime_type},
+                timeout=120,
+            )
+        if not s3_resp.ok:
+            raise Exception(f"S3 upload failed: {s3_resp.status_code} {s3_resp.text[:300]}")
+
+        print(f"[API] S3 upload complete, mediaId={media_id}")
+
+        # Step 3: Poll upload status
+        for _ in range(30):
+            status_res = self._req_json(f"/api/media-v3/u/upload-status/{media_id}")
+            status = (status_res.get("data") or {}).get("uploadStatus", "")
+            if status == "COMPLETED":
+                break
+            if status == "FAILED":
+                raise Exception(f"Upload failed for mediaId={media_id}")
+            time.sleep(1)
+
+        # Step 4: Confirm via presignedurls (JE capture adds module query params)
+        confirm_path = "/api/media-v3/u/v2/presignedurls"
+        if module_name or service_name:
+            qs = urlencode(
+                {
+                    "attachment": "false",
+                    **({"moduleName": module_name} if module_name else {}),
+                    **({"serviceName": service_name} if service_name else {}),
+                }
+            )
+            confirm_path = f"{confirm_path}?{qs}"
+        self._req_json(
+            confirm_path,
+            method="POST",
+            body=[media_id],
+        )
+
+        print(f"[API] Document uploaded successfully, mediaId={media_id}")
+        return media_id
+
+    def create_stock_order(
+        self,
+        vendor_id: int,
+        vendor_name: str,
+        vendor_display_id: str,
+        vendor_site_id: str,
+        vendor_phone: str,
+        vendor_email: str,
+        parts: list[dict[str, Any]],
+        dealer_address: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Create + submit a vendor stock order (NON_OEM_STOCK_ORDER).
+
+        No pre-invoice — the order is submitted and ready for receiving on the
+        Tekion UI.
+        """
+        # Build the shipping/billing address from the dealer's default address.
+        addr = {
+            "complexListId": dealer_address.get("complexListId", "Default"),
+            "dealerAddressID": dealer_address.get("dealerAddressID", "1"),
+            "addressType": dealer_address.get("addressType", 0),
+            "addressTypeDisplayName": dealer_address.get("addressTypeDisplayName", "DEFAULT"),
+            "streetAddress1": dealer_address.get("streetAddress1", ""),
+            "streetAddress2": dealer_address.get("streetAddress2", ""),
+            "streetAddress3": dealer_address.get("streetAddress3"),
+            "streetAddress4": dealer_address.get("streetAddress4"),
+            "city": dealer_address.get("city", ""),
+            "state": dealer_address.get("state", ""),
+            "zipCode": dealer_address.get("zipCode", ""),
+            "country": dealer_address.get("country", "US"),
+            "county": dealer_address.get("county", ""),
+            "isdCode": dealer_address.get("isdCode", ""),
+            "locationUrl": dealer_address.get("locationUrl"),
+            "epa": dealer_address.get("epa"),
+            "bar": dealer_address.get("bar"),
+            "website": dealer_address.get("website"),
+            "phoneNumber": dealer_address.get("phoneNumber"),
+            "phoneNumberUnformatted": dealer_address.get("phoneNumberUnformatted"),
+            "email": dealer_address.get("email"),
+            "departmentId": dealer_address.get("departmentId"),
+            "departmentName": dealer_address.get("departmentName"),
+            "makeId": dealer_address.get("makeId"),
+            "makeName": dealer_address.get("makeName"),
+            "fromEmail": dealer_address.get("fromEmail"),
+            "fromName": dealer_address.get("fromName"),
+            "geoLocation": dealer_address.get("geoLocation"),
+            "addressOverride": dealer_address.get("addressOverride"),
+            "isActive": dealer_address.get("isActive", True),
+            "line1": dealer_address.get("streetAddress1", ""),
+            "line2": dealer_address.get("streetAddress2", ""),
+            "pincode": dealer_address.get("zipCode", ""),
+        }
+
+        # Build parts list — parts come in with alias keys (partNumber, unitPrice, etc.)
+        parts_payload = []
+        for p in parts:
+            part_number = p.get("partNumber") or p.get("part_number", "")
+            part_name = p.get("partName") or p.get("part_name", "")
+            unit_price = p.get("unitPrice") or p.get("unit_price", 0)
+            brand_code = p.get("brandCode") or p.get("brand_code", "")
+            qty = p.get("qty", 1)
+            part_id = f"M_{brand_code}_{part_number}".replace(" ", "_")
+            parts_payload.append({
+                "partId": part_id,
+                "qty": qty,
+                "unit": "ea",
+                "price": unit_price,
+                "charges": [],
+                "partNumber": part_number,
+                "partName": part_name,
+                "dmsPartNumber": part_number.replace(" ", ""),
+                "brandCode": brand_code,
+                "groupIds": [],
+                "extra": {
+                    "originalCostPrice": unit_price,
+                    "partCostOverriddenByVendorPricing": False,
+                },
+            })
+
+        body = {
+            "vendorSiteId": vendor_site_id,
+            "vendorId": vendor_id,
+            "vendorPhone": vendor_phone,
+            "vendorEmail": vendor_email,
+            "vendorName": vendor_name,
+            "vendorDisplayId": vendor_display_id,
+            "vendorAddress": {},
+            "temporaryVendor": False,
+            "estimateDeliveryTime": None,
+            "shippingAddress": addr,
+            "billingAddress": addr,
+            "poAssetType": "parts",
+            "companyId": 1,
+            "parts": parts_payload,
+            "items": False,
+            "poChargeToAdd": [],
+            "poChargeToUpdate": [],
+            "poChargeToDelete": [],
+            "status": "READY_TO_SUBMIT",
+            "controlNumber": None,
+            "orderType": "NON_OEM_STOCK_ORDER",
+            "purchaseType": "REGULAR",
+            "additional": {},
+            "newTaxCodeEnabled": False,
+            "poTaxConfiguration": {
+                "taxCodeGrid": [],
+                "taxDetails": [],
+                "flatTaxDetails": [],
+            },
+            "printConfigDto": {
+                "copyTypes": ["VENDOR", "DEALER"],
+                "sortDetails": None,
+                "copyTypeVsLocale": None,
+            },
+        }
+
+        res = self._req_json(
+            "/api/partTrade/u/nonOem/order",
+            method="POST",
+            body=body,
+        )
+        data = res.get("data") or {}
+        return {
+            "orderId": data.get("id"),
+            "orderNumber": data.get("orderNumber"),
+            "status": data.get("status"),
+            "universalId": data.get("universalId"),
+            "totalAmount": data.get("totalAmount"),
+            "vendorName": (data.get("vendorDetails") or {}).get("vendorName"),
+        }
+
+    def find_purchase_order(self, po_number: str) -> dict[str, Any] | None:
+        """Find an existing purchase order by the number printed on an invoice.
+
+        The vendor stock order flow does not create a PO — one already exists in
+        Tekion and the invoice references it. This is the lookup the clerk does
+        by typing the number into the purchase order list.
+
+        Returns the PO with the fields the pre-invoice needs (id, orderNumber,
+        universalId, orderType, totalAmount, vendorDetails), or None.
+        """
+        res = self._req_json(
+            "/api/partTrade/u/purchase/search",
+            method="POST",
+            body={
+                "sort": [],
+                "filters": [
+                    {"field": "orderNumber", "operator": "IN", "values": [str(po_number).strip()]}
+                ],
+                "searchText": "",
+                "groupBy": [],
+                "includeFields": [],
+                "searchableFields": [],
+                "excludeFields": [],
+                "pageInfo": {"start": 0, "rows": 10},
+            },
+        )
+        hits = (res.get("data") or {}).get("hits") or []
+        wanted = str(po_number).strip()
+        for hit in hits:
+            if str(hit.get("orderNumber") or "").strip() == wanted:
+                return hit
+        # The search is fuzzy; only an exact number is safe to act on.
+        return None
+
+    def search_ro(self, ro_number: str, include_closed: bool = False) -> list[dict[str, str]]:
+        """Find a repair order by its number.
+
+        Open orders only by default, which is right when the RO is being
+        DISCOVERED -- work still in progress is what a sublet invoice normally
+        refers to.
+
+        `include_closed` is for the case where the invoice NAMES the order. A
+        vendor who bills weeks later is writing down an order that has long
+        since closed, and refusing to look at it turns a known number into "no
+        such RO". What to do with a closed one is the caller's decision; this
+        only stops hiding it.
+        """
+        filters: list[dict[str, Any]] = [
+            {"field": "siteId", "operator": "IN", "values": [self.site_id]},
+        ]
+        if not include_closed:
+            filters.insert(
+                0,
+                {
+                    "field": "status",
+                    "operator": "NIN",
+                    "values": ["INVOICED", "CLOSED", "VOIDED"],
+                },
+            )
+        res = self._req_json(
+            "/api/lookup/search",
+            method="POST",
+            body={
+                "REPAIR_ORDER_ASSET": {
+                    "filters": filters,
+                    "searchText": ro_number,
+                    "pageInfo": {"start": 0, "rows": 20},
+                    "sort": [],
+                }
+            },
+        )
+
+        results = self._extract_lookup_results(res, "REPAIR_ORDER_ASSET", "displayValue")
+        ros = []
+        for r in results:
+            ros.append(
+                {
+                    "id": str(r.get("id", "")),
+                    "roNumber": str(r.get("_displayValue") or r.get("roNumber") or r.get("roNo") or ""),
+                    "status": r.get("status", ""),
+                }
+            )
+        return ros
+
+    def get_ro_jobs(self, ro_id: str) -> list[dict[str, str]]:
+        res = self._req_json(
+            f"/api/service-module/u/ro/{ro_id}",
+            method="POST",
+            body=["JOB", "RECOMMENDATION"],
+        )
+
+        jobs = (res.get("data") or {}).get("jobs") or []
+        return [
+            {
+                "id": j["id"],
+                "jobNumber": str(j.get("jobNumber", "")),
+                "payType": j.get("payType", ""),
+                "subPayType": j.get("subPayType", ""),
+                "roId": j.get("roId", ro_id),
+                "roNumber": j.get("roNo", ""),
+            }
+            for j in jobs
+        ]
+
+    # Statuses that make a repair order NOT open for VIN-based sublet lookup —
+    # the same exclusion list search_ro() already uses for RO-number search.
+    CLOSED_RO_STATUSES = {"INVOICED", "CLOSED", "VOIDED"}
+
+    def search_ro_by_vin(self, vin: str) -> list[dict[str, Any]]:
+        """Search repair orders by VIN via the global search service.
+
+        Returns raw RO hits (id, status, createdTime, modifiedTime, ...),
+        newest first (by createdTime) so callers can pick "most recent".
+
+        Tekion's GSS search index stores VINs in lowercase, so the search text
+        is lowercased here regardless of how the caller stored it.
+        """
+        res = self._req_json(
+            "/api/gss/u/v2/search/v2",
+            method="POST",
+            body={
+                "entities": [
+                    {
+                        "entity": "ro",
+                        "advancedFilters": [],
+                        "rows": 20,
+                        "offset": 0,
+                        "searchRequestV3List": [
+                            {
+                                "searchableFields": ["RO_NO", "TAG_NO", "MODEL", "VIN", "CUSTOMER_NAME"],
+                                "searchText": vin.lower(),
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+        entity_responses = (res.get("data") or {}).get("entityResponses") or []
+        hits = list(entity_responses[0].get("hits") or []) if entity_responses else []
+        hits.sort(key=lambda h: h.get("createdTime", 0), reverse=True)
+        return hits
+
+    def find_latest_open_ro_by_vin(self, vin: str) -> dict[str, Any] | None:
+        """Most recent open repair order for a VIN, or None if none is open."""
+        for ro in self.search_ro_by_vin(vin):
+            if (ro.get("status") or "").upper() not in self.CLOSED_RO_STATUSES:
+                return ro
+        return None
+
+    def get_ro_job_details(self, ro_id: str) -> list[dict[str, Any]]:
+        """Per-job capture (concern) + tech story text for a repair order.
+
+        Used to let the LLM match sublet invoice line items to the job they
+        belong to, instead of trusting the RO number printed on the invoice.
+        """
+        res = self._req_json(
+            f"/api/service-module/u/ro/{ro_id}/job/calculate?roDetailsReq=true&forceCalculate=false",
+            method="POST",
+            body=[],
+        )
+        job_lines = (res.get("data") or {}).get("jobLines") or []
+        jobs: list[dict[str, Any]] = []
+        for line in job_lines:
+            job = line.get("job") or {}
+            story_lines = [
+                story.get("text", "")
+                for op in job.get("operations") or []
+                for story in op.get("storyLines") or []
+                if story.get("text")
+            ]
+            jobs.append(
+                {
+                    "id": job.get("id"),
+                    "jobNumber": str(job.get("jobNumber", "")),
+                    "capture": job.get("concern") or "",
+                    "techStory": " ".join(story_lines),
+                }
+            )
+        return jobs
+
+    # ── Sublet PO Creation ────────────────────────────────────────────────────
+
+    def create_sublet_po(
+        self,
+        vendor_id: int,
+        vendor_name: str,
+        vendor_display_id: str,
+        vendor_site_id: str,
+        items: list[dict[str, Any]],
+        vendor_phone: str = "",
+        vendor_email: str = "",
+    ) -> dict[str, Any]:
+        items_to_add = []
+        for item in items:
+            items_to_add.append(
+                {
+                    "description": item["description"],
+                    "jobId": item["jobId"],
+                    "invoiceId": None,
+                    "invoiceAmount": None,
+                    "partTaxable": False,
+                    "laborTaxable": False,
+                    "glAccountId": item.get("glAccountId", ""),
+                    "itemId": item["jobId"],
+                    "itemType": "job",
+                    "referenceId": item["referenceId"],
+                    "referenceNumber": item["referenceNumber"],
+                    "subletOpcodeDetail": {
+                        "opcode": item.get("opcode", "SUBLET"),
+                        "serviceTypeIds": item.get("serviceTypeIds", []),
+                        "category": item.get("category", "MISCELLANEOUS"),
+                        "subletMarkUpDetails": [],
+                    },
+                    "poLineItemLaborAmount": item["laborAmount"],
+                    "poLineItemPartsAmount": item["partsAmount"],
+                }
+            )
+
+        body = {
+            "action": "SUBMITTED",
+            "poTaxConfiguration": {"taxCodeGrid": [], "taxDetails": [], "flatTaxDetails": []},
+            "newTaxCodeEnabled": False,
+            "taxable": False,
+            "taxDetails": [
+                {"taxRegimeType": "SALES_TAX", "partTaxPercentage": 10, "laborTaxPercentage": 10}
+            ],
+            "taxOverridden": False,
+            "flatTaxApplied": False,
+            "vendorId": vendor_id,
+            "vendorName": vendor_name,
+            "vendorDisplayId": vendor_display_id,
+            "vendorSiteId": vendor_site_id,
+            "vendorPhone": vendor_phone,
+            "vendorEmail": vendor_email,
+            "estimateDeliveryTime": None,
+            "expectedPickupDate": "",
+            "temporaryVendor": False,
+            "vendorAddress": {},
+            "billingAddress": {},
+            "itemsToAdd": items_to_add,
+            "itemsToUpdate": [],
+            "itemsToDelete": [],
+            "printConfigDto": {
+                "copyTypes": ["VENDOR", "DEALER"],
+                "sortDetails": None,
+                "copyTypeVsLocale": None,
+            },
+        }
+
+        print("[API] Creating Sublet PO...")
+        res = self._req_json("/api/partTrade/u/sublet/order/v2/create", method="POST", body=body)
+
+        data = res.get("data")
+        if not data:
+            raise Exception("No data in sublet create response")
+
+        po_id = data["id"]
+        po_number = data["orderNumber"]
+        universal_id = f"SUBLET%{po_id}"
+
+        print(f"[API] Sublet PO created: {po_number} (id={po_id}, status={data['status']})")
+
+        return {
+            "poId": po_id,
+            "poNumber": po_number,
+            "universalId": universal_id,
+            "status": data["status"],
+            "orderType": data.get("orderType", ""),
+        }
+
+    # ── Misc PO Creation ──────────────────────────────────────────────────────
+
+    def create_misc_po(
+        self,
+        vendor_id: str,
+        vendor_name: str,
+        vendor_display_id: str,
+        vendor_site_id: str,
+        items: list[dict[str, Any]],
+        vendor_phone: str = "",
+        vendor_email: str = "",
+        sales_tax: float = 0.0,
+    ) -> dict[str, Any]:
+        """Raise a miscellaneous purchase order.
+
+        `sales_tax` is added as a final line rather than left off. The PO used
+        to total the goods alone, so its front page said 2,378.11 where the
+        invoice attached to it said 2,580.23, and the two never reconciled on
+        screen. A line makes the order worth what the invoice is worth.
+        """
+        items = _with_tax_line(items, sales_tax)
+        formatted_items = []
+        for item in items:
+            gross_total = round(item["qty"] * item["price"], 2)
+            formatted_items.append(
+                {
+                    "grossTotalPrice": gross_total,
+                    "item": item["description"],
+                    "id": str(uuid.uuid4()),
+                    "qty": item["qty"],
+                    "unit": item.get("unit", "ea"),
+                    "price": item["price"],
+                    "additional": {},
+                    "charges": [],
+                }
+            )
+
+        body = {
+            "vendorSiteId": vendor_site_id,
+            "vendorId": vendor_id,
+            "vendorPhone": vendor_phone,
+            "vendorEmail": vendor_email,
+            "vendorName": vendor_name,
+            "vendorDisplayId": vendor_display_id,
+            "vendorAddress": {},
+            "temporaryVendor": False,
+            "estimateDeliveryTime": None,
+            "shippingAddress": {},
+            "billingAddress": {},
+            "poAssetType": "misc",
+            "companyId": 1,
+            "parts": False,
+            "items": formatted_items,
+            "poChargeToAdd": [],
+            "poChargeToUpdate": [],
+            "poChargeToDelete": [],
+            "status": "READY_TO_SUBMIT",
+            "controlNumber": None,
+            "orderType": "MISC",
+            "purchaseType": "REGULAR",
+            "additional": {},
+            "newTaxCodeEnabled": False,
+            "poTaxConfiguration": {"taxCodeGrid": [], "taxDetails": [], "flatTaxDetails": []},
+            "printConfigDto": {
+                "copyTypes": ["VENDOR", "DEALER"],
+                "sortDetails": None,
+                "copyTypeVsLocale": None,
+            },
+        }
+
+        print("[API] Creating Misc PO...")
+        res = self._req_json("/api/partTrade/u/misc/order", method="POST", body=body)
+
+        data = res.get("data")
+        if not data:
+            raise Exception("No data in misc order create response")
+
+        po_id = data["id"]
+        po_number = data["orderNumber"]
+        universal_id = f"MISCELLANEOUS%{po_id}"
+
+        print(f"[API] Misc PO created: {po_number} (id={po_id}, status={data['status']})")
+
+        return {
+            "poId": po_id,
+            "poNumber": po_number,
+            "universalId": universal_id,
+            "status": data["status"],
+            "orderType": data.get("orderType", ""),
+        }
+
+    # ── Pre-Invoice Flow ──────────────────────────────────────────────────────
+
+    def pre_invoice(
+        self,
+        vendor_id: str,
+        vendor_site_id: str,
+        vendor_name: str,
+        vendor_display_id: str,
+        dealer_id: str,
+        po_id: int,
+        po_number: str,
+        universal_id: str,
+        invoice_number: str,
+        invoice_amount: float,
+        gl_account_id: str,
+        ap_gl_account_id: str,
+        ref_text: str,
+        po_type: str,
+        sales_tax: float = 0.0,
+        invoice_date: str | None = None,
+        attachment_media_ids: list[str] | None = None,
+        gl_splits: list[dict[str, Any]] | None = None,
+        use_returned_postings: bool = False,
+        po_covers_tax: bool = False,
+    ) -> dict[str, str]:
+        amount_cents = round(invoice_amount * 100)
+        tax_cents = round(sales_tax * 100)
+
+        # How much of the purchase order this invoice uses up.
+        #
+        # Historically the goods only, because the PO was raised for the goods
+        # only. An order that now carries a SALES TAX line is worth the whole
+        # invoice, and consuming the net would leave the tax outstanding on it
+        # for ever -- a PO that can never be closed.
+        po_consumed_cents = amount_cents if po_covers_tax else amount_cents - tax_cents
+        subtotal_cents = po_consumed_cents
+
+        # Step 1: Get invoice date
+        print("[API] Pre-invoice: getInvoiceDate...")
+        date_res = self._req_json(
+            "/api/accounting/u/poInvoice/getInvoiceDate",
+            method="POST",
+            body={"type": "INVOICE", "vendorId": vendor_id},
+        )
+        _data = date_res.get("data")
+        if isinstance(_data, dict):
+            invoice_date_ms = _data.get("invoiceDate")
+        elif isinstance(_data, (int, float)):
+            invoice_date_ms = _data
+        else:
+            invoice_date_ms = None
+        if not invoice_date_ms:
+            # Calendar day at dealer-TZ midnight — not UTC (avoids −1 day in Central).
+            from api.services.je_creation import invoice_date_to_epoch_ms
+
+            date_str = invoice_date or datetime.now(tz=timezone.utc).strftime("%m/%d/%Y")
+            invoice_date_ms = invoice_date_to_epoch_ms(
+                date_str, tz_name=self.get_dealer_timezone()
+            )
+        print(f"[API] Invoice date: {datetime.fromtimestamp(invoice_date_ms / 1000, tz=timezone.utc).strftime('%m/%d/%Y')}")
+
+        # Step 2: Get due date
+        print("[API] Pre-invoice: invoiceDueDate...")
+        due_res = self._req_json(
+            "/api/accounting/u/poInvoice/invoiceDueDate",
+            method="POST",
+            body={
+                "invoiceDate": invoice_date_ms,
+                "vendorId": vendor_id,
+                "vendorSiteId": int(vendor_site_id),
+            },
+        )
+        _due_data = due_res.get("data")
+        if isinstance(_due_data, dict):
+            due_date_ms = _due_data.get("invoiceDueDate")
+        elif isinstance(_due_data, (int, float)):
+            due_date_ms = _due_data
+        else:
+            due_date_ms = None
+        if not due_date_ms:
+            due_date_ms = invoice_date_ms + 30 * 24 * 60 * 60 * 1000
+        print(f"[API] Due date: {datetime.fromtimestamp(due_date_ms / 1000, tz=timezone.utc).strftime('%m/%d/%Y')}")
+
+        # Step 3: Get postings
+        print("[API] Pre-invoice: postings...")
+        postings_res = self._req_json(
+            "/api/accounting/u/poInvoice/preInvoicing/postings",
+            method="POST",
+            body={
+                "vendorId": vendor_id,
+                "poUniversalIds": [universal_id],
+                "invoiceAmount": {"amount": subtotal_cents, "currency": "USD"},
+                "apGlAccountId": ap_gl_account_id,
+                "poNumbers": [po_number],
+            },
+        )
+
+        # Tekion works out the expense side itself and hands it back: one
+        # posting per part line on the PO, each with the GL account that part
+        # belongs to. A stock order has as many lines as it has parts, so
+        # inventing a single posting from one GL account -- which is right for
+        # sublet and misc -- would post the wrong breakdown here.
+        #
+        # Opt-in so the existing callers keep their single-line behaviour.
+        accounting_details: list[dict[str, Any]] | None = None
+        if use_returned_postings:
+            returned = postings_res.get("data") or []
+            # The response is a balanced double entry: one debit per part plus
+            # the AP credit, which sums to zero. Only the expense side belongs in
+            # accountingDetails -- the AP side travels separately as
+            # apGlAccountId, and including it here posts a zero invoice.
+            returned = [
+                p for p in returned if p.get("glAccountId") != ap_gl_account_id
+            ]
+            if returned:
+                accounting_details = [
+                    {
+                        "description": p.get("description"),
+                        "glAccountId": p.get("glAccountId"),
+                        # The postings response is in dollars; the post body is
+                        # in cents, like every other amount here.
+                        "postingAmount": {
+                            "amount": round(float(p.get("amount") or 0) * 100),
+                            "currency": "USD",
+                        },
+                        "controlNumberList": p.get("controlNumberList"),
+                        "refText": p.get("refText"),
+                    }
+                    for p in returned
+                ]
+                total = sum(d["postingAmount"]["amount"] for d in accounting_details)
+                print(f"[API] Pre-invoice: {len(accounting_details)} posting(s) from Tekion, "
+                      f"totalling {total / 100:.2f}")
+            else:
+                print("[API] Pre-invoice: Tekion returned no postings; falling back")
+
+        if accounting_details is None:
+            # Tekion had nothing, so fall back to what the invoice says. The
+            # written splits come first: they name several accounts with their
+            # own amounts, and collapsing that into one account -- which is what
+            # gl_account_id does -- would throw the division away.
+            if gl_splits:
+                accounting_details = [
+                    {
+                        "description": s.get("description"),
+                        "glAccountId": s["gl_account_id"],
+                        "postingAmount": {
+                            "amount": round(s["amount"] * 100),
+                            "currency": "USD",
+                        },
+                        "controlNumberList": None,
+                        "refText": ref_text,
+                    }
+                    for s in gl_splits
+                ]
+                print(
+                    f"[API] Pre-invoice: using {len(gl_splits)} GL split(s) "
+                    "written on the invoice"
+                )
+            else:
+                accounting_details = [
+                    {
+                        "description": None,
+                        "glAccountId": gl_account_id,
+                        "postingAmount": {"amount": subtotal_cents, "currency": "USD"},
+                        "controlNumberList": None,
+                        "refText": ref_text,
+                    }
+                ]
+
+        # Step 4: Post pre-invoice
+        print("[API] Pre-invoice: post...")
+        post_res = self._req_json(
+            "/api/accounting/u/poInvoice/preInvoice/post",
+            method="POST",
+            body={
+                "dealerId": dealer_id,
+                "payeeId": int(vendor_id),
+                "payeeType": "VENDOR",
+                "vendorSiteId": vendor_site_id,
+                "invoiceNumber": invoice_number,
+                "invoiceAmount": {"amount": amount_cents, "currency": "USD"},
+                "invoiceDate": invoice_date_ms,
+                "invoiceDueDate": due_date_ms,
+                "salesTax": {"amount": tax_cents, "currency": "USD"},
+                "taxes": [{"type": "SALES_TAX", "amount": tax_cents}],
+                "fees": {"amount": 0, "currency": "USD"},
+                "shippingCharges": {"amount": 0, "currency": "USD"},
+                "discount": {"amount": 0, "currency": "USD"},
+                "attachments": [{"mediaId": mid} for mid in (attachment_media_ids or [])],
+                "transactionDetails": None,
+                "accountingDetails": (
+                    [
+                        {
+                            "description": s.get("description"),
+                            "glAccountId": s["gl_account_id"],
+                            "postingAmount": {"amount": round(s["amount"] * 100), "currency": "USD"},
+                            "controlNumberList": None,
+                            # A line's own control when it has one, else the
+                            # document's -- which is what every line used to get.
+                            "refText": s.get("ref_text") or ref_text,
+                        }
+                        for s in gl_splits
+                    ]
+                    if gl_splits
+                    else [
+                        {
+                            "description": None,
+                            "glAccountId": gl_account_id,
+                            "postingAmount": {"amount": subtotal_cents, "currency": "USD"},
+                            "controlNumberList": None,
+                            "refText": ref_text,
+                        }
+                    ]
+                ),
+                "type": "INVOICE",
+                "payeeNumber": vendor_display_id,
+                "payeeName": vendor_name,
+                "apGlAccountId": ap_gl_account_id,
+                "poDetails": [
+                    {
+                        "poId": po_id,
+                        "poNum": po_number,
+                        "poType": po_type,
+                        "universalId": universal_id,
+                        "poInvoicedAmount": {"amount": subtotal_cents, "currency": "USD"},
+                    }
+                ],
+            },
+        )
+
+        post_data = post_res.get("data") or post_res
+        invoice_id = post_data.get("id") or post_data.get("invoiceId") or "unknown"
+        print(f"[API] Pre-invoice posted: invoiceId={invoice_id}")
+
+        return {"invoiceId": str(invoice_id), "status": "posted"}
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _extract_lookup_results(
+        self, res: dict[str, Any], entity_type: str, display_value_field: str | None = None
+    ) -> list[dict[str, Any]]:
+        data = res.get("data") or {}
+        entities = (data.get(entity_type) or {}).get("entities")
+        if isinstance(entities, list):
+            results = []
+            for e in entities:
+                d = e.get("data") or e
+                if display_value_field:
+                    d[f"_{display_value_field}"] = e.get("displayValue")
+                results.append(d)
+            return results
+
+        # Fallback shapes
+        et_data = data.get(entity_type) or {}
+        if et_data.get("results"):
+            return et_data["results"]
+        if data.get("results"):
+            return data["results"]
+        if isinstance(data, list):
+            return data
+        top_et = res.get(entity_type) or {}
+        if top_et.get("results"):
+            return top_et["results"]
+        if isinstance(data.get(entity_type), list):
+            return data[entity_type]
+
+        print(f"[API] Could not extract results for {entity_type}: {str(res)[:200]}")
+        return []

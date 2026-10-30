@@ -1,0 +1,993 @@
+"""OCR JSON field extraction helpers.
+
+Python port of src/api/ocrHelpers.ts — reads the structure produced by
+vision_extract.py and extracts vendor, dealership, invoice number, totals,
+line items, and sales tax.
+"""
+from __future__ import annotations
+
+import json
+import re
+from datetime import datetime
+from typing import Any
+
+
+def load_ocr_json(path: str) -> dict[str, Any]:
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def get_vendor_name(ocr: dict[str, Any]) -> str:
+    vendor = ocr.get("vendor") or {}
+    return vendor.get("name") or vendor.get("displayName") or ""
+
+
+def get_dealership_name(ocr: dict[str, Any]) -> str:
+    user_input = ocr.get("user_input") or {}
+    dealership = ocr.get("dealership") or {}
+    if isinstance(dealership, dict):
+        return user_input.get("dealership") or dealership.get("name") or ""
+    return user_input.get("dealership") or dealership or ""
+
+
+def _clean_ro_number(raw: Any) -> str:
+    """Strip the label off a repair order number.
+
+    Invoices print the RO as "RO 1575659", "RO# 1575659", "R.O. 1575659" — and
+    OCR routinely reads that leading "RO" as "R0" with a digit zero. Tekion
+    searches on the number itself, so a value carrying the prefix finds nothing
+    and the run fails with "No RO found" even though the number was read
+    correctly.
+
+    Only a recognisable RO label is removed. A number that genuinely contains
+    letters is left alone rather than guessed at.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    # "RO", "R0", "R.O.", "RO#", "REPAIR ORDER" — optionally followed by
+    # punctuation and whitespace, at the start only.
+    stripped = re.sub(
+        r"^\s*(?:R[O0]|R\.?\s*[O0]\.?|REPAIR\s+ORDER)\s*[#:.\-]?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+    return stripped or text
+
+
+def get_vin(ocr: dict[str, Any]) -> str:
+    vehicle = ocr.get("vehicle") or {}
+    vin = str(vehicle.get("vin") or "").strip().upper()
+    # Drop obvious OCR noise ("[illegible]", stray punctuation) rather than
+    # feeding a garbage VIN into a Tekion search.
+    vin = re.sub(r"[^A-Z0-9]", "", vin)
+    # Sublet invoices often print only a partial VIN (e.g. the last 8
+    # characters like "TL012280"). Tekion's GSS search matches on those
+    # fragments, so accept anything 6+ chars after cleaning — anything
+    # shorter is almost certainly OCR noise, not a real VIN fragment.
+    return vin if len(vin) >= 6 else ""
+
+
+# Labels that really do name a repair order, most specific first. Matched as
+# whole words against a label stripped of punctuation and spaces.
+#
+# The obvious `"ro" in label` is what this replaces, and it was wrong in a way
+# that is easy to miss: "ro" appears inside "shipped f-r-o-m", so every invoice
+# with a Shipped From field filed its shipping origin as a repair order number.
+_RO_LABELS = (
+    "repairorder",
+    "repairordernumber",
+    "ronumber",
+    "rono",
+    "controlnumber",
+    "controlno",
+)
+
+# Fields that contain an RO label as a substring but mean something else.
+_NOT_AN_RO = ("shippedfrom", "shipto", "billto", "salesorder", "purchaseorder")
+
+
+def _looks_like_ro_label(label: str) -> bool:
+    """True when this label names a repair order rather than merely containing 'ro'."""
+    key = "".join(str(label or "").lower().split()).replace(".", "").replace("-", "")
+    if not key or any(key.startswith(bad) for bad in _NOT_AN_RO):
+        return False
+    if key in _RO_LABELS:
+        return True
+    # A bare "RO" or "R/O" column heading is common and legitimate.
+    if key in ("ro", "r/o", "ro#"):
+        return True
+    # Otherwise require the words, not the letters: "repair order" anywhere, or
+    # a label that starts with "ro" followed by a separator ("ro no", "ro #").
+    return "repairorder" in key or key.startswith("rono") or key.startswith("ro#")
+
+
+def get_control_number(ocr: dict[str, Any]) -> str:
+    po_contract = ocr.get("_po_contract") or {}
+    if po_contract.get("ro_number"):
+        return _clean_ro_number(po_contract["ro_number"])
+
+    for id_entry in ocr.get("identifiers", []):
+        if _looks_like_ro_label(id_entry.get("label")):
+            return _clean_ro_number(id_entry.get("value"))
+
+    return _clean_ro_number(
+        ocr.get("control_number")
+        or ocr.get("controlNumber")
+        or (po_contract.get("control_number") or "")
+    )
+
+
+# How many whitespace-separated pieces an invoice number may be made of, and how
+# long a piece has to be before it stops looking like part of one.
+_INVOICE_MAX_PARTS = 3
+_INVOICE_CODE_MAX = 3
+_INVOICE_PREFIX_MAX = 4
+
+
+def _clean_invoice_number(raw: str) -> str:
+    """The invoice number as printed, including any short code attached to it.
+
+    Letters were never the problem -- "80090801610A" and "41854-39" always came
+    through whole. What was lost was anything after a SPACE, because this took
+    the first token and stopped. S&S Automotive prints
+
+        ORDER          INVOICE        PAGE
+        10180847 SS    6101029 RI     1
+
+    and "RI" is part of the number, not a note beside it. Dropping it makes two
+    different documents from the same vendor collide on 6101029 and reports the
+    second as a duplicate of the first.
+
+    So a short code is kept, on either side of the digits:
+
+        "6101029 RI"    -> "6101029 RI"
+        "RI 6101029"    -> "RI 6101029"
+        "80090801610A"  -> unchanged
+        "41854-39"      -> unchanged
+
+    Bounded on purpose. An identifier field sometimes carries a few words of
+    prose after the number, and a rule that simply kept everything would post
+    "6101029 RI Customer Copy" to Tekion. Only pieces SHORT enough to be a code
+    are taken, and at most three of them:
+
+        "6101029 RI Customer Copy" -> "6101029 RI"
+    """
+    trimmed = " ".join(str(raw or "").split())
+    if not trimmed:
+        return ""
+
+    parts = trimmed.split(" ")
+    kept = [parts[0]]
+    index = 1
+
+    # A leading letter-only code belongs to the digits that follow it: "RI
+    # 6101029" is one number written the other way round, and keeping only "RI"
+    # would throw away the number itself.
+    if (
+        parts[0].isalpha()
+        and len(parts[0]) <= _INVOICE_PREFIX_MAX
+        and len(parts) > 1
+        and any(c.isdigit() for c in parts[1])
+    ):
+        kept.append(parts[1])
+        index = 2
+
+    # Short codes after it: "RI", "SS", "CM". Three characters is the cutoff --
+    # it admits every code seen and excludes the shortest real word likely to
+    # follow one.
+    while (
+        index < len(parts)
+        and len(kept) < _INVOICE_MAX_PARTS
+        and len(parts[index]) <= _INVOICE_CODE_MAX
+        and parts[index].isalnum()
+    ):
+        kept.append(parts[index])
+        index += 1
+
+    return " ".join(kept)
+
+
+def get_invoice_number(ocr: dict[str, Any]) -> str:
+    # Gemini's own answer first: it reads the page as a whole, so it knows the
+    # "Order #" is this vendor's invoice number where no invoice number is
+    # printed. The label rules below are for reads made before it was asked.
+    decided = _clean_invoice_number(str(ocr.get("invoice_number") or ""))
+    if decided:
+        return decided
+
+    for id_entry in ocr.get("identifiers", []):
+        label = (id_entry.get("label") or "").lower()
+        if "invoice number" in label or "invoice #" in label or label == "invoice":
+            return _clean_invoice_number(str(id_entry.get("value") or ""))
+
+    for id_entry in ocr.get("identifiers", []):
+        label = (id_entry.get("label") or "").lower()
+        if "invoice" in label and "date" not in label:
+            return _clean_invoice_number(str(id_entry.get("value") or ""))
+
+    po_contract = ocr.get("_po_contract") or {}
+    fallback = (
+        ocr.get("invoice_number")
+        or ocr.get("invoiceNumber")
+        or po_contract.get("invoice_number")
+        or ""
+    )
+    return _clean_invoice_number(str(fallback)) if fallback else ""
+
+
+def _clean_po_number(raw: Any) -> str:
+    """Strip a leading PO label, the way _clean_ro_number does for repair orders."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    stripped = re.sub(
+        r"^\s*(?:P\.?\s*O\.?|PURCHASE\s+ORDER)\s*(?:NUMBER|NO|#)?\s*[#:.\-]?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+    return stripped or text
+
+
+# A purchase order number a person wrote on the page: "PO 35096", "P.O. #35096".
+# The label is what separates it from every other number on the invoice, and
+# "PO BOX" is excluded because it appears in most vendor addresses.
+_WRITTEN_PO = re.compile(
+    r"\bP\.?\s*O\.?(?!\s*BOX)\s*(?:NUMBER|NO|#)?\s*[#:.-]?\s*([A-Za-z0-9-]{3,20})\b",
+    re.IGNORECASE,
+)
+
+
+def get_po_number(ocr: dict[str, Any]) -> str:
+    """The purchase order number printed on the invoice.
+
+    Vendor stock orders are invoiced against a PO that already exists in Tekion,
+    so this is the field the whole flow hangs on.
+
+    "PO BOX" is excluded outright — it is part of the vendor's address and
+    appears on most invoices, so a loose match would confidently return a
+    postal box number as a purchase order.
+    """
+    po_contract = ocr.get("_po_contract") or {}
+    if po_contract.get("po_number"):
+        return _clean_po_number(po_contract["po_number"])
+
+    identifiers = ocr.get("identifiers") or []
+
+    def scan(predicate) -> str:
+        for entry in identifiers:
+            label = (entry.get("label") or "").strip().lower()
+            if not label or "box" in label:
+                continue
+            if predicate(label):
+                cleaned = _clean_po_number(entry.get("value"))
+                if cleaned:
+                    return cleaned
+        return ""
+
+    # An explicit purchase-order label first.
+    found = scan(lambda label: "purchase order" in label)
+    if found:
+        return found
+    # Then the abbreviation, but only where it stands as its own word.
+    found = scan(
+        lambda label: label.replace(".", "").replace(" ", "").startswith("po")
+    )
+    if found:
+        return found
+
+    found = _clean_po_number(ocr.get("po_number") or ocr.get("poNumber") or "")
+    if found:
+        return found
+
+    # Written on by hand. The prompt asks for these in identifiers[] too, but a
+    # margin scribble is the case OCR is least consistent about structuring, and
+    # the raw transcription is where it always survives.
+    #
+    # A LABEL IS REQUIRED here -- unlike the printed path, which trusts the
+    # field's own name. A note is just text on a page: scanning it for bare
+    # digits would return the RO number, the account number or the date.
+    for note in ocr.get("handwritten_notes") or []:
+        match = _WRITTEN_PO.search(str(note or ""))
+        if match:
+            return _clean_po_number(match.group(1))
+
+    return ""
+
+
+
+# A dealership GL account is four or five digits. Anything shorter is a line
+# number or a quantity; anything longer is an invoice or part number.
+_GL_PATTERN = re.compile(r"\b(\d{4,5})\b")
+
+# Labels and note text that introduce a GL account, so "GL# 2410" scrawled in
+# the margin is read as an account and "Invoice Number 135624720" is not.
+_GL_HINTS = ("gl", "g/l", "account", "acct", "acc#", "post to", "charge to")
+
+
+def _first_gl(text: Any) -> str:
+    """The first plausible GL account in a string, or ""."""
+    match = _GL_PATTERN.search(str(text or ""))
+    return match.group(1) if match else ""
+
+
+def get_line_item_gl_accounts(ocr: dict[str, Any]) -> dict[int, str]:
+    """GL account per line item index, for the lines that carry one."""
+    out: dict[int, str] = {}
+    for i, item in enumerate(ocr.get("line_items") or []):
+        account = _first_gl(item.get("gl_account"))
+        if account:
+            out[i] = account
+    return out
+
+
+def get_document_gl_account(ocr: dict[str, Any]) -> str:
+    """The GL account written on the invoice, for the whole document.
+
+    Clerks write the account on the page by hand -- "GL# 2410" circled in the
+    margin -- and the OCR prompt already binds a code like that to everything on
+    the document when no arrow points it at one line. This reads that back.
+
+    Searched most reliable first:
+      1. an account every line item agrees on
+      2. gl_mappings[], which the prompt fills for fees and charges
+      3. an identifier labelled like a GL account
+      4. handwritten notes, where a margin scrawl ends up
+
+    Returns "" when the invoice does not name one. Callers treat that as
+    "nothing was written here", not as an error.
+    """
+    per_line = set(get_line_item_gl_accounts(ocr).values())
+    if len(per_line) == 1:
+        return per_line.pop()
+
+    return _written_on_the_document(ocr)
+
+
+def _written_on_the_document(ocr: dict[str, Any]) -> str:
+    """A GL account written for the DOCUMENT, ignoring the line items.
+
+    Split out from `get_document_gl_account` because its first rule -- an
+    account every line agrees on -- must not be used when filling in blank
+    lines. One line carrying 7550 while another carries nothing is not
+    agreement; treating it as such copies one row's account onto rows the clerk
+    never marked, which is exactly the kind of quiet mistake that puts money in
+    the wrong account.
+    """
+    for mapping in ocr.get("gl_mappings") or []:
+        account = _first_gl(mapping.get("gl_account"))
+        if account:
+            return account
+
+    for entry in ocr.get("identifiers") or []:
+        label = str(entry.get("label") or "").lower()
+        if any(hint in label for hint in _GL_HINTS):
+            account = _first_gl(entry.get("value"))
+            if account:
+                return account
+
+    # A handwritten note only counts when it says it is an account. Invoices are
+    # covered in stray numbers, and picking one at random would post real money
+    # to whatever four digits happened to be legible.
+    for note in ocr.get("handwritten_notes") or []:
+        text = str(note or "").lower()
+        if any(hint in text for hint in _GL_HINTS):
+            account = _first_gl(note)
+            if account:
+                return account
+
+    return ""
+
+def get_document_type(ocr: dict[str, Any]) -> str:
+    """Whatever OCR decided the document is.
+
+    Recorded next to the upload folder so a mismatch stays visible. The folder
+    is authoritative for pipeline selection — this is only for review.
+    """
+    po_contract = ocr.get("_po_contract") or {}
+    return str(ocr.get("document_type") or po_contract.get("document_type") or "").strip()
+
+
+# Date formats seen on vendor invoices and parts tickets, in priority order.
+_DATE_FORMATS = ("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%m-%d-%Y", "%d-%b-%Y", "%b %d, %Y")
+
+
+def _normalize_date(raw: Any) -> str:
+    """Normalize a date string to MM/DD/YYYY. Returns '' when unparseable."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.strptime(text, fmt).strftime("%m/%d/%Y")
+        except ValueError:
+            continue
+    # Ford prints "Date Inv. Prepared" as three separate boxes, which OCR reads
+    # back as "08 05 26". Matched as a WHOLE string rather than searched for, so
+    # that three unrelated numbers sitting near each other in some other field
+    # cannot be mistaken for a date.
+    m = re.fullmatch(r"\s*(\d{1,2})[\s.](\d{1,2})[\s.](\d{2,4})\s*", text)
+    if m:
+        month, day, year = m.groups()
+        if len(year) == 2:
+            year = f"20{year}"
+        try:
+            return datetime(int(year), int(month), int(day)).strftime("%m/%d/%Y")
+        except ValueError:
+            return ""
+
+    # Last resort: pull an M/D/Y out of a longer string ("Invoice Date 05/12/2026").
+    m = re.search(r"(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})", text)
+    if m:
+        month, day, year = m.groups()
+        if len(year) == 2:
+            year = f"20{year}"
+        try:
+            return datetime(int(year), int(month), int(day)).strftime("%m/%d/%Y")
+        except ValueError:
+            return ""
+    return ""
+
+
+def get_invoice_date(ocr: dict[str, Any]) -> str:
+    """The invoice date as MM/DD/YYYY — the JE flow's Accounting Date.
+
+    Looks for an explicit invoice-date identifier first, then any date label
+    that is not a due/payment date, since posting to the due date would put the
+    entry in the wrong period.
+    """
+    identifiers = ocr.get("identifiers") or []
+
+    for entry in identifiers:
+        label = (entry.get("label") or "").lower()
+        if "invoice date" in label or label in ("date", "inv date"):
+            normalized = _normalize_date(entry.get("value"))
+            if normalized:
+                return normalized
+
+    for entry in identifiers:
+        label = (entry.get("label") or "").lower()
+        if "date" not in label:
+            continue
+        if any(skip in label for skip in ("due", "payment", "ship", "order", "delivery")):
+            continue
+        normalized = _normalize_date(entry.get("value"))
+        if normalized:
+            return normalized
+
+    po_contract = ocr.get("_po_contract") or {}
+    return _normalize_date(
+        ocr.get("invoice_date") or ocr.get("invoiceDate") or po_contract.get("invoice_date")
+    )
+
+
+# How a printed figure says it is a CREDIT: "422.27 CR", "-1,001.52",
+# "(460.00)", "CR 541.52".
+_CREDIT_MARK = re.compile(r"(?:\bCR\b|\bCREDIT\b|^\s*-|^\s*\()", re.IGNORECASE)
+
+
+def _is_credit_value(value: Any) -> bool:
+    """Whether a printed amount is marked as a credit."""
+    if isinstance(value, (int, float)):
+        return value < 0
+    return bool(_CREDIT_MARK.search(str(value or "")))
+
+
+def _parse_amount(value: Any) -> float:
+    """The MAGNITUDE of a printed amount. Whether it is a credit is asked
+    separately -- see _is_credit_value -- because most callers want the size.
+
+    "422.27 CR" used to fail to parse at all and come back as 0.0. On a Honda
+    parts credit memo every total is printed that way, so no total was found,
+    and the invoice was posted for the first part's price, 332.25, instead of
+    its 422.27 total.
+    """
+    if isinstance(value, (int, float)):
+        return abs(float(value))
+    cleaned = re.sub(r"(?i)\b(?:CR|DR|CREDIT|DEBIT)\b", "", str(value or "0"))
+    cleaned = re.sub(r"[$,()\s]", "", cleaned)
+    try:
+        return abs(float(cleaned))
+    except ValueError:
+        return 0.0
+
+
+def get_sales_tax(ocr: dict[str, Any]) -> float:
+    for t in ocr.get("totals", []):
+        label = (t.get("label") or "").lower()
+        if "sales tax" in label or label == "tax":
+            return _parse_amount(t.get("value"))
+    return 0.0
+
+
+# Labels that look like a total but are not the amount owed. "SUBTOTAL"
+# contains "total", so a naive substring match returns the pre-tax figure — and
+# anything that then subtracts tax from it takes the tax off twice.
+_NOT_A_GRAND_TOTAL = (
+    "sub", "line", "item", "extended", "tax", "discount", "rate",
+    "qty", "quantity", "freight", "shipping", "handling", "paid", "credit",
+)
+
+# Tried in order. An explicit grand-total label beats a bare "total".
+_GRAND_TOTAL_LABELS = (
+    "grand total", "total amount due", "amount due", "balance due",
+    "invoice total", "total due", "total amount", "net due", "please pay",
+    # Honda on Grand prints its total as "PAY THIS AMOUNT". Missing from this
+    # list, the total fell through to a guess that picked the -16.00 core
+    # return, and a $112.64 invoice was sent to Tekion as a $16 credit.
+    "pay this amount", "amount to pay", "total to pay",
+)
+
+
+def _grand_total_raw(ocr: dict[str, Any]) -> Any:
+    """The printed grand-total value, as printed -- "422.27 CR", "-1001.52".
+
+    Label matching is deliberately prioritised rather than first-match: an
+    invoice prints several numbers that read as totals, and picking the wrong
+    one is not a rounding error. One S&S invoice listed EXTENDED 411.26, SALES
+    TAX 34.96 and TOTAL 446.22; returning 411.26 as "the total" and then
+    deducting tax produced a purchase order for 376.30 against a 446.22 bill.
+
+    Shared by get_total_amount and is_credit_invoice, so the size of the total
+    and whether it is a credit are read off the same figure.
+    """
+    # Gemini's own answer first. It sees the layout, so it can tell the bill's
+    # total from a merchandise-only line, an opening balance or a payment due
+    # that adds earlier balances. Matching label words could not: "MERCHANDISE
+    # INVOICE TOTAL 20.00" contains "invoice total" and was taken for a $30.00
+    # invoice. The label rules below are the fallback for reads made before
+    # the model was asked, and for a total it could not give. Every flow still
+    # checks this figure against the GL lines or line items before posting.
+    decided = ocr.get("invoice_total")
+    if decided not in (None, "") and _parse_amount(decided):
+        return decided
+
+    totals = ocr.get("totals") or []
+
+    def raw_for(predicate) -> Any:
+        for entry in totals:
+            label = (entry.get("label") or "").strip().lower()
+            if not label or any(bad in label for bad in _NOT_A_GRAND_TOTAL):
+                continue
+            if predicate(label) and _parse_amount(entry.get("value")):
+                return entry.get("value")
+        return None
+
+    # 1. An unambiguous grand-total label.
+    for wanted in _GRAND_TOTAL_LABELS:
+        found = raw_for(lambda label, w=wanted: w in label)
+        if found is not None:
+            return found
+
+    # 2. The word "total" on its own.
+    found = raw_for(lambda label: label == "total")
+    if found is not None:
+        return found
+
+    # 3. Any surviving label containing "total" -- subtotals and line totals
+    #    were excluded above.
+    found = raw_for(lambda label: "total" in label)
+    if found is not None:
+        return found
+
+    # 4. No total line at all: add up what the invoice prints instead --
+    #    subtotal plus tax and freight -- before trusting a guess made
+    #    elsewhere. That guess (the _po_contract total) is built from the rows,
+    #    and on a parts invoice with a core return it took the core line.
+    rebuilt = _total_from_parts(totals)
+    if rebuilt is not None:
+        return rebuilt
+
+    po_contract = ocr.get("_po_contract") or {}
+    summary = ocr.get("summary") or {}
+    return ocr.get("total") or po_contract.get("total") or summary.get("total") or 0
+
+
+def _total_from_parts(totals: list[dict[str, Any]]) -> float | None:
+    """Subtotal + tax + freight/shipping/handling, when a subtotal is printed.
+
+    Signed, so a subtotal printed "CR" gives a negative total and the invoice
+    still reads as a credit. None when there is no subtotal to start from.
+    """
+    def signed(value: Any) -> float:
+        amount = _parse_amount(value)
+        return -amount if _is_credit_value(value) else amount
+
+    subtotal = None
+    extras = 0.0
+    for entry in totals:
+        label = (entry.get("label") or "").strip().lower()
+        value = entry.get("value")
+        if not label or not re.search(r"\d", str(value or "")):
+            continue
+        if subtotal is None and ("subtotal" in label or "sub total" in label or "sub-total" in label):
+            subtotal = signed(value)
+        elif "tax" in label and "exempt" not in label:
+            extras += signed(value)
+        elif any(word in label for word in ("freight", "shipping", "handling", "delivery")):
+            extras += signed(value)
+    if subtotal is None:
+        return None
+    return round(subtotal + extras, 2)
+
+
+def get_total_amount(ocr: dict[str, Any]) -> float:
+    """The amount owed on the invoice, tax included, as a positive figure."""
+    return _parse_amount(_grand_total_raw(ocr))
+
+
+def has_printed_zero_total(ocr: dict[str, Any]) -> bool:
+    """Whether the invoice's total was READ, and reads zero.
+
+    get_total_amount returns 0.0 both for a total that says .00 and for one
+    that was never found, and the two need different answers: a Kia core
+    credit memo printed ".00CR" has nothing to post, while an unread total
+    needs a clearer scan. Only true when a total figure is actually present.
+    """
+    # _grand_total_raw skips zero values and falls back to a bare 0 when it
+    # finds nothing, so it cannot answer this: look for the total line itself.
+    if get_total_amount(ocr):
+        return False
+    for entry in ocr.get("totals") or []:
+        label = (entry.get("label") or "").strip().lower()
+        if "total" not in label or any(bad in label for bad in _NOT_A_GRAND_TOTAL):
+            continue
+        value = str(entry.get("value") or "").strip()
+        if re.search(r"\d", value) and _parse_amount(value) == 0.0:
+            return True
+    return False
+
+
+def is_credit_invoice(ocr: dict[str, Any]) -> bool:
+    """Whether the invoice is a CREDIT -- money owed to the dealership.
+
+    Honda prints a credit memo's totals as "422.27 CR"; OCR sometimes turns that
+    into "-422.27". Either way the whole entry runs the other direction: A/P is
+    debited, and the accounts the clerk writes are credited. Posting it as an
+    ordinary invoice balances perfectly and is completely backwards.
+    """
+    return _is_credit_value(_grand_total_raw(ocr))
+
+
+def to_flat_fields(ocr: dict[str, Any]) -> dict[str, Any]:
+    """Flatten the OCR output into the shape the API documents and returns.
+
+    The model picks its own field names, so the raw extraction is nested and
+    label-driven: `vendor: {name}`, `identifiers: [{label, value}]`,
+    `totals: [{label, value}]`. Every consumer would otherwise have to redo this
+    digging — including the frontend, in JavaScript.
+
+    This is the single flattening, used by both the pipeline and the OCR job
+    endpoint, so both report identical values.
+    """
+    return {
+        "document_type": get_document_type(ocr),
+        "dealership_name": get_dealership_name(ocr),
+        "vendor_name": get_vendor_name(ocr),
+        "invoice_number": get_invoice_number(ocr),
+        "invoice_date": get_invoice_date(ocr),
+        "invoice_amount": get_total_amount(ocr),
+        "sales_tax": get_sales_tax(ocr),
+        "ro_number": get_control_number(ocr),
+        "line_items": get_raw_line_items(ocr),
+        "needs_review": bool((ocr.get("_validation") or {}).get("needs_review", False)),
+    }
+
+
+def get_raw_line_items(ocr: dict[str, Any]) -> list[dict[str, Any]]:
+    items = ocr.get("line_items") or []
+    result = []
+    for item in items:
+        try:
+            qty = float(re.sub(r"[$,]", "", str(item.get("qty", "1")))) or 1.0
+        except ValueError:
+            qty = 1.0
+        unit_price = _parse_amount(item.get("unit_price") or item.get("unitPrice"))
+        total_price = _parse_amount(item.get("total_price") or item.get("totalPrice"))
+
+        # A row priced ONLY as an extended total.
+        #
+        # Plenty of invoices have one price column and no quantity at all -- a
+        # body shop billing "rear hatch scratches ... 85.00" is not selling 85
+        # of anything. OCR reports that as total_price with unit_price empty,
+        # and everything downstream values the row at qty x unitPrice, which is
+        # zero. On a G.A.R.I. sublet invoice that made all eight rows worth
+        # nothing, so they failed to reconcile against the 760.00 total and were
+        # thrown away -- taking the repair order numbers on them with it.
+        #
+        # Only fills a blank. A row that states its own unit price keeps it,
+        # even where the two disagree, because that disagreement is the
+        # invoice's and not ours to reconcile.
+        if not unit_price and total_price:
+            unit_price = round(total_price / qty, 2) if qty else total_price
+        result.append(
+            {
+                "description": item.get("description") or "",
+                "qty": qty,
+                "unitPrice": unit_price,
+                "totalPrice": total_price,
+                "glAccount": item.get("gl_account") or "",
+                # The repair order this row's work was done on. A sublet invoice
+                # that bills several vehicles names one per row; without it the
+                # flow has to guess the RO from the VIN, and a page listing eight
+                # cars has no single VIN to guess from.
+                "roNumber": _clean_ro_number(item.get("ro_number") or ""),
+            }
+        )
+
+    # A GL written once for the whole document applies to every line on it.
+    #
+    # Clerks write "GL 6173" in the margin beside the charge, or across the top,
+    # and OCR reports that as a document-level account rather than a per-line
+    # one -- there is nothing pointing at an individual row to attach it to.
+    # Without this the account was read successfully and then used by nobody:
+    # the PO flows only look at line_items[].gl_account, so an invoice with a
+    # margin GL fell through to the Gemini classifier as though nothing had been
+    # written on it at all.
+    #
+    # Only fills a blank. A line with its own account keeps it, because a
+    # document-level note is the default for the page, not an override of a
+    # specific row.
+    if any(not row["glAccount"] for row in result):
+        document_gl = _written_on_the_document(ocr)
+        if document_gl:
+            for row in result:
+                if not row["glAccount"]:
+                    row["glAccount"] = document_gl
+    return result
+
+
+# A handwritten note that states an account and the figure beside it:
+#     "GL# 2410 $414.00"    -> 2410,  +414.00
+#     "GL# 6777 -$62.10"    -> 6777,   -62.10
+#     "2248 641.93 HTB"     -> 2248,  +641.93, labelled HTB
+#
+# Anchored at the start so a note that merely CONTAINS numbers is not read as
+# an annotation: "HTB 641.93" and "OBT 7992" both fail here, which is right --
+# the first is a memo of a figure and the second is a stock number.
+_NOTE_GL_LINE = re.compile(
+    # A lead-in the clerk writes before the account: "* Credit GL# 2410".
+    # Without this the whole note failed to match, and the minus sign on it --
+    # the only place a credit is marked -- was never read.
+    r"^\s*(?:[*\-]+\s*)?(?P<word>CREDIT|DEBIT|CR|DR)?\s*"
+    r"(?:GL|G/?L|ACCT|ACCOUNT|A/C)?\s*#?\s*"
+    r"(?P<account>\d{4,5}[A-Za-z]?)\s+"
+    # The figure may start at the decimal point: clerks write small credits as
+    # "-$.25", with no leading zero. Requiring a digit first skipped that note
+    # entirely, its minus with it, and the 6777 discount on 80092491307A
+    # posted as +0.25 -- an entry $0.50 out of balance.
+    r"(?P<minus>-\s*)?\$?\s*(?P<figure>[\d,]+(?:\.\d{1,2})?|\.\d{1,2})"
+    # Cents written raised, which OCR reads as a separate group: "-$422 27".
+    r"(?:\s+(?P<cents>\d{2})(?!\d))?"
+    r"\s*\$?\s*(?P<label>.*)$",
+    re.IGNORECASE,
+)
+
+
+def note_lines(raw: Any) -> list[str]:
+    """One handwritten note, split into the lines it was written on.
+
+    OCR does not transcribe a block of handwriting consistently. The same two
+    lines come back as two notes on one run and as ONE note joined by a newline
+    on the next -- "# 2410 $414 00\\n# 6777 - $82 80". Anything that reads a note
+    as a single annotation then sees the first account and swallows the second
+    into its label, which dropped 6777 and its minus and posted a journal entry
+    out of balance by exactly that figure.
+    """
+    return [line.strip() for line in str(raw or "").splitlines() if line.strip()]
+
+
+def _note_annotations(ocr: dict[str, Any]) -> list[str]:
+    """Every "account amount" annotation in the notes, one per entry.
+
+    Each line is read on its own. A line that is not an annotation by itself
+    is tried joined to the one before it, for the clerk who writes the account
+    and puts the figure underneath: "GL# 2410" then "$414.00".
+    """
+    annotations: list[str] = []
+    for raw in ocr.get("handwritten_notes") or []:
+        carry = ""
+        for line in note_lines(raw):
+            if _NOTE_GL_LINE.match(line):
+                annotations.append(line)
+                carry = ""
+            elif carry and _NOTE_GL_LINE.match(f"{carry} {line}"):
+                annotations.append(f"{carry} {line}")
+                carry = ""
+            else:
+                carry = line
+    return annotations
+
+
+# The dealership's own code for the vendor, written or stamped on the invoice
+# as dealer number, dash, vendor number: "1707-310" is vendor 1707_310 in
+# Tekion. A whole note and nothing else, so a GL line ("#3142 $72.69"), a date
+# or a phone number never reads as one.
+_VENDOR_CODE_RE = re.compile(
+    r"^\s*(?:vendor|vend|v)?\s*#?\s*(\d{4})\s*[-_\u2013\u2014]\s*(\d{1,6})\s*$",
+    re.IGNORECASE,
+)
+
+
+def get_vendor_codes(ocr: dict[str, Any]) -> list[str]:
+    """Dealer-vendor codes written on the invoice, as "1707-310", in order.
+
+    From `vendor.id`, where the vision prompt asks for it, and from the
+    handwritten notes, where it lands when the model does not file it there.
+    Which dealer a code belongs to is checked by the caller: only one naming
+    the dealership being posted to is used.
+    """
+    raw = [str((ocr.get("vendor") or {}).get("id") or "")]
+    raw += [str(n) for n in (ocr.get("handwritten_notes") or [])]
+    codes: list[str] = []
+    for text in raw:
+        m = _VENDOR_CODE_RE.match(text)
+        if m and f"{m[1]}-{m[2]}" not in codes:
+            codes.append(f"{m[1]}-{m[2]}")
+    return codes
+
+
+def gl_notes(ocr: dict[str, Any]) -> list[dict[str, Any]]:
+    """Accounts and amounts read straight off the transcribed handwriting.
+
+    One of TWO places the sign is read. The vision prompt used to demand a
+    POSITIVE figure in `gl_mappings`, so a clerk who wrote "GL# 6777 -$62.10"
+    got 62.10 back from the structured output, and this note was the only place
+    the minus survived -- without it a discount posts as a charge, which is how
+    a Honda parts invoice came out $124.20 over, exactly twice the discount.
+    `gl_mappings` now carries the sign as written too; get_gl_amount_splits
+    takes a minus from either.
+
+    Returns [{"account", "amount" (signed), "label", "signed"}] in the order the
+    notes were read. `signed` records whether a minus was actually on the page,
+    as opposed to the amount simply arriving positive.
+    """
+    found: list[dict[str, Any]] = []
+    for text in _note_annotations(ocr):
+        match = _NOTE_GL_LINE.match(text)
+        if not match:
+            continue
+        figure = match.group("figure")
+        if match.group("cents") and "." not in figure:
+            figure = f"{figure}.{match.group('cents')}"
+        amount = _parse_amount(figure)
+        if amount is None:
+            continue
+        # A minus, or the word the clerk wrote in front of it. "Credit GL# 2410
+        # $460" is a credit whether or not a minus made it through OCR.
+        negative = bool(match.group("minus")) or (
+            (match.group("word") or "").upper() in ("CREDIT", "CR")
+        )
+        found.append(
+            {
+                "account": match.group("account").upper(),
+                "amount": -abs(amount) if negative else abs(amount),
+                "label": (match.group("label") or "").strip(),
+                "signed": negative,
+            }
+        )
+    return found
+
+
+# An account as Gemini gives it in posting_lines: digits with an optional
+# trailing letter ("2410V"), which _GL_PATTERN's word boundary would reject.
+_POSTING_ACCOUNT = re.compile(r"(?<![\dA-Za-z])(\d{4,5}[A-Za-z]?)(?![\dA-Za-z])")
+
+
+def has_posting_lines(ocr: dict[str, Any]) -> bool:
+    """Whether this read carries Gemini's own posting lines.
+
+    Reads made before `posting_lines` was asked for do not, and fall back to
+    the transcription rules in get_gl_amount_splits.
+    """
+    return isinstance(ocr.get("posting_lines"), list)
+
+
+def get_posting_lines(ocr: dict[str, Any]) -> list[dict[str, Any]]:
+    """The GL accounts written on the invoice and the signed amount each takes.
+
+    Decided by Gemini from the whole page (see `posting_lines` in the vision
+    prompt): negative is a credit, and the lines add up to the signed invoice
+    total. Used as given -- no hunting through notes, no sign rules. The
+    flows still check the lines against the invoice total and the chart of
+    accounts before anything is posted.
+    """
+    lines: list[dict[str, Any]] = []
+    for line in ocr.get("posting_lines") or []:
+        if not isinstance(line, dict):
+            continue
+        match = _POSTING_ACCOUNT.search(str(line.get("account") or ""))
+        account = match.group(1).upper() if match else ""
+        raw = str(line.get("amount") or "").replace("$", "").replace(",", "").strip()
+        amount = _parse_amount(raw)
+        if not account or not amount:
+            continue
+        if _is_credit_value(raw):
+            amount = -amount
+        lines.append({
+            "gl_account": account,
+            "amount": round(amount, 2),
+            "description": str(line.get("label") or "") or None,
+        })
+    return lines
+
+
+def get_gl_amount_splits(ocr: dict[str, Any]) -> list[dict[str, Any]]:
+    """GL accounts written on the invoice WITH the amount each one takes.
+
+    The newer annotation style. Instead of marking each row, the clerk writes a
+    block naming the accounts and how the invoice divides between them:
+
+        GL# 7193   $2,378.11
+        GL# 3142   $202.12
+
+    That is a complete instruction on its own -- the accounts and the split --
+    so it does not need line items to be attached to, and there is no rule that
+    could derive it from them. The two amounts above are the goods and the sales
+    tax; nothing about the parts table says which account tax belongs in.
+
+    Returns [] when the invoice carries no amounts against its accounts, which
+    is the older style where a code sits beside a row and the split has to be
+    worked out from the rows themselves.
+
+    A read that carries Gemini's own `posting_lines` uses those and nothing
+    else: everything below is the transcription-matching for older reads. On a
+    Honda credit memo the clerk's "Credit # 2410 $2,890.20" came back only as a
+    note, gl_mappings stayed empty, this returned [], and the account was
+    guessed from the parts as 2430.
+    """
+    if has_posting_lines(ocr):
+        return get_posting_lines(ocr)
+
+    notes = gl_notes(ocr)
+    claimed: set[int] = set()
+
+    splits: list[dict[str, Any]] = []
+    for mapping in ocr.get("gl_mappings") or []:
+        if not isinstance(mapping, dict):
+            continue
+        account = _first_gl(mapping.get("gl_account"))
+        raw = mapping.get("amount")
+        amount = _parse_amount(raw)
+        # An account with no amount is the older style and belongs to the
+        # per-line path; taking it here would post a zero split.
+        if not account or not amount:
+            continue
+
+        # The sign as Gemini reported it. The prompt used to demand a positive
+        # figure here, which threw away a minus the model had read correctly
+        # and left the note transcription as the only place it could survive --
+        # and that free text came back jumbled often enough ("-#271 19 #6777")
+        # to post a discount as a charge. It now asks for the sign as written.
+        mapped_credit = _is_credit_value(str(raw or "").replace("$", "").strip())
+
+        # The transcription of this same figure, also for its sign. Either one
+        # showing a minus makes it a credit: an unsigned reading in one place is
+        # not evidence against a minus read in the other.
+        twin = next(
+            (
+                i
+                for i, note in enumerate(notes)
+                if i not in claimed
+                and note["account"] == account.upper()
+                and round(abs(note["amount"]), 2) == round(abs(amount), 2)
+            ),
+            None,
+        )
+        note_credit = False
+        if twin is not None:
+            claimed.add(twin)
+            note_credit = notes[twin]["amount"] < 0
+        if mapped_credit or note_credit:
+            amount = -abs(amount)
+
+        splits.append(
+            {
+                "gl_account": account,
+                "amount": round(amount, 2),
+                "description": str(mapping.get("mapped_description") or "") or None,
+            }
+        )
+    return splits

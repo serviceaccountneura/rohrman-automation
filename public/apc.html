@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tekion APC — Data Entry</title>
+  <style>
+    :root { font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; }
+    body  { max-width: 900px; margin: 32px auto; padding: 0 16px; color: #1a1a1a; }
+    h1    { font-size: 20px; margin: 0 0 6px; }
+    .sub  { color: #666; font-size: 13px; margin-bottom: 18px; }
+    .tabs { display: flex; gap: 4px; border-bottom: 1px solid #ddd; margin-bottom: 16px; flex-wrap: wrap; }
+    .tab  { padding: 8px 14px; cursor: pointer; border: 1px solid transparent; border-bottom: none;
+            border-radius: 6px 6px 0 0; color: #444; }
+    .tab.active { background: #fff; border-color: #ddd; color: #111; font-weight: 600;
+                  margin-bottom: -1px; }
+    label { display: block; font-weight: 600; margin: 14px 0 6px; font-size: 13px; }
+    select, textarea, input[type=file], input[type=text], button {
+      font-size: 14px; width: 100%; box-sizing: border-box;
+    }
+    select, input[type=text] { padding: 8px; }
+    textarea { min-height: 240px; padding: 10px; font-family: ui-monospace, Menlo, monospace; }
+    button   { margin-top: 16px; padding: 12px; background: #111; color: #fff; border: 0;
+               border-radius: 8px; cursor: pointer; font-weight: 600; }
+    button:disabled { opacity: .5; cursor: default; }
+    pre   { background: #f5f5f5; padding: 12px; border-radius: 8px; overflow: auto; white-space: pre-wrap; font-size: 12px; }
+    .meta { color: #666; font-size: 12px; }
+    .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px;
+            font-weight: 600; margin-right: 6px; vertical-align: middle; }
+    .GET    { background: #e7f1ff; color: #0a58ca; }
+    .POST   { background: #e6f7ec; color: #0a7d27; }
+    .PUT    { background: #fff3cd; color: #806406; }
+    .PATCH  { background: #fde8d2; color: #8a3b00; }
+    .DELETE { background: #fde2e1; color: #b00020; }
+    .ok { color: #0a7d27; } .err { color: #b00020; }
+    .desc { font-size: 12px; color: #666; margin-top: 4px; }
+  </style>
+</head>
+<body>
+  <h1>Tekion APC — Data Entry</h1>
+  <div class="sub">Choose a module, pick an endpoint, fill the payload (or attach a file), and submit. Calls route through the APC client using your tokens.</div>
+
+  <div class="tabs" id="tabs"></div>
+
+  <label for="ep">Endpoint</label>
+  <select id="ep"></select>
+  <div class="meta" id="epmeta"></div>
+  <div class="desc"   id="epdesc"></div>
+
+  <div id="jsonPane">
+    <label for="body">Request body (JSON)</label>
+    <textarea id="body" spellcheck="false"></textarea>
+  </div>
+
+  <div id="filePane" style="display:none">
+    <label for="fileInput">File (invoice image / PDF)</label>
+    <input id="fileInput" type="file" />
+    <label for="fileField">Multipart field name</label>
+    <input id="fileField" type="text" value="file" />
+  </div>
+
+  <button id="go">Send to APC</button>
+
+  <h3>Result</h3>
+  <pre id="out">—</pre>
+
+<script>
+  let catalog = {};
+  let currentModule = null;
+
+  async function load() {
+    catalog = await fetch('/api/apc/endpoints').then(r => r.json());
+    const tabs = document.getElementById('tabs');
+    Object.keys(catalog).forEach((mod, i) => {
+      const t = document.createElement('div');
+      t.className = 'tab' + (i === 0 ? ' active' : '');
+      t.textContent = mod;
+      t.onclick = () => switchModule(mod, t);
+      tabs.appendChild(t);
+      if (i === 0) currentModule = mod;
+    });
+    populateEndpoints();
+  }
+
+  function switchModule(mod, el) {
+    currentModule = mod;
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    el.classList.add('active');
+    populateEndpoints();
+  }
+
+  function populateEndpoints() {
+    const sel = document.getElementById('ep');
+    const list = catalog[currentModule] || [];
+    sel.innerHTML = list.map((e, i) =>
+      `<option value="${i}">${e.method}  ${e.name}</option>`).join('');
+    sel.onchange = renderEndpoint;
+    renderEndpoint();
+  }
+
+  function renderEndpoint() {
+    const list = catalog[currentModule] || [];
+    const e = list[document.getElementById('ep').value];
+    if (!e) return;
+    document.getElementById('epmeta').innerHTML =
+      `<span class="pill ${e.method}">${e.method}</span><code>${e.path}</code>`;
+    document.getElementById('epdesc').textContent = e.description || '';
+    if (e.multipart) {
+      document.getElementById('jsonPane').style.display = 'none';
+      document.getElementById('filePane').style.display = '';
+      document.getElementById('fileField').value = e.multipart.fileField || 'file';
+    } else {
+      document.getElementById('jsonPane').style.display = '';
+      document.getElementById('filePane').style.display = 'none';
+      document.getElementById('body').value =
+        JSON.stringify(e.exampleBody ?? {}, null, 2);
+    }
+  }
+
+  document.getElementById('go').onclick = async () => {
+    const list = catalog[currentModule] || [];
+    const e = list[document.getElementById('ep').value];
+    const out = document.getElementById('out');
+    out.className = ''; out.textContent = 'Submitting…';
+
+    try {
+      let r;
+      if (e.multipart) {
+        const fi = document.getElementById('fileInput');
+        if (!fi.files.length) { out.className = 'err'; out.textContent = 'Choose a file first.'; return; }
+        const form = new FormData();
+        form.append('file', fi.files[0]);
+        form.append('path', e.path);
+        form.append('fileField', document.getElementById('fileField').value || 'file');
+        r = await fetch('/api/apc/upload', { method: 'POST', body: form }).then(r => r.json());
+      } else {
+        let body;
+        try { body = JSON.parse(document.getElementById('body').value || '{}'); }
+        catch (err) { out.className = 'err'; out.textContent = 'Invalid JSON: ' + err; return; }
+        r = await fetch('/api/apc/call', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ method: e.method, path: e.path, body }),
+        }).then(r => r.json());
+      }
+      out.className = r.ok ? 'ok' : 'err';
+      out.textContent = JSON.stringify(r, null, 2);
+    } catch (err) {
+      out.className = 'err';
+      out.textContent = String(err);
+    }
+  };
+
+  load();
+</script>
+</body>
+</html>
