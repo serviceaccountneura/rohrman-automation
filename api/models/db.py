@@ -363,6 +363,21 @@ class PasswordReset(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_utcnow)
 
 
+class AppSetting(SQLModel, table=True):
+    """Runtime feature flags (key → bool), editable from Settings without redeploy.
+
+    Env vars (TEKION_PO_WRITES, OEM_POST, …) seed a key the first time it is
+    read. After that the DB row wins until an admin toggles it.
+    """
+
+    __tablename__ = "app_settings"
+
+    key: str = Field(primary_key=True, max_length=64)
+    value: bool = Field(default=False)
+    updated_at: datetime = Field(default_factory=_utcnow)
+    updated_by: UUID | None = Field(default=None, foreign_key="users.id")
+
+
 class InviteCode(SQLModel, table=True):
     """Single-use invite codes for user registration.
 

@@ -16,11 +16,10 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 
-from api.config import settings
 from api.db import get_session
 from api.deps import CurrentUserDep
 from api.models.db import Document, VendorMapping
-from api.services import access, file_source
+from api.services import access, file_source, runtime_flags
 from api.models.schemas import (
     CreateMiscPoRequest,
     CreatePoRequest,
@@ -294,11 +293,11 @@ def _create_sublet_po(
 
         # Upload invoice document if provided.
         attachment_media_ids: list[str] = []
-        if req.invoice_file_path and settings.tekion_po_writes:  # TEKION_PO_WRITES
+        if req.invoice_file_path and runtime_flags.tekion_po_writes():  # TEKION_PO_WRITES
             media_id = client.upload_document(req.invoice_file_path)
             attachment_media_ids.append(media_id)
 
-        result = {"invoiceId": None} if not settings.tekion_po_writes else client.pre_invoice(  # TEKION_PO_WRITES
+        result = {"invoiceId": None} if not runtime_flags.tekion_po_writes() else client.pre_invoice(  # TEKION_PO_WRITES
             vendor_id=vendor["id"],
             vendor_site_id=vendor["siteId"],
             vendor_name=vendor["name"],
@@ -434,13 +433,13 @@ def _create_misc_po(
 
         # Upload invoice document if provided.
         attachment_media_ids: list[str] = []
-        if req.invoice_file_path and settings.tekion_po_writes:  # TEKION_PO_WRITES
+        if req.invoice_file_path and runtime_flags.tekion_po_writes():  # TEKION_PO_WRITES
             media_id = client.upload_document(req.invoice_file_path)
             attachment_media_ids.append(media_id)
 
         # Prefer what Tekion returns from preInvoicing/postings (same as Stock).
         use_postings = not req.gl_splits and not ocr_gl_items
-        result = {"invoiceId": None} if not settings.tekion_po_writes else client.pre_invoice(  # TEKION_PO_WRITES
+        result = {"invoiceId": None} if not runtime_flags.tekion_po_writes() else client.pre_invoice(  # TEKION_PO_WRITES
             vendor_id=vendor["id"],
             vendor_site_id=vendor["siteId"],
             vendor_name=vendor["name"],

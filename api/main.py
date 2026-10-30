@@ -31,6 +31,7 @@ from api.routes import (
     notifications,
     ocr,
     pipeline,
+    settings as settings_routes,
     tekion,
     users,
 )
@@ -71,6 +72,7 @@ app.include_router(tekion.router, dependencies=[Depends(get_current_user)])
 app.include_router(dashboard.router, dependencies=[Depends(get_current_user)])
 app.include_router(invoices.router, dependencies=[Depends(get_current_user)])
 app.include_router(users.router, dependencies=[Depends(get_current_user)])
+app.include_router(settings_routes.router, dependencies=[Depends(get_current_user)])
 app.include_router(notifications.router, dependencies=[Depends(get_current_user)])
 
 
