@@ -38,6 +38,21 @@ STATUS_DUPLICATE = "DUPLICATE"
 # The invoice names a purchase order that already exists in Tekion. Like
 # DUPLICATE this is a question, not a failure -- nothing was posted.
 STATUS_PO_DECISION = "PO_DECISION"
+
+# Upload folder PO_INVOICE is rewritten to SUBLET / MISCELLANEOUS / STOCK after
+# Tekion resolve. Duplicate / same-invoice lookups must treat that whole family
+# as one inbox, or a re-upload (still typed PO_INVOICE) never collides with the
+# PROCESSED row that now says MISCELLANEOUS.
+_PO_INVOICE_FAMILY = frozenset(
+    {"PO_INVOICE", "SUBLET", "MISCELLANEOUS", "STOCK"}
+)
+
+
+def _po_type_match(doc_po_type: str):
+    """SQLAlchemy clause: same folder family as `doc_po_type`."""
+    if doc_po_type in _PO_INVOICE_FAMILY:
+        return Document.po_type.in_(list(_PO_INVOICE_FAMILY))
+    return Document.po_type == doc_po_type
 # Read and decided, not yet posted. A person checks the fields and GL lines and
 # releases it. Nothing has been sent to Tekion.
 STATUS_AWAITING_REVIEW = "AWAITING_REVIEW"
@@ -506,7 +521,7 @@ def find_duplicate(session: Session, doc: Document) -> Document | None:
         select(Document).where(
             Document.invoice_number == doc.invoice_number,
             Document.dealership_name == doc.dealership_name,
-            Document.po_type == doc.po_type,
+            _po_type_match(doc.po_type),
             Document.deleted_at.is_(None),  # type: ignore[union-attr]
             Document.id != doc.id,
             Document.status == STATUS_PROCESSED,
@@ -524,7 +539,7 @@ def find_duplicate(session: Session, doc: Document) -> Document | None:
     candidates = session.exec(
         select(Document).where(
             Document.dealership_name == doc.dealership_name,
-            Document.po_type == doc.po_type,
+            _po_type_match(doc.po_type),
             Document.deleted_at.is_(None),  # type: ignore[union-attr]
             Document.id != doc.id,
             Document.status == STATUS_PROCESSED,
@@ -649,7 +664,7 @@ def find_failed_same_invoice(session: Session, doc: Document) -> Document | None
         .where(
             Document.invoice_number == doc.invoice_number,
             Document.dealership_name == doc.dealership_name,
-            Document.po_type == doc.po_type,
+            _po_type_match(doc.po_type),
             Document.status == STATUS_EXCEPTION,
             Document.deleted_at.is_(None),  # type: ignore[union-attr]
             Document.id != doc.id,

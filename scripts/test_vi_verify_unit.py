@@ -67,8 +67,15 @@ def _client(
         if "poInvoice/search" in path:
             search = str((body or {}).get("searchText") or "")
             primary = [hit] if hit else []
-            if search.isdigit() and extra_hits:
-                hits = primary + list(extra_hits)
+            extras = list(extra_hits or [])
+            # Mirror live Tekion quirks used by near-dup scan:
+            # - digit core without a leading zero (e.g. "123") finds variants
+            # - short zero-padded cores ("001") often return nothing
+            # - empty searchText = recent Pre Invoice list (includes extras)
+            if extras and search == "":
+                hits = primary + extras
+            elif extras and search.isdigit() and not search.startswith("0"):
+                hits = primary + extras
             else:
                 hits = primary
             return {"data": {"hits": hits, "count": len(hits)}}
@@ -392,6 +399,47 @@ def test_tekion_near_duplicate_flags() -> None:
     assert not r.ok and r.code == CODE_DUPLICATE
 
 
+def test_tekion_near_duplicate_short_zero_padded_core() -> None:
+    """Digit core '001' often misses in Tekion search; recent-list scan must still catch BLK001."""
+    hit = _hit(
+        invoiceNumber="TEST-MUQSIT-001",
+        payeeName="ADVANCE AUTO PARTS",
+        invoiceAmount={"amount": 1001},
+        poDetails=[{"poNum": "36515"}],
+    )
+    extra = {
+        "id": "inv-blk",
+        "invoiceNumber": "BLK001",
+        "invoiceAmount": {"amount": 1001},  # same $10.01 confirms
+        "payeeName": "ADVANCE AUTO PARTS",
+        "poDetails": [{"poNum": "36532"}],
+    }
+    po = _po(
+        order_number="36515",
+        total=10.01,
+        invoice_numbers=[
+            {"invoiceId": "inv-1", "invoiceNumber": "TEST-MUQSIT-001"}
+        ],
+    )
+    po["vendorDetails"] = {"vendorName": "ADVANCE AUTO PARTS", "vendorId": "1"}
+    r = verify_vendor_invoice(
+        client=_client(
+            po,
+            hit=hit,
+            extra_hits=[extra],
+            postings=_vendor_postings("ADVANCE AUTO PARTS"),
+        ),
+        expected=_input(
+            invoice_number="TEST-MUQSIT-001",
+            invoice_amount=10.01,
+            vendor_name="ADVANCE AUTO PARTS",
+            po_number="36515",
+        ),
+        dry_run=True,
+    )
+    assert not r.ok and r.code == CODE_DUPLICATE, r.message
+
+
 def test_tekion_near_duplicate_requires_po_or_amount() -> None:
     """Same digit pattern but different PO and amount is not a duplicate."""
     hit = _hit(invoiceNumber="BLK123", payeeName="AUTO GLASS")
@@ -609,6 +657,7 @@ def main() -> None:
         test_je_control_7xxx_needs_description,
         test_sublet_2460_control_is_ro,
         test_tekion_near_duplicate_flags,
+        test_tekion_near_duplicate_short_zero_padded_core,
         test_tekion_near_duplicate_requires_po_or_amount,
         test_tekion_near_duplicate_skipped_when_ignored,
         test_happy_path_dry_run,
