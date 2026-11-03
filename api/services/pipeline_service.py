@@ -996,6 +996,16 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
             f"splits {[(sp['gl_account'], sp['amount']) for sp in gl_splits]}"
         )
 
+    # OCR sometimes copies the claim total into invoice_number when no Invoice #
+    # is on the page ("75.00"). Treat money-only values as missing so we fail
+    # cleanly instead of posting a JE keyed on the amount.
+    if invoice_number and ocr_helpers.looks_like_money_amount(invoice_number):
+        print(
+            f"[PIPE] {doc.id} OEM invoice_number {invoice_number!r} looks like "
+            f"an amount — clearing (missing invoice #)"
+        )
+        invoice_number = doc.invoice_number = ""
+
     # The SOP needs exactly these three off the ticket.
     missing = [
         name
@@ -1342,9 +1352,11 @@ def _run_vi_verify(
     from api.routes.tekion import get_client, reset_client
     from api.services.vi_verify import ViVerifyInput, verify_vendor_invoice
 
-    # PO # is optional here — verify finds the VI by invoice number first.
-    # doc.po_number is usually filled by _resolve_existing_po via that VI.
-    po_number = doc.po_number or ocr_helpers.get_po_number(ocr) or ""
+    # Page PO for three-way match. Optional: blank OCR PO skips the PO-on-
+    # document leg. Do NOT prefer doc.po_number here — _resolve_existing_po
+    # already filled that from the Tekion VI, and using it as the "invoice"
+    # PO hid real OCR mismatches (e.g. PDF 99999 vs Tekion 36517).
+    ocr_po_number = ocr_helpers.get_po_number(ocr) or ""
     invoice_number = doc.invoice_number or ocr_helpers.get_invoice_number(ocr)
     total = ocr_helpers.get_total_amount(ocr)
 
@@ -1357,14 +1369,12 @@ def _run_vi_verify(
         )
         return
 
-    if po_number:
-        doc.po_number = po_number
     doc.invoice_number = invoice_number
     session.add(doc)
     session.commit()
 
     expected = ViVerifyInput(
-        po_number=po_number,
+        po_number=ocr_po_number,
         invoice_number=invoice_number,
         invoice_amount=float(total),
         dealership_name=doc.dealership_name,
@@ -1398,7 +1408,7 @@ def _run_vi_verify(
             doc,
             session,
             lines=result.gl_lines_for_doc or [],
-            reference=result.po_number or po_number,
+            reference=result.po_number or doc.po_number or ocr_po_number,
             vi_match=result.match or None,
             invoice_amount=float(total),
             tekion_amount=result.tekion_amount,
@@ -1424,7 +1434,8 @@ def _run_vi_verify(
         _fail(session, doc, code, error=result.message or "; ".join(result.notes))
         return
 
-    doc.po_number = result.po_number or po_number
+    # Prefer Tekion's linked PO for the dashboard; keep prior resolve if needed.
+    doc.po_number = result.po_number or doc.po_number or ocr_po_number
     doc.vendor_name = result.vendor_name or doc.vendor_name
 
     job_queue.complete(session, doc)

@@ -843,6 +843,37 @@ def verify_vendor_invoice(
     return result
 
 
+def _pre_invoice_hits_for_near_dup_scan(
+    svc: ApApprovalService, invoice_number: str
+) -> list[dict[str, Any]]:
+    """Candidate Pre Invoices for near-duplicate comparison.
+
+    Tekion's search box often returns nothing for a short digit core like
+    ``001`` even when ``BLK001`` / ``TEST-MUQSIT-001`` exist. Search the core,
+    a leading-zero-stripped core, and an unfiltered recent Pre Invoice page,
+    then dedupe by id.
+    """
+    core = invoice_digits(invoice_number)
+    needles: list[str] = []
+    if core:
+        needles.append(core)
+        stripped = core.lstrip("0")
+        if stripped and stripped != core:
+            needles.append(stripped)
+    needles.append("")  # recent list — catches short cores Tekion search misses
+
+    by_id: dict[str, dict[str, Any]] = {}
+    for needle in needles:
+        for hit in svc.search_pre_invoiced(search_text=needle, rows=50):
+            hid = str(hit.get("id") or "") or normalize_invoice(
+                str(hit.get("invoiceNumber") or "")
+            )
+            if not hid:
+                continue
+            by_id[hid] = hit
+    return list(by_id.values())
+
+
 def _find_confirmed_tekion_near_duplicates(
     svc: ApApprovalService,
     invoice_number: str,
@@ -862,7 +893,7 @@ def _find_confirmed_tekion_near_duplicates(
     our_id = str(matched_invoice_id or "")
     found: list[str] = []
     seen: set[str] = set()
-    for hit in svc.search_pre_invoiced(search_text=core, rows=50):
+    for hit in _pre_invoice_hits_for_near_dup_scan(svc, invoice_number):
         other_id = str(hit.get("id") or "")
         other_num = str(hit.get("invoiceNumber") or "").strip()
         if not other_num:

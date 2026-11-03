@@ -125,6 +125,30 @@ _INVOICE_MAX_PARTS = 3
 _INVOICE_CODE_MAX = 3
 _INVOICE_PREFIX_MAX = 4
 
+# Dollar totals OCR sometimes stuffs into invoice_number when the page has no
+# Invoice # at all (e.g. "75.00", "$1,234.56", "53.82 CR"). Real invoice
+# numbers are not money-with-cents alone — reject those so MISSING_REQUIRED_FIELD
+# can fire instead of posting a JE keyed on the amount.
+_MONEY_ONLY_INVOICE = re.compile(
+    r"""
+    ^\$?\s*
+    -?
+    (?:
+        \d{1,3}(?:,\d{3})+\.\d{2}   # 1,234.56
+      | \d+\.\d{2}                  # 75.00 / 1234.56
+    )
+    \s*(?:CR|DR|CREDIT|DEBIT)?
+    $
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def looks_like_money_amount(raw: str) -> bool:
+    """True when `raw` is only a currency total, not an invoice id."""
+    trimmed = " ".join(str(raw or "").split())
+    return bool(trimmed) and bool(_MONEY_ONLY_INVOICE.fullmatch(trimmed))
+
 
 def _clean_invoice_number(raw: str) -> str:
     """The invoice number as printed, including any short code attached to it.
@@ -153,9 +177,15 @@ def _clean_invoice_number(raw: str) -> str:
     are taken, and at most three of them:
 
         "6101029 RI Customer Copy" -> "6101029 RI"
+
+    A value that is only a money amount ("75.00") is cleared — Gemini sometimes
+    copies the claim total into invoice_number when no number is printed.
     """
     trimmed = " ".join(str(raw or "").split())
     if not trimmed:
+        return ""
+
+    if looks_like_money_amount(trimmed):
         return ""
 
     parts = trimmed.split(" ")
@@ -186,7 +216,10 @@ def _clean_invoice_number(raw: str) -> str:
         kept.append(parts[index])
         index += 1
 
-    return " ".join(kept)
+    cleaned = " ".join(kept)
+    if looks_like_money_amount(cleaned):
+        return ""
+    return cleaned
 
 
 def get_invoice_number(ocr: dict[str, Any]) -> str:
@@ -901,9 +934,12 @@ def get_posting_lines(ocr: dict[str, Any]) -> list[dict[str, Any]]:
         match = _POSTING_ACCOUNT.search(str(line.get("account") or ""))
         account = match.group(1).upper() if match else ""
         raw = str(line.get("amount") or "").replace("$", "").replace(",", "").strip()
-        amount = _parse_amount(raw)
-        if not account or not amount:
+        # Skip only when account or amount text is missing. A real "$0.00" must
+        # stay: `not amount` used to drop zeros, empty the split list, and the
+        # OEM path then said NO_GL_ACCOUNT_WRITTEN instead of ZERO_TOTAL.
+        if not account or not raw:
             continue
+        amount = _parse_amount(raw)
         if _is_credit_value(raw):
             amount = -amount
         lines.append({
@@ -950,10 +986,12 @@ def get_gl_amount_splits(ocr: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         account = _first_gl(mapping.get("gl_account"))
         raw = mapping.get("amount")
+        raw_text = str(raw or "").replace("$", "").replace(",", "").strip()
         amount = _parse_amount(raw)
-        # An account with no amount is the older style and belongs to the
-        # per-line path; taking it here would post a zero split.
-        if not account or not amount:
+        # An account with no amount text is the older style and belongs to the
+        # per-line path. An explicit 0.00 is a real zero split (core credit) —
+        # keep it so ZERO_TOTAL can fire instead of pretending no GL was read.
+        if not account or not raw_text:
             continue
 
         # The sign as Gemini reported it. The prompt used to demand a positive
