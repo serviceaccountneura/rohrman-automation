@@ -879,13 +879,17 @@ def _record_postings(
     credit = round(sum(-l["amount"] for l in clean if l["amount"] < 0), 2)
     debit = round(sum(l["amount"] for l in clean if l["amount"] > 0), 2)
 
+    # No GL lines → omit 0/0/0 so the detail panel does not show fake $0.00.
     payload: dict[str, Any] = {
         "lines": clean,
-        "creditTotal": credit,
-        "debitTotal": debit,
-        "balance": round(debit - credit, 2) if balance is None else round(balance, 2),
         "reference": reference,
     }
+    if clean:
+        payload["creditTotal"] = credit
+        payload["debitTotal"] = debit
+        payload["balance"] = (
+            round(debit - credit, 2) if balance is None else round(balance, 2)
+        )
     if vi_match:
         payload["viMatch"] = vi_match
     if invoice_amount is not None:

@@ -249,6 +249,16 @@ def _money(value: Any) -> float | None:
         return None
 
 
+def _try_load_postings(result: "ViVerifyResult", svc: "ApApprovalService") -> None:
+    """Best-effort JE lines so amount/date fails still show GL on the detail panel."""
+    if result.postings or not result.invoice_id:
+        return
+    try:
+        result.postings = svc.get_invoice_postings(result.invoice_id)
+    except Exception as exc:  # noqa: BLE001
+        result.notes.append(f"Could not preload Tekion postings: {exc}")
+
+
 def _expense_postings(postings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for p in postings:
@@ -498,6 +508,8 @@ def verify_vendor_invoice(
 
     # Keep match snapshot as we go so failures still show the panel.
     result.match = _snap()
+    # Load JE lines early so AMOUNT_MISMATCH / date fails still stash GL for UI.
+    _try_load_postings(result, svc)
 
     ap_expected = ExpectedInvoice(
         invoice_number=invoice_number,
@@ -710,12 +722,14 @@ def verify_vendor_invoice(
         return result
 
     # ── Postings / GL ────────────────────────────────────────────────────────
-    try:
-        result.postings = svc.get_invoice_postings(result.invoice_id or "")
-    except Exception as exc:  # noqa: BLE001
-        result.code = CODE_TEKION
-        result.message = f"Could not load Tekion invoice postings: {exc}"
-        return result
+    # Prefer the early preload; retry once if that failed so GL checks still run.
+    if not result.postings:
+        try:
+            result.postings = svc.get_invoice_postings(result.invoice_id or "")
+        except Exception as exc:  # noqa: BLE001
+            result.code = CODE_TEKION
+            result.message = f"Could not load Tekion invoice postings: {exc}"
+            return result
 
     expense = _expense_postings(result.postings)
     if not expense:
