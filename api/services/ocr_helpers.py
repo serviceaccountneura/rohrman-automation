@@ -934,9 +934,12 @@ def get_posting_lines(ocr: dict[str, Any]) -> list[dict[str, Any]]:
         match = _POSTING_ACCOUNT.search(str(line.get("account") or ""))
         account = match.group(1).upper() if match else ""
         raw = str(line.get("amount") or "").replace("$", "").replace(",", "").strip()
-        amount = _parse_amount(raw)
-        if not account or not amount:
+        # Skip only when account or amount text is missing. A real "$0.00" must
+        # stay: `not amount` used to drop zeros, empty the split list, and the
+        # OEM path then said NO_GL_ACCOUNT_WRITTEN instead of ZERO_TOTAL.
+        if not account or not raw:
             continue
+        amount = _parse_amount(raw)
         if _is_credit_value(raw):
             amount = -amount
         lines.append({
@@ -983,10 +986,12 @@ def get_gl_amount_splits(ocr: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         account = _first_gl(mapping.get("gl_account"))
         raw = mapping.get("amount")
+        raw_text = str(raw or "").replace("$", "").replace(",", "").strip()
         amount = _parse_amount(raw)
-        # An account with no amount is the older style and belongs to the
-        # per-line path; taking it here would post a zero split.
-        if not account or not amount:
+        # An account with no amount text is the older style and belongs to the
+        # per-line path. An explicit 0.00 is a real zero split (core credit) —
+        # keep it so ZERO_TOTAL can fire instead of pretending no GL was read.
+        if not account or not raw_text:
             continue
 
         # The sign as Gemini reported it. The prompt used to demand a positive
