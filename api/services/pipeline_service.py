@@ -996,6 +996,16 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
             f"splits {[(sp['gl_account'], sp['amount']) for sp in gl_splits]}"
         )
 
+    # OCR sometimes copies the claim total into invoice_number when no Invoice #
+    # is on the page ("75.00"). Treat money-only values as missing so we fail
+    # cleanly instead of posting a JE keyed on the amount.
+    if invoice_number and ocr_helpers.looks_like_money_amount(invoice_number):
+        print(
+            f"[PIPE] {doc.id} OEM invoice_number {invoice_number!r} looks like "
+            f"an amount — clearing (missing invoice #)"
+        )
+        invoice_number = doc.invoice_number = ""
+
     # The SOP needs exactly these three off the ticket.
     missing = [
         name
