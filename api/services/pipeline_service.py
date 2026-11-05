@@ -640,10 +640,62 @@ def read_fields(doc: Document) -> dict[str, Any]:
     splits = ocr_helpers.get_gl_amount_splits(ocr) or [
         {"gl_account": n["account"], "amount": n["amount"]} for n in ocr_helpers.gl_notes(ocr)
     ]
+    total = ocr_helpers.get_total_amount(ocr)
     return {
         "invoiceDate": ocr_helpers.get_invoice_date(ocr) or "",
+        "invoiceAmount": total,
+        "poNumber": ocr_helpers.get_po_number(ocr) or "",
         "glAnnotations": {str(s["gl_account"]): round(float(s["amount"]), 2) for s in splits},
     }
+
+
+def _stash_ocr_legs_for_panel(
+    doc: Document,
+    session: Session,
+    ocr: dict[str, Any],
+    *,
+    po_number: str = "",
+    po_vendor: str = "",
+) -> None:
+    """Save OCR (+ optional found-PO) legs so three-way still shows PDF values.
+
+    Used when we stop before full VI verify (wrong PO type, closed PO, etc.)
+    so the panel is not blank for amount/date.
+    """
+    from api.services.vi_verify import _build_match_snapshot
+
+    inv = str(doc.invoice_number or ocr_helpers.get_invoice_number(ocr) or "").strip()
+    vendor = str(doc.vendor_name or ocr_helpers.get_vendor_name(ocr) or "").strip()
+    ocr_po = str(ocr_helpers.get_po_number(ocr) or "").strip()
+    amt = ocr_helpers.get_total_amount(ocr)
+    date_s = ocr_helpers.get_invoice_date(ocr) or ""
+    po_num = str(po_number or "").strip()
+    match = _build_match_snapshot(
+        invoice_po=ocr_po,
+        po_po=po_num,
+        vi_po="",
+        invoice_vendor=vendor,
+        po_vendor=str(po_vendor or "").strip(),
+        vi_vendor="",
+        invoice_number=inv,
+        po_invoice_number="",
+        vi_invoice_number="",
+        invoice_amount=float(amt) if amt is not None else None,
+        po_amount=None,
+        vi_amount=None,
+        invoice_date=date_s,
+        po_date="",
+        vi_date="",
+    )
+    _record_postings(
+        doc,
+        session,
+        lines=[],
+        reference=po_num or ocr_po,
+        vi_match=match,
+        invoice_amount=float(amt) if amt is not None else None,
+        invoice_date=date_s or None,
+    )
 
 
 def manual_overrides(doc: Document) -> dict[str, Any]:
@@ -793,6 +845,7 @@ def _run(doc: Document, session: Session) -> None:
     if doc.po_type in (FOLDER_PO_INVOICE, *_PO_INVOICE_TYPES):
         unresolved = [u for u in unresolved if not str(u).startswith("GL line ")]
     if cached is None and unresolved:
+        _stash_ocr_legs_for_panel(doc, session, ocr)
         _fail(
             session,
             doc,
@@ -960,6 +1013,14 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
     # either way a person says where it goes. Reads from before posting_lines
     # keep the old path.
     if not gl_splits and ocr_helpers.has_posting_lines(ocr):
+        _record_postings(
+            doc,
+            session,
+            lines=[],
+            reference=invoice_number or "",
+            invoice_amount=invoice_amount if invoice_amount else None,
+            invoice_date=invoice_date or None,
+        )
         _fail(
             session,
             doc,
@@ -1023,6 +1084,14 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
     # A total that was READ as zero is not a missing total: a core credit memo
     # can genuinely be .00CR. Say so, instead of "missing: invoice_amount".
     if missing == ["invoice_amount"] and ocr_helpers.has_printed_zero_total(ocr):
+        _record_postings(
+            doc,
+            session,
+            lines=[],
+            reference=invoice_number or "",
+            invoice_amount=0.0,
+            invoice_date=invoice_date or None,
+        )
         _fail(
             session,
             doc,
@@ -1031,6 +1100,14 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         )
         return
     if missing:
+        _record_postings(
+            doc,
+            session,
+            lines=[],
+            reference=invoice_number or "",
+            invoice_amount=invoice_amount if invoice_amount else None,
+            invoice_date=invoice_date or None,
+        )
         _fail(session, doc, EX_MISSING_FIELD, error=f"missing: {', '.join(missing)}")
         return
 
@@ -1066,6 +1143,14 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
     except Exception as e:  # noqa: BLE001
         print(f"[PIPE] {doc.id} journal entry failed: {e}")
         reset_client()
+        _record_postings(
+            doc,
+            session,
+            lines=[],
+            reference=invoice_number or "",
+            invoice_amount=invoice_amount if invoice_amount else None,
+            invoice_date=invoice_date or None,
+        )
         _fail(session, doc, EX_TEKION_ERROR, error=str(e))
         return
 
@@ -1087,6 +1172,7 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         # Persist the ticket date so the detail page can show Invoice Date
         # (same value posted as Tekion scheduledTime / Accounting Date).
         invoice_date=invoice_date,
+        invoice_amount=invoice_amount if invoice_amount else None,
     )
 
     # Checked before `balanced`: a refused entry never got as far as balancing,
@@ -1193,6 +1279,30 @@ def _run_vehicle_journal_entry(
     except Exception as e:  # noqa: BLE001
         print(f"[PIPE] {doc.id} vehicle journal entry failed: {e}")
         reset_client()
+        doc.vehicle_details = json.dumps(
+            {
+                "manufacturer": facts.manufacturer,
+                "stockNumber": facts.stock_number,
+                "vin": facts.vin,
+                "invoiceDate": facts.invoice_date,
+                "dealerCostTotal": facts.dealer_cost_total,
+                "msrpTotal": facts.msrp_total,
+                "glAnnotations": facts.gl_annotations,
+                "needs": ["tekion"],
+                "refusal": str(e),
+            },
+            default=str,
+        )[:8000]
+        session.add(doc)
+        session.commit()
+        _record_postings(
+            doc,
+            session,
+            lines=[],
+            reference=facts.stock_number or "",
+            invoice_amount=facts.dealer_cost_total or None,
+            invoice_date=facts.invoice_date or None,
+        )
         _fail(session, doc, EX_TEKION_ERROR, error=str(e))
         return
 
@@ -1319,22 +1429,12 @@ def _run_po_invoice(
     set the concrete type after PO lookup. This path never creates a PO and
     never calls pre-invoice — Parts do that in Tekion first.
     """
-    existing_po, stop = _resolve_existing_po(doc, ocr, session)
+    _existing_po, stop = _resolve_existing_po(doc, ocr, session)
     if stop:
         return
-    if not existing_po:
-        _fail(
-            session,
-            doc,
-            EX_PO_NOT_FOUND,
-            error=(
-                "No existing Tekion purchase order to verify against. "
-                "Create and pre-invoice the PO in Tekion first, then upload "
-                "this invoice."
-            ),
-        )
-        return
-
+    # PO may be unresolved when Tekion has no VI yet. Still run verify so
+    # PRE_INVOICE_MISSING gets an OCR three-way snapshot (amount/date/vendor).
+    # Failing in resolve alone left posting_details empty and the panel blank.
     _run_vi_verify(
         doc,
         ocr,
@@ -1363,8 +1463,18 @@ def _run_vi_verify(
     ocr_po_number = ocr_helpers.get_po_number(ocr) or ""
     invoice_number = doc.invoice_number or ocr_helpers.get_invoice_number(ocr)
     total = ocr_helpers.get_total_amount(ocr)
+    invoice_date = ocr_helpers.get_invoice_date(ocr) or None
+
+    # "Correct and run again" overlays — VI verify used to ignore these, so a
+    # typed invoice date never fixed INVOICE_DATE_MISMATCH.
+    corrected = manual_overrides(doc)
+    if str(corrected.get("invoice_number") or "").strip():
+        invoice_number = doc.invoice_number = str(corrected["invoice_number"]).strip()
+    if str(corrected.get("invoice_date") or "").strip():
+        invoice_date = str(corrected["invoice_date"]).strip()
 
     if not invoice_number or total is None:
+        _stash_ocr_legs_for_panel(doc, session, ocr)
         _fail(
             session,
             doc,
@@ -1385,7 +1495,7 @@ def _run_vi_verify(
         po_type=doc.po_type or FOLDER_MISC,
         ro_number=doc.ro_number or ocr_helpers.get_control_number(ocr) or None,
         vendor_name=doc.vendor_name or ocr_helpers.get_vendor_name(ocr) or None,
-        invoice_date=ocr_helpers.get_invoice_date(ocr) or None,
+        invoice_date=invoice_date,
         reference_number=invoice_number,
         invoice_file_path=source_path,
         invoice_file_name=doc.file_name or None,
@@ -1403,6 +1513,7 @@ def _run_vi_verify(
     except Exception as e:  # noqa: BLE001
         print(f"[PIPE] {doc.id} VI verify failed: {e}")
         reset_client()
+        _stash_ocr_legs_for_panel(doc, session, ocr)
         _fail(session, doc, EX_TEKION_ERROR, error=str(e))
         return
 
@@ -1493,6 +1604,7 @@ def _resolve_existing_po(
         session.add(doc)
         session.commit()
     if choice == po_reuse.CHOICE_NEW:
+        _stash_ocr_legs_for_panel(doc, session, ocr)
         _fail(
             session,
             doc,
@@ -1508,6 +1620,7 @@ def _resolve_existing_po(
     ocr_po_number = ocr_helpers.get_po_number(ocr)
     invoice_number = ocr_helpers.get_invoice_number(ocr)
     if not invoice_number and not ocr_po_number:
+        _stash_ocr_legs_for_panel(doc, session, ocr)
         _fail(
             session,
             doc,
@@ -1547,35 +1660,38 @@ def _resolve_existing_po(
 
     if found is None:
         if invoice_number:
-            _fail(
-                session,
-                doc,
-                EX_PRE_INVOICE_MISSING,
-                error=(
-                    f"No pre-invoiced Vendor Invoice found in Tekion for "
-                    f"{invoice_number!r}"
-                    + (
-                        f" (OCR also had PO {ocr_po_number!r}, not found)."
-                        if ocr_po_number
-                        else ". Create and pre-invoice the PO in Tekion first."
-                    )
-                ),
+            # Defer to _run_vi_verify → PRE_INVOICE_MISSING + OCR match stash.
+            # Early _fail here wiped the three-way panel (no posting_details).
+            print(
+                f"[PIPE] {doc.id} no Tekion VI/PO for invoice "
+                f"{invoice_number!r} (OCR PO {(ocr_po_number or '—')!r}); "
+                "continuing to VI verify"
             )
-        else:
-            _fail(
-                session,
-                doc,
-                EX_PO_NOT_FOUND,
-                error=(
-                    f"PO {ocr_po_number} was not found in Tekion at this dealership. "
-                    "Nothing was posted. Create or fix the purchase order in Tekion, "
-                    "then run this invoice again."
-                ),
-            )
+            return None, False
+        _stash_ocr_legs_for_panel(
+            doc, session, ocr, po_number=str(ocr_po_number or "")
+        )
+        _fail(
+            session,
+            doc,
+            EX_PO_NOT_FOUND,
+            error=(
+                f"PO {ocr_po_number} was not found in Tekion at this dealership. "
+                "Nothing was posted. Create or fix the purchase order in Tekion, "
+                "then run this invoice again."
+            ),
+        )
         return None, True
 
     routed = po_reuse.pipeline_folder_for(found)
     if not routed:
+        _stash_ocr_legs_for_panel(
+            doc,
+            session,
+            ocr,
+            po_number=found.po_number or "",
+            po_vendor=found.vendor_name or "",
+        )
         _fail(
             session,
             doc,
@@ -1599,6 +1715,13 @@ def _resolve_existing_po(
     # Closed/cancelled POs cannot be verified. Same invoice already on the PO
     # is fine — that is the VI we are about to check.
     if found.is_dead:
+        _stash_ocr_legs_for_panel(
+            doc,
+            session,
+            ocr,
+            po_number=found.po_number or "",
+            po_vendor=found.vendor_name or "",
+        )
         _fail(
             session,
             doc,

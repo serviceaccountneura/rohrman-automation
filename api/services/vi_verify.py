@@ -180,8 +180,19 @@ def find_pre_invoice_by_invoice_number(
 
 
 def _norm_name(value: str | None) -> str:
-    """Compare vendor / control names case-insensitively, collapse spaces."""
-    return re.sub(r"\s+", " ", str(value or "").strip()).upper()
+    """Vendor/control compare: upper, drop punctuation, collapse spaces.
+
+    OCR often prints ``U.S. AutoForce`` while Tekion stores ``USAUTOFORCE``.
+    Dots/hyphens/commas/etc. become spaces (then collapsed); ``&`` → ``AND``.
+    """
+    text = str(value or "").strip().upper().replace("&", " AND ")
+    text = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _compact_name(value: str) -> str:
+    """Alphanumeric-only key so spaced vs compacted Tekion names can equal."""
+    return re.sub(r"[^A-Z0-9]", "", value)
 
 
 def _vendor_core(value: str | None) -> str:
@@ -196,7 +207,11 @@ def _names_match(a: str | None, b: str | None) -> bool:
     ca, cb = _vendor_core(a), _vendor_core(b)
     if not ca or not cb:
         return False
-    return ca == cb or ca in cb or cb in ca
+    if ca == cb or ca in cb or cb in ca:
+        return True
+    # Equality only on compacted form (no substring) — avoids US AUTO ⊂ USAUTOFORCE.
+    xa, xb = _compact_name(ca), _compact_name(cb)
+    return bool(xa and xb and xa == xb)
 
 
 def _parse_date(value: Any) -> date | None:
@@ -222,7 +237,17 @@ def _parse_date(value: Any) -> date | None:
     try:
         return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
     except ValueError:
-        return None
+        pass
+    # Same vendor formats as OCR ("04 NOV 26") via shared normalizer.
+    from api.services.ocr_helpers import _normalize_date
+
+    normalized = _normalize_date(text)
+    if normalized:
+        try:
+            return datetime.strptime(normalized, "%m/%d/%Y").date()
+        except ValueError:
+            return None
+    return None
 
 
 def _fmt_date(d: date | None) -> str:
@@ -391,18 +416,40 @@ def verify_vendor_invoice(
     result = ViVerifyResult()
     svc = ApApprovalService(client)
 
+    ocr_po_number = str(expected.po_number or "").strip()
+    invoice_number = _norm_invoice(expected.invoice_number)
+    ocr_date = _parse_date(expected.invoice_date)
+    result.invoice_date = _fmt_date(ocr_date) or str(expected.invoice_date or "").strip()
+
+    def _stash_ocr_only() -> None:
+        """Keep PDF legs on the panel even when we never reach a Tekion VI."""
+        amt = expected.invoice_amount
+        result.match = _build_match_snapshot(
+            invoice_po=ocr_po_number,
+            po_po="",
+            vi_po="",
+            invoice_vendor=str(expected.vendor_name or "").strip(),
+            po_vendor="",
+            vi_vendor="",
+            invoice_number=invoice_number,
+            po_invoice_number="",
+            vi_invoice_number="",
+            invoice_amount=float(amt) if amt is not None else None,
+            po_amount=None,
+            vi_amount=None,
+            invoice_date=result.invoice_date or "",
+            po_date="",
+            vi_date="",
+        )
+
     if expected.dealership_name:
         dealer_id = client.find_dealer_by_name(expected.dealership_name)
         if not dealer_id:
             result.code = CODE_TEKION
             result.message = f"Could not match dealership '{expected.dealership_name}'"
+            _stash_ocr_only()
             return result
         client.switch_dealer(dealer_id)
-
-    ocr_po_number = str(expected.po_number or "").strip()
-    invoice_number = _norm_invoice(expected.invoice_number)
-    ocr_date = _parse_date(expected.invoice_date)
-    result.invoice_date = _fmt_date(ocr_date) or str(expected.invoice_date or "").strip()
 
     if not invoice_number:
         result.code = CODE_INVOICE_NUMBER_MISMATCH
@@ -410,6 +457,7 @@ def verify_vendor_invoice(
             "Invoice number is missing on the document. It must match the Invoice "
             "Number on Tekion's Vendor Invoice screen exactly."
         )
+        _stash_ocr_only()
         return result
     if expected.invoice_amount is None:
         result.code = CODE_AMOUNT_MISMATCH
@@ -417,6 +465,7 @@ def verify_vendor_invoice(
             "Invoice amount is missing on the document. It must match Invoice "
             "Amount on Tekion's Vendor Invoice screen to the cent."
         )
+        _stash_ocr_only()
         return result
 
     # ── Primary: find Vendor Invoice by invoice number ───────────────────────
@@ -427,6 +476,27 @@ def verify_vendor_invoice(
             f"No Vendor Invoice (Pre Invoice) found in Tekion for invoice "
             f"{invoice_number!r}. Create the PO, pre-invoice it with this "
             "invoice number, then upload again."
+        )
+        # Still stash OCR legs so the three-way panel shows amount / date /
+        # vendor from the PDF. PO + VI columns stay empty (no Tekion hit).
+        invoice_amt = float(expected.invoice_amount)
+        invoice_date_s = result.invoice_date or _fmt_date(ocr_date) or ""
+        result.match = _build_match_snapshot(
+            invoice_po=ocr_po_number,
+            po_po="",
+            vi_po="",
+            invoice_vendor=str(expected.vendor_name or "").strip(),
+            po_vendor="",
+            vi_vendor="",
+            invoice_number=invoice_number,
+            po_invoice_number="",
+            vi_invoice_number="",
+            invoice_amount=invoice_amt,
+            po_amount=None,
+            vi_amount=None,
+            invoice_date=invoice_date_s,
+            po_date="",
+            vi_date="",
         )
         return result
 
@@ -452,6 +522,25 @@ def verify_vendor_invoice(
         result.message = (
             f"Tekion returned invoice {invoice_number!r} without an id — cannot "
             "load postings. Open the Vendor Invoice in Tekion and try again."
+        )
+        invoice_amt = float(expected.invoice_amount)
+        invoice_date_s = result.invoice_date or _fmt_date(ocr_date) or ""
+        result.match = _build_match_snapshot(
+            invoice_po=ocr_po_number,
+            po_po="",
+            vi_po="",
+            invoice_vendor=str(expected.vendor_name or "").strip(),
+            po_vendor="",
+            vi_vendor="",
+            invoice_number=invoice_number,
+            po_invoice_number="",
+            vi_invoice_number="",
+            invoice_amount=invoice_amt,
+            po_amount=None,
+            vi_amount=None,
+            invoice_date=invoice_date_s,
+            po_date="",
+            vi_date="",
         )
         return result
 
@@ -521,7 +610,9 @@ def verify_vendor_invoice(
         amount_tolerance=0.0,  # Loom: exact match, no tolerance
     )
 
-    # ── 1. PO Number (invoice ↔ PO ↔ Pre-invoice) ───────────────────────────
+    # ── 1. PO Number (Tekion PO ↔ Pre-invoice only; OCR PO is display) ───────
+    # Customer PDF often prints a vendor "order #" / shop label that is not the
+    # Tekion PO. Hard-fail only when Tekion's PO record and VI link disagree.
     if not vi_po:
         result.code = CODE_PO_NUMBER_MISMATCH
         result.message = (
@@ -547,14 +638,12 @@ def verify_vendor_invoice(
         result.match = _snap()
         return result
     if ocr_po_number and not _po_nums_equal(ocr_po_number, vi_po):
-        result.code = CODE_PO_NUMBER_MISMATCH
-        result.message = (
-            f"PO number on the document is {ocr_po_number!r}, but Tekion Pre Invoice "
-            f"/ PO has {vi_po!r}. All three must match. Correct the PO in Tekion or "
-            "re-upload a clearer scan, then re-run checks."
+        # Keep going — three-way UI still shows the OCR value for humans.
+        result.notes.append(
+            f"OCR PO {ocr_po_number!r} differs from Tekion PO/VI {vi_po!r}; "
+            "PO # check is Tekion PO ↔ Pre Invoice only."
         )
         result.match = _snap()
-        return result
 
     # ── 2. Vendor Number / Name (invoice ↔ PO ↔ Pre-invoice) ─────────────────
     if not vi_vendor:

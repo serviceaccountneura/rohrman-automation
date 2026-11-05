@@ -172,17 +172,18 @@ def test_pre_invoice_missing_no_vi() -> None:
     assert not r.ok and r.code == CODE_PRE_INVOICE_MISSING
 
 
-def test_ocr_po_mismatch_is_hard_fail() -> None:
-    """3-way PO #: OCR must match Tekion PO / Pre Invoice when OCR has a PO #."""
+def test_ocr_po_mismatch_is_not_hard_fail() -> None:
+    """PO # hard-check is Tekion PO ↔ VI only; OCR noise stays in the snapshot."""
     client = _client(_po(), hit=_hit(), postings=_vendor_postings())
     r = verify_vendor_invoice(
         client=client,
         expected=_input(po_number="071526"),  # OCR garbage (looks like a date)
         dry_run=True,
     )
-    assert not r.ok and r.code == CODE_PO_NUMBER_MISMATCH
+    assert r.ok, r.message
     assert r.match.get("poNumber", {}).get("invoice") == "071526"
     assert r.match.get("poNumber", {}).get("preInvoice") == "36137"
+    assert any("OCR PO" in n for n in r.notes)
 
 
 def test_finds_vi_when_ocr_po_blank() -> None:
@@ -255,6 +256,25 @@ def test_vendor_mismatch() -> None:
     )
     assert not r.ok and r.code == CODE_VENDOR_MISMATCH
     assert "Vendor" in r.message
+
+
+def test_vendor_punct_space_normalize_matches() -> None:
+    """OCR 'U.S. AutoForce' must match Tekion compacted 'USAUTOFORCE'."""
+    assert vi_verify._names_match("U.S. AutoForce", "USAUTOFORCE")
+    assert vi_verify._names_match("Smith & Sons", "SMITH AND SONS")
+    assert not vi_verify._names_match("US AUTO", "USAUTOFORCE")
+    po = _po()
+    po["vendorDetails"] = {"vendorName": "USAUTOFORCE", "vendorId": "1"}
+    r = verify_vendor_invoice(
+        client=_client(
+            po,
+            hit=_hit(payeeName="USAUTOFORCE"),
+            postings=_vendor_postings("USAUTOFORCE"),
+        ),
+        expected=_input(vendor_name="U.S. AutoForce"),
+        dry_run=True,
+    )
+    assert r.ok, r.message
 
 
 def test_invoice_date_mismatch() -> None:
@@ -643,13 +663,14 @@ def main() -> None:
     tests = [
         test_norm_keeps_prefix,
         test_pre_invoice_missing_no_vi,
-        test_ocr_po_mismatch_is_hard_fail,
+        test_ocr_po_mismatch_is_not_hard_fail,
         test_finds_vi_when_ocr_po_blank,
         test_po_total_mismatch,
         test_po_vendor_vs_vi_mismatch,
         test_amount_mismatch,
         test_invoice_number_not_on_pre_invoice_list,
         test_vendor_mismatch,
+        test_vendor_punct_space_normalize_matches,
         test_invoice_date_mismatch,
         test_missing_gl,
         test_je_unbalanced_fails,

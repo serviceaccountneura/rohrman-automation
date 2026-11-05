@@ -22,11 +22,11 @@ CATEGORY_LABELS = {
     CATEGORY_PO: "PO / Invoice",
     CATEGORY_JE: "Journal entry",
     CATEGORY_DUPLICATE: "Duplicates",
-    CATEGORY_WAITING: "Waiting on Tekion",
+    CATEGORY_WAITING: "Document missing on Tekion",
     CATEGORY_OTHER: "Other",
 }
 
-# Waiting on Tekion: PO / pre-invoice not there yet — auto-retry in the UI.
+# Document missing on Tekion: PO / pre-invoice not there yet — auto-retry in the UI.
 _WAITING_CODES = frozenset(
     {
         "PRE_INVOICE_MISSING",

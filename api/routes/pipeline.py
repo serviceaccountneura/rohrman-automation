@@ -478,11 +478,22 @@ def rerun_document(
             fields[key] = value
 
     if not supplied:
-        # Running again unchanged is only safe if nothing reached Tekion. A
-        # failure after a PO or journal entry was created would create it a
-        # second time; that needs a person to look, not a button.
-        already = doc.po_number or doc.transaction_number
-        if already:
+        # Block only when THIS app actually wrote to Tekion. A looked-up PO #
+        # on the VI-verify path is not a create — blocking re-run there made
+        # "Run again" fail with 409 after every verify exception.
+        import json as _json
+
+        wrote = False
+        if doc.transaction_number or doc.journal_id:
+            wrote = True
+        else:
+            try:
+                vip = (_json.loads(doc.posting_details or "{}") or {}).get("viPost") or {}
+                wrote = bool(vip.get("posted") or vip.get("attached"))
+            except ValueError:
+                wrote = False
+        if wrote:
+            already = doc.transaction_number or doc.po_number or "Tekion"
             raise HTTPException(
                 status_code=409,
                 detail=(
