@@ -640,10 +640,62 @@ def read_fields(doc: Document) -> dict[str, Any]:
     splits = ocr_helpers.get_gl_amount_splits(ocr) or [
         {"gl_account": n["account"], "amount": n["amount"]} for n in ocr_helpers.gl_notes(ocr)
     ]
+    total = ocr_helpers.get_total_amount(ocr)
     return {
         "invoiceDate": ocr_helpers.get_invoice_date(ocr) or "",
+        "invoiceAmount": total,
+        "poNumber": ocr_helpers.get_po_number(ocr) or "",
         "glAnnotations": {str(s["gl_account"]): round(float(s["amount"]), 2) for s in splits},
     }
+
+
+def _stash_ocr_legs_for_panel(
+    doc: Document,
+    session: Session,
+    ocr: dict[str, Any],
+    *,
+    po_number: str = "",
+    po_vendor: str = "",
+) -> None:
+    """Save OCR (+ optional found-PO) legs so three-way still shows PDF values.
+
+    Used when we stop before full VI verify (wrong PO type, closed PO, etc.)
+    so the panel is not blank for amount/date.
+    """
+    from api.services.vi_verify import _build_match_snapshot
+
+    inv = str(doc.invoice_number or ocr_helpers.get_invoice_number(ocr) or "").strip()
+    vendor = str(doc.vendor_name or ocr_helpers.get_vendor_name(ocr) or "").strip()
+    ocr_po = str(ocr_helpers.get_po_number(ocr) or "").strip()
+    amt = ocr_helpers.get_total_amount(ocr)
+    date_s = ocr_helpers.get_invoice_date(ocr) or ""
+    po_num = str(po_number or "").strip()
+    match = _build_match_snapshot(
+        invoice_po=ocr_po,
+        po_po=po_num,
+        vi_po="",
+        invoice_vendor=vendor,
+        po_vendor=str(po_vendor or "").strip(),
+        vi_vendor="",
+        invoice_number=inv,
+        po_invoice_number="",
+        vi_invoice_number="",
+        invoice_amount=float(amt) if amt is not None else None,
+        po_amount=None,
+        vi_amount=None,
+        invoice_date=date_s,
+        po_date="",
+        vi_date="",
+    )
+    _record_postings(
+        doc,
+        session,
+        lines=[],
+        reference=po_num or ocr_po,
+        vi_match=match,
+        invoice_amount=float(amt) if amt is not None else None,
+        invoice_date=date_s or None,
+    )
 
 
 def manual_overrides(doc: Document) -> dict[str, Any]:
@@ -1559,6 +1611,13 @@ def _resolve_existing_po(
 
     routed = po_reuse.pipeline_folder_for(found)
     if not routed:
+        _stash_ocr_legs_for_panel(
+            doc,
+            session,
+            ocr,
+            po_number=found.po_number or "",
+            po_vendor=found.vendor_name or "",
+        )
         _fail(
             session,
             doc,
@@ -1582,6 +1641,13 @@ def _resolve_existing_po(
     # Closed/cancelled POs cannot be verified. Same invoice already on the PO
     # is fine — that is the VI we are about to check.
     if found.is_dead:
+        _stash_ocr_legs_for_panel(
+            doc,
+            session,
+            ocr,
+            po_number=found.po_number or "",
+            po_vendor=found.vendor_name or "",
+        )
         _fail(
             session,
             doc,
