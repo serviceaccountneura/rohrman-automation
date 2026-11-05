@@ -171,13 +171,23 @@ class ApApprovalService:
         vendor_id: str | None = None,
         rows: int = 50,
     ) -> list[dict[str, Any]]:
-        """Invoice List filtered to Status = Pre Invoice.
+        """Invoice List for Vendor Invoice verify / complete.
 
-        `search_text` matches against invoiceNumber and poDetails.poNum, which is
-        how the UI's search box behaves.
+        Tekion's list uses Status = Pre Invoice (`PRE_INVOICED`) for newly
+        pre-invoiced rows. After Parts opens the VI it often sits as `OPEN`
+        (screenshot: Status Open, still on the preinvoice URL) — searching
+        only `PRE_INVOICED` missed real invoices like 4347630854328.
+
+        `search_text` matches against invoiceNumber and poDetails.poNum, which
+        is how the UI's search box behaves.
         """
         filters: list[dict[str, Any]] = [
-            {"field": "status", "operator": "IN", "values": ["PRE_INVOICED"], "key": "status"},
+            {
+                "field": "status",
+                "operator": "IN",
+                "values": ["PRE_INVOICED", "OPEN"],
+                "key": "status",
+            },
             {
                 "field": "otherPayableInvoice",
                 "operator": "IN",
