@@ -1319,22 +1319,12 @@ def _run_po_invoice(
     set the concrete type after PO lookup. This path never creates a PO and
     never calls pre-invoice — Parts do that in Tekion first.
     """
-    existing_po, stop = _resolve_existing_po(doc, ocr, session)
+    _existing_po, stop = _resolve_existing_po(doc, ocr, session)
     if stop:
         return
-    if not existing_po:
-        _fail(
-            session,
-            doc,
-            EX_PO_NOT_FOUND,
-            error=(
-                "No existing Tekion purchase order to verify against. "
-                "Create and pre-invoice the PO in Tekion first, then upload "
-                "this invoice."
-            ),
-        )
-        return
-
+    # PO may be unresolved when Tekion has no VI yet. Still run verify so
+    # PRE_INVOICE_MISSING gets an OCR three-way snapshot (amount/date/vendor).
+    # Failing in resolve alone left posting_details empty and the panel blank.
     _run_vi_verify(
         doc,
         ocr,
@@ -1547,31 +1537,24 @@ def _resolve_existing_po(
 
     if found is None:
         if invoice_number:
-            _fail(
-                session,
-                doc,
-                EX_PRE_INVOICE_MISSING,
-                error=(
-                    f"No pre-invoiced Vendor Invoice found in Tekion for "
-                    f"{invoice_number!r}"
-                    + (
-                        f" (OCR also had PO {ocr_po_number!r}, not found)."
-                        if ocr_po_number
-                        else ". Create and pre-invoice the PO in Tekion first."
-                    )
-                ),
+            # Defer to _run_vi_verify → PRE_INVOICE_MISSING + OCR match stash.
+            # Early _fail here wiped the three-way panel (no posting_details).
+            print(
+                f"[PIPE] {doc.id} no Tekion VI/PO for invoice "
+                f"{invoice_number!r} (OCR PO {ocr_po_number!r or '—'}); "
+                "continuing to VI verify"
             )
-        else:
-            _fail(
-                session,
-                doc,
-                EX_PO_NOT_FOUND,
-                error=(
-                    f"PO {ocr_po_number} was not found in Tekion at this dealership. "
-                    "Nothing was posted. Create or fix the purchase order in Tekion, "
-                    "then run this invoice again."
-                ),
-            )
+            return None, False
+        _fail(
+            session,
+            doc,
+            EX_PO_NOT_FOUND,
+            error=(
+                f"PO {ocr_po_number} was not found in Tekion at this dealership. "
+                "Nothing was posted. Create or fix the purchase order in Tekion, "
+                "then run this invoice again."
+            ),
+        )
         return None, True
 
     routed = po_reuse.pipeline_folder_for(found)

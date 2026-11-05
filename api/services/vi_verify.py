@@ -474,6 +474,25 @@ def verify_vendor_invoice(
             f"Tekion returned invoice {invoice_number!r} without an id — cannot "
             "load postings. Open the Vendor Invoice in Tekion and try again."
         )
+        invoice_amt = float(expected.invoice_amount)
+        invoice_date_s = result.invoice_date or _fmt_date(ocr_date) or ""
+        result.match = _build_match_snapshot(
+            invoice_po=ocr_po_number,
+            po_po="",
+            vi_po="",
+            invoice_vendor=str(expected.vendor_name or "").strip(),
+            po_vendor="",
+            vi_vendor="",
+            invoice_number=invoice_number,
+            po_invoice_number="",
+            vi_invoice_number="",
+            invoice_amount=invoice_amt,
+            po_amount=None,
+            vi_amount=None,
+            invoice_date=invoice_date_s,
+            po_date="",
+            vi_date="",
+        )
         return result
 
     # Load PO (dealership-scoped) for the three-way legs.
