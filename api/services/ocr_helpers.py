@@ -424,7 +424,19 @@ def get_document_type(ocr: dict[str, Any]) -> str:
 
 
 # Date formats seen on vendor invoices and parts tickets, in priority order.
-_DATE_FORMATS = ("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%m-%d-%Y", "%d-%b-%Y", "%b %d, %Y")
+_DATE_FORMATS = (
+    "%m/%d/%Y",
+    "%m/%d/%y",
+    "%Y-%m-%d",
+    "%m-%d-%Y",
+    "%d-%b-%Y",
+    "%d-%b-%y",
+    "%d %b %Y",
+    "%d %b %y",  # vendor tickets: "04 NOV 26"
+    "%b %d, %Y",
+    "%b %d %Y",
+    "%b %d, %y",
+)
 
 
 def _normalize_date(raw: Any) -> str:
@@ -432,11 +444,15 @@ def _normalize_date(raw: Any) -> str:
     text = str(raw or "").strip()
     if not text:
         return ""
-    for fmt in _DATE_FORMATS:
-        try:
-            return datetime.strptime(text, fmt).strftime("%m/%d/%Y")
-        except ValueError:
-            continue
+    # Collapse multi-spaces so "04  NOV  26" still matches.
+    text = re.sub(r"\s+", " ", text)
+    candidates = (text, text.upper())
+    for candidate in candidates:
+        for fmt in _DATE_FORMATS:
+            try:
+                return datetime.strptime(candidate, fmt).strftime("%m/%d/%Y")
+            except ValueError:
+                continue
     # Ford prints "Date Inv. Prepared" as three separate boxes, which OCR reads
     # back as "08 05 26". Matched as a WHOLE string rather than searched for, so
     # that three unrelated numbers sitting near each other in some other field

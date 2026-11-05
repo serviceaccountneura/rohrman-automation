@@ -222,7 +222,17 @@ def _parse_date(value: Any) -> date | None:
     try:
         return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
     except ValueError:
-        return None
+        pass
+    # Same vendor formats as OCR ("04 NOV 26") via shared normalizer.
+    from api.services.ocr_helpers import _normalize_date
+
+    normalized = _normalize_date(text)
+    if normalized:
+        try:
+            return datetime.strptime(normalized, "%m/%d/%Y").date()
+        except ValueError:
+            return None
+    return None
 
 
 def _fmt_date(d: date | None) -> str:
