@@ -521,7 +521,9 @@ def verify_vendor_invoice(
         amount_tolerance=0.0,  # Loom: exact match, no tolerance
     )
 
-    # ── 1. PO Number (invoice ↔ PO ↔ Pre-invoice) ───────────────────────────
+    # ── 1. PO Number (Tekion PO ↔ Pre-invoice only; OCR PO is display) ───────
+    # Customer PDF often prints a vendor "order #" / shop label that is not the
+    # Tekion PO. Hard-fail only when Tekion's PO record and VI link disagree.
     if not vi_po:
         result.code = CODE_PO_NUMBER_MISMATCH
         result.message = (
@@ -547,14 +549,12 @@ def verify_vendor_invoice(
         result.match = _snap()
         return result
     if ocr_po_number and not _po_nums_equal(ocr_po_number, vi_po):
-        result.code = CODE_PO_NUMBER_MISMATCH
-        result.message = (
-            f"PO number on the document is {ocr_po_number!r}, but Tekion Pre Invoice "
-            f"/ PO has {vi_po!r}. All three must match. Correct the PO in Tekion or "
-            "re-upload a clearer scan, then re-run checks."
+        # Keep going — three-way UI still shows the OCR value for humans.
+        result.notes.append(
+            f"OCR PO {ocr_po_number!r} differs from Tekion PO/VI {vi_po!r}; "
+            "PO # check is Tekion PO ↔ Pre Invoice only."
         )
         result.match = _snap()
-        return result
 
     # ── 2. Vendor Number / Name (invoice ↔ PO ↔ Pre-invoice) ─────────────────
     if not vi_vendor:
