@@ -855,11 +855,30 @@ def verify_vendor_invoice(
         )
         return result
 
+    # ── Sublet + GL 2460: RO is mandatory (always on — blocks attach/post) ───
+    # Misc Control / vendor-name checks stay behind ENFORCE_JE_CONTROL.
+    po_is_sublet = str(expected.po_type or "").strip().upper() == "SUBLET"
+    has_sublet_gl = any(_account_number(p) == SUBLET_GL for p in expense)
+    ro = str(expected.ro_number or "").strip()
+    tekion_2460_control = any(
+        _account_number(p) == SUBLET_GL and str(p.get("refText") or "").strip()
+        for p in expense
+    )
+    if po_is_sublet and has_sublet_gl and not ro and not tekion_2460_control:
+        result.code = CODE_JE_CONTROL
+        result.message = (
+            f"Sublet with GL {SUBLET_GL} requires a Repair Order number in Control, "
+            "but no RO # was found on the invoice or on Tekion's Journal Entry. "
+            "Enter the RO # (Correct & re-run or Tekion Control), then re-run. "
+            "Nothing was posted."
+        )
+        result.match = _snap()
+        return result
+
     # ── Control column (JE): vendor name, or RO for Sublet GL 2460 ───────────
     # Temporarily off (ENFORCE_JE_CONTROL=False). Flip the flag to re-enable.
     if ENFORCE_JE_CONTROL:
         po_vendor_for_control = result.vendor_name or expected.vendor_name or ""
-        ro = str(expected.ro_number or "").strip()
 
         for p in expense:
             acct = _account_number(p)
