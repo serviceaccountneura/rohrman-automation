@@ -436,6 +436,10 @@ _DATE_FORMATS = (
     "%b %d, %Y",
     "%b %d %Y",
     "%b %d, %y",
+    # Gemini sometimes returns JS-ish stamps: "Tue Nov 3 2026 7:22 AM"
+    "%a %b %d %Y %I:%M %p",
+    "%a %b %d %Y %H:%M",
+    "%a %b %d %Y",
 )
 
 

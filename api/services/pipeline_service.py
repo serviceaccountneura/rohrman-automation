@@ -1463,6 +1463,15 @@ def _run_vi_verify(
     ocr_po_number = ocr_helpers.get_po_number(ocr) or ""
     invoice_number = doc.invoice_number or ocr_helpers.get_invoice_number(ocr)
     total = ocr_helpers.get_total_amount(ocr)
+    invoice_date = ocr_helpers.get_invoice_date(ocr) or None
+
+    # "Correct and run again" overlays — VI verify used to ignore these, so a
+    # typed invoice date never fixed INVOICE_DATE_MISMATCH.
+    corrected = manual_overrides(doc)
+    if str(corrected.get("invoice_number") or "").strip():
+        invoice_number = doc.invoice_number = str(corrected["invoice_number"]).strip()
+    if str(corrected.get("invoice_date") or "").strip():
+        invoice_date = str(corrected["invoice_date"]).strip()
 
     if not invoice_number or total is None:
         _stash_ocr_legs_for_panel(doc, session, ocr)
@@ -1486,7 +1495,7 @@ def _run_vi_verify(
         po_type=doc.po_type or FOLDER_MISC,
         ro_number=doc.ro_number or ocr_helpers.get_control_number(ocr) or None,
         vendor_name=doc.vendor_name or ocr_helpers.get_vendor_name(ocr) or None,
-        invoice_date=ocr_helpers.get_invoice_date(ocr) or None,
+        invoice_date=invoice_date,
         reference_number=invoice_number,
         invoice_file_path=source_path,
         invoice_file_name=doc.file_name or None,
