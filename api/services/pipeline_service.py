@@ -1541,7 +1541,7 @@ def _resolve_existing_po(
             # Early _fail here wiped the three-way panel (no posting_details).
             print(
                 f"[PIPE] {doc.id} no Tekion VI/PO for invoice "
-                f"{invoice_number!r} (OCR PO {ocr_po_number!r or '—'}); "
+                f"{invoice_number!r} (OCR PO {(ocr_po_number or '—')!r}); "
                 "continuing to VI verify"
             )
             return None, False
