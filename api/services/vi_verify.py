@@ -391,18 +391,40 @@ def verify_vendor_invoice(
     result = ViVerifyResult()
     svc = ApApprovalService(client)
 
+    ocr_po_number = str(expected.po_number or "").strip()
+    invoice_number = _norm_invoice(expected.invoice_number)
+    ocr_date = _parse_date(expected.invoice_date)
+    result.invoice_date = _fmt_date(ocr_date) or str(expected.invoice_date or "").strip()
+
+    def _stash_ocr_only() -> None:
+        """Keep PDF legs on the panel even when we never reach a Tekion VI."""
+        amt = expected.invoice_amount
+        result.match = _build_match_snapshot(
+            invoice_po=ocr_po_number,
+            po_po="",
+            vi_po="",
+            invoice_vendor=str(expected.vendor_name or "").strip(),
+            po_vendor="",
+            vi_vendor="",
+            invoice_number=invoice_number,
+            po_invoice_number="",
+            vi_invoice_number="",
+            invoice_amount=float(amt) if amt is not None else None,
+            po_amount=None,
+            vi_amount=None,
+            invoice_date=result.invoice_date or "",
+            po_date="",
+            vi_date="",
+        )
+
     if expected.dealership_name:
         dealer_id = client.find_dealer_by_name(expected.dealership_name)
         if not dealer_id:
             result.code = CODE_TEKION
             result.message = f"Could not match dealership '{expected.dealership_name}'"
+            _stash_ocr_only()
             return result
         client.switch_dealer(dealer_id)
-
-    ocr_po_number = str(expected.po_number or "").strip()
-    invoice_number = _norm_invoice(expected.invoice_number)
-    ocr_date = _parse_date(expected.invoice_date)
-    result.invoice_date = _fmt_date(ocr_date) or str(expected.invoice_date or "").strip()
 
     if not invoice_number:
         result.code = CODE_INVOICE_NUMBER_MISMATCH
@@ -410,6 +432,7 @@ def verify_vendor_invoice(
             "Invoice number is missing on the document. It must match the Invoice "
             "Number on Tekion's Vendor Invoice screen exactly."
         )
+        _stash_ocr_only()
         return result
     if expected.invoice_amount is None:
         result.code = CODE_AMOUNT_MISMATCH
@@ -417,6 +440,7 @@ def verify_vendor_invoice(
             "Invoice amount is missing on the document. It must match Invoice "
             "Amount on Tekion's Vendor Invoice screen to the cent."
         )
+        _stash_ocr_only()
         return result
 
     # ── Primary: find Vendor Invoice by invoice number ───────────────────────

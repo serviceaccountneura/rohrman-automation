@@ -845,6 +845,7 @@ def _run(doc: Document, session: Session) -> None:
     if doc.po_type in (FOLDER_PO_INVOICE, *_PO_INVOICE_TYPES):
         unresolved = [u for u in unresolved if not str(u).startswith("GL line ")]
     if cached is None and unresolved:
+        _stash_ocr_legs_for_panel(doc, session, ocr)
         _fail(
             session,
             doc,
@@ -1012,6 +1013,14 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
     # either way a person says where it goes. Reads from before posting_lines
     # keep the old path.
     if not gl_splits and ocr_helpers.has_posting_lines(ocr):
+        _record_postings(
+            doc,
+            session,
+            lines=[],
+            reference=invoice_number or "",
+            invoice_amount=invoice_amount if invoice_amount else None,
+            invoice_date=invoice_date or None,
+        )
         _fail(
             session,
             doc,
@@ -1075,6 +1084,14 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
     # A total that was READ as zero is not a missing total: a core credit memo
     # can genuinely be .00CR. Say so, instead of "missing: invoice_amount".
     if missing == ["invoice_amount"] and ocr_helpers.has_printed_zero_total(ocr):
+        _record_postings(
+            doc,
+            session,
+            lines=[],
+            reference=invoice_number or "",
+            invoice_amount=0.0,
+            invoice_date=invoice_date or None,
+        )
         _fail(
             session,
             doc,
@@ -1083,6 +1100,14 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         )
         return
     if missing:
+        _record_postings(
+            doc,
+            session,
+            lines=[],
+            reference=invoice_number or "",
+            invoice_amount=invoice_amount if invoice_amount else None,
+            invoice_date=invoice_date or None,
+        )
         _fail(session, doc, EX_MISSING_FIELD, error=f"missing: {', '.join(missing)}")
         return
 
@@ -1118,6 +1143,14 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
     except Exception as e:  # noqa: BLE001
         print(f"[PIPE] {doc.id} journal entry failed: {e}")
         reset_client()
+        _record_postings(
+            doc,
+            session,
+            lines=[],
+            reference=invoice_number or "",
+            invoice_amount=invoice_amount if invoice_amount else None,
+            invoice_date=invoice_date or None,
+        )
         _fail(session, doc, EX_TEKION_ERROR, error=str(e))
         return
 
@@ -1139,6 +1172,7 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         # Persist the ticket date so the detail page can show Invoice Date
         # (same value posted as Tekion scheduledTime / Accounting Date).
         invoice_date=invoice_date,
+        invoice_amount=invoice_amount if invoice_amount else None,
     )
 
     # Checked before `balanced`: a refused entry never got as far as balancing,
@@ -1245,6 +1279,30 @@ def _run_vehicle_journal_entry(
     except Exception as e:  # noqa: BLE001
         print(f"[PIPE] {doc.id} vehicle journal entry failed: {e}")
         reset_client()
+        doc.vehicle_details = json.dumps(
+            {
+                "manufacturer": facts.manufacturer,
+                "stockNumber": facts.stock_number,
+                "vin": facts.vin,
+                "invoiceDate": facts.invoice_date,
+                "dealerCostTotal": facts.dealer_cost_total,
+                "msrpTotal": facts.msrp_total,
+                "glAnnotations": facts.gl_annotations,
+                "needs": ["tekion"],
+                "refusal": str(e),
+            },
+            default=str,
+        )[:8000]
+        session.add(doc)
+        session.commit()
+        _record_postings(
+            doc,
+            session,
+            lines=[],
+            reference=facts.stock_number or "",
+            invoice_amount=facts.dealer_cost_total or None,
+            invoice_date=facts.invoice_date or None,
+        )
         _fail(session, doc, EX_TEKION_ERROR, error=str(e))
         return
 
@@ -1407,6 +1465,7 @@ def _run_vi_verify(
     total = ocr_helpers.get_total_amount(ocr)
 
     if not invoice_number or total is None:
+        _stash_ocr_legs_for_panel(doc, session, ocr)
         _fail(
             session,
             doc,
@@ -1445,6 +1504,7 @@ def _run_vi_verify(
     except Exception as e:  # noqa: BLE001
         print(f"[PIPE] {doc.id} VI verify failed: {e}")
         reset_client()
+        _stash_ocr_legs_for_panel(doc, session, ocr)
         _fail(session, doc, EX_TEKION_ERROR, error=str(e))
         return
 
@@ -1535,6 +1595,7 @@ def _resolve_existing_po(
         session.add(doc)
         session.commit()
     if choice == po_reuse.CHOICE_NEW:
+        _stash_ocr_legs_for_panel(doc, session, ocr)
         _fail(
             session,
             doc,
@@ -1550,6 +1611,7 @@ def _resolve_existing_po(
     ocr_po_number = ocr_helpers.get_po_number(ocr)
     invoice_number = ocr_helpers.get_invoice_number(ocr)
     if not invoice_number and not ocr_po_number:
+        _stash_ocr_legs_for_panel(doc, session, ocr)
         _fail(
             session,
             doc,
@@ -1597,6 +1659,9 @@ def _resolve_existing_po(
                 "continuing to VI verify"
             )
             return None, False
+        _stash_ocr_legs_for_panel(
+            doc, session, ocr, po_number=str(ocr_po_number or "")
+        )
         _fail(
             session,
             doc,
