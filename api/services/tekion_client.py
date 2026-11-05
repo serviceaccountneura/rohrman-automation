@@ -1091,6 +1091,8 @@ class TekionApiClient:
         vendor_phone: str = "",
         vendor_email: str = "",
         sales_tax: float = 0.0,
+        comment: str = "",
+        invoice_number: str = "",
     ) -> dict[str, Any]:
         """Raise a miscellaneous purchase order.
 
@@ -1098,6 +1100,13 @@ class TekionApiClient:
         to total the goods alone, so its front page said 2,378.11 where the
         invoice attached to it said 2,580.23, and the two never reconciled on
         screen. A line makes the order worth what the invoice is worth.
+
+        `comment` is stored on the PO (and mirrored in additional) so test /
+        ops tags like TM2 stay visible in Tekion.
+
+        `invoice_number` fills the PO header Invoice # field
+        (`vendorDetails.invoiceNumber`). Pre-invoice still sets the VI number
+        separately; without this the Misc PO screen shows Invoice # blank.
         """
         items = _with_tax_line(items, sales_tax)
         formatted_items = []
@@ -1116,6 +1125,19 @@ class TekionApiClient:
                 }
             )
 
+        note = (comment or "").strip()
+        inv = (invoice_number or "").strip()
+        vendor_details = {
+            "vendorId": vendor_id,
+            "vendorName": vendor_name,
+            "vendorDisplayId": vendor_display_id,
+            "vendorSiteId": vendor_site_id,
+            "vendorPhone": vendor_phone,
+            "vendorEmail": vendor_email,
+            "invoiceNumber": inv or None,
+        }
+        # Create as DRAFT first so Invoice # (vendorDetails.invoiceNumber) sticks;
+        # READY_TO_SUBMIT in one shot drops that header field in Tekion.
         body = {
             "vendorSiteId": vendor_site_id,
             "vendorId": vendor_id,
@@ -1135,11 +1157,14 @@ class TekionApiClient:
             "poChargeToAdd": [],
             "poChargeToUpdate": [],
             "poChargeToDelete": [],
-            "status": "READY_TO_SUBMIT",
+            "status": "DRAFT",
             "controlNumber": None,
             "orderType": "MISC",
             "purchaseType": "REGULAR",
-            "additional": {},
+            "comment": note or None,
+            "additional": {"comment": note} if note else {},
+            "invoiceNumber": inv or None,
+            "vendorDetails": vendor_details,
             "newTaxCodeEnabled": False,
             "poTaxConfiguration": {"taxCodeGrid": [], "taxDetails": [], "flatTaxDetails": []},
             "printConfigDto": {
@@ -1149,7 +1174,7 @@ class TekionApiClient:
             },
         }
 
-        print("[API] Creating Misc PO...")
+        print("[API] Creating Misc PO (DRAFT)...")
         res = self._req_json("/api/partTrade/u/misc/order", method="POST", body=body)
 
         data = res.get("data")
@@ -1160,13 +1185,34 @@ class TekionApiClient:
         po_number = data["orderNumber"]
         universal_id = f"MISCELLANEOUS%{po_id}"
 
-        print(f"[API] Misc PO created: {po_number} (id={po_id}, status={data['status']})")
+        # Submit while keeping Invoice # / comment on the header.
+        detail = self._req_json(
+            f"/api/partTrade/u/misc/order/{po_id}", method="GET"
+        ).get("data") or data
+        submit_body = dict(detail)
+        submit_body["status"] = "READY_TO_SUBMIT"
+        submit_body["comment"] = note or submit_body.get("comment")
+        submit_body["invoiceNumber"] = inv or submit_body.get("invoiceNumber")
+        vd = dict(submit_body.get("vendorDetails") or vendor_details)
+        if inv:
+            vd["invoiceNumber"] = inv
+        submit_body["vendorDetails"] = vd
+        print(f"[API] Submitting Misc PO {po_number}...")
+        submit_res = self._req_json(
+            f"/api/partTrade/u/misc/order/{po_id}", method="PUT", body=submit_body
+        )
+        data = submit_res.get("data") or detail
+
+        print(
+            f"[API] Misc PO created: {po_number} (id={po_id}, "
+            f"status={data.get('status')}, invoice#={inv or '—'})"
+        )
 
         return {
             "poId": po_id,
             "poNumber": po_number,
             "universalId": universal_id,
-            "status": data["status"],
+            "status": data.get("status") or "SUBMITTED",
             "orderType": data.get("orderType", ""),
         }
 
@@ -1207,25 +1253,33 @@ class TekionApiClient:
         po_consumed_cents = amount_cents if po_covers_tax else amount_cents - tax_cents
         subtotal_cents = po_consumed_cents
 
-        # Step 1: Get invoice date
-        print("[API] Pre-invoice: getInvoiceDate...")
-        date_res = self._req_json(
-            "/api/accounting/u/poInvoice/getInvoiceDate",
-            method="POST",
-            body={"type": "INVOICE", "vendorId": vendor_id},
-        )
-        _data = date_res.get("data")
-        if isinstance(_data, dict):
-            invoice_date_ms = _data.get("invoiceDate")
-        elif isinstance(_data, (int, float)):
-            invoice_date_ms = _data
+        # Step 1: Invoice date — caller override wins (needed for deliberate
+        # DATE_MISMATCH test fixtures). Else ask Tekion, else today.
+        from api.services.je_creation import invoice_date_to_epoch_ms
+
+        invoice_date_ms: int | None = None
+        if invoice_date:
+            invoice_date_ms = invoice_date_to_epoch_ms(
+                invoice_date, tz_name=self.get_dealer_timezone()
+            )
+            print(f"[API] Pre-invoice: using caller invoice_date={invoice_date}")
         else:
-            invoice_date_ms = None
+            print("[API] Pre-invoice: getInvoiceDate...")
+            date_res = self._req_json(
+                "/api/accounting/u/poInvoice/getInvoiceDate",
+                method="POST",
+                body={"type": "INVOICE", "vendorId": vendor_id},
+            )
+            _data = date_res.get("data")
+            if isinstance(_data, dict):
+                invoice_date_ms = _data.get("invoiceDate")
+            elif isinstance(_data, (int, float)):
+                invoice_date_ms = _data
+            else:
+                invoice_date_ms = None
         if not invoice_date_ms:
             # Calendar day at dealer-TZ midnight — not UTC (avoids −1 day in Central).
-            from api.services.je_creation import invoice_date_to_epoch_ms
-
-            date_str = invoice_date or datetime.now(tz=timezone.utc).strftime("%m/%d/%Y")
+            date_str = datetime.now(tz=timezone.utc).strftime("%m/%d/%Y")
             invoice_date_ms = invoice_date_to_epoch_ms(
                 date_str, tz_name=self.get_dealer_timezone()
             )
