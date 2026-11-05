@@ -180,8 +180,19 @@ def find_pre_invoice_by_invoice_number(
 
 
 def _norm_name(value: str | None) -> str:
-    """Compare vendor / control names case-insensitively, collapse spaces."""
-    return re.sub(r"\s+", " ", str(value or "").strip()).upper()
+    """Vendor/control compare: upper, drop punctuation, collapse spaces.
+
+    OCR often prints ``U.S. AutoForce`` while Tekion stores ``USAUTOFORCE``.
+    Dots/hyphens/commas/etc. become spaces (then collapsed); ``&`` → ``AND``.
+    """
+    text = str(value or "").strip().upper().replace("&", " AND ")
+    text = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _compact_name(value: str) -> str:
+    """Alphanumeric-only key so spaced vs compacted Tekion names can equal."""
+    return re.sub(r"[^A-Z0-9]", "", value)
 
 
 def _vendor_core(value: str | None) -> str:
@@ -196,7 +207,11 @@ def _names_match(a: str | None, b: str | None) -> bool:
     ca, cb = _vendor_core(a), _vendor_core(b)
     if not ca or not cb:
         return False
-    return ca == cb or ca in cb or cb in ca
+    if ca == cb or ca in cb or cb in ca:
+        return True
+    # Equality only on compacted form (no substring) — avoids US AUTO ⊂ USAUTOFORCE.
+    xa, xb = _compact_name(ca), _compact_name(cb)
+    return bool(xa and xb and xa == xb)
 
 
 def _parse_date(value: Any) -> date | None:

@@ -258,6 +258,25 @@ def test_vendor_mismatch() -> None:
     assert "Vendor" in r.message
 
 
+def test_vendor_punct_space_normalize_matches() -> None:
+    """OCR 'U.S. AutoForce' must match Tekion compacted 'USAUTOFORCE'."""
+    assert vi_verify._names_match("U.S. AutoForce", "USAUTOFORCE")
+    assert vi_verify._names_match("Smith & Sons", "SMITH AND SONS")
+    assert not vi_verify._names_match("US AUTO", "USAUTOFORCE")
+    po = _po()
+    po["vendorDetails"] = {"vendorName": "USAUTOFORCE", "vendorId": "1"}
+    r = verify_vendor_invoice(
+        client=_client(
+            po,
+            hit=_hit(payeeName="USAUTOFORCE"),
+            postings=_vendor_postings("USAUTOFORCE"),
+        ),
+        expected=_input(vendor_name="U.S. AutoForce"),
+        dry_run=True,
+    )
+    assert r.ok, r.message
+
+
 def test_invoice_date_mismatch() -> None:
     r = verify_vendor_invoice(
         client=_client(_po(), hit=_hit(), postings=_vendor_postings()),
@@ -651,6 +670,7 @@ def main() -> None:
         test_amount_mismatch,
         test_invoice_number_not_on_pre_invoice_list,
         test_vendor_mismatch,
+        test_vendor_punct_space_normalize_matches,
         test_invoice_date_mismatch,
         test_missing_gl,
         test_je_unbalanced_fails,
