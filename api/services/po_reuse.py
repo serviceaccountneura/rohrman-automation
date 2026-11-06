@@ -248,13 +248,22 @@ def pipeline_folder_for(found: FoundPo) -> str | None:
 
     Prefers ``orderType``, then the prefix of ``universalId``
     (``MISCELLANEOUS%10950`` → MISCELLANEOUS). That is what lets one upload
-    folder accept Sublet, Misc and Vendor Stock invoices without the clerk
-    sorting them first.
+    folder accept Sublet, Misc, Vendor Stock, and vendor Special Order
+    invoices without the clerk sorting them first.
+
+    ``NON_OEM_SPECIAL_ORDER`` / ``VENDOR_SPECIAL_ORDER`` are PO-side (VI
+    verify), same path as Misc — not OEM journal entry.
     """
     raw = (found.order_type or "").strip().upper()
     if not raw and found.universal_id:
         raw = str(found.universal_id).split("%", 1)[0].strip().upper()
-    if raw in {"MISCELLANEOUS", "MISC"}:
+    if raw in {
+        "MISCELLANEOUS",
+        "MISC",
+        "NON_OEM_SPECIAL_ORDER",
+        "VENDOR_SPECIAL_ORDER",
+        "SPECIAL_ORDER",
+    }:
         return "MISCELLANEOUS"
     if raw == "SUBLET":
         return "SUBLET"
