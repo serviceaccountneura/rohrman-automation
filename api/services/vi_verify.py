@@ -7,7 +7,9 @@ step only:
      (primary). OCR often has no PO #, or misreads a date as a PO #.
   2. Read the linked PO # from that VI; optionally confirm the PO still exists.
   3. Three-way compare (uploaded invoice == Tekion PO == Pre-invoice VI)
-     for: PO #, Vendor, Invoice #, Invoice amount (exact cents), Invoice date.
+     for: PO #, Vendor, Invoice #, Invoice amount (exact cents). Invoice date
+     is shown on the panel but is **not** a pass/fail gate — Parts often
+     raise the PO days/weeks after the vendor invoice date.
   4. JE screen (postings): Balance must be $0.00; expense GL Control must
      equal the PO vendor name — except GL 2460 (Sublet) = RO #. For Sublet,
      the RO is taken from the Tekion PO (`subletDetails.assetNumber`) first;
@@ -837,42 +839,24 @@ def verify_vendor_invoice(
         result.match = _snap()
         return result
 
-    # ── 5. Invoice Date (invoice ↔ Pre-invoice; PO when Tekion provides it) ──
-    if not ocr_date:
-        result.code = CODE_DATE_MISMATCH
-        result.message = (
-            "Invoice date is missing on the document. It must match Invoice Date "
-            "on Tekion's Vendor Invoice screen."
+    # ── 5. Invoice Date — informational only (not a pass/fail gate) ──────────
+    # Parts routinely create / pre-invoice the PO days or weeks after the
+    # vendor invoice date (Kevin / Daisy Nov 2026). Keep dates on the three-way
+    # panel via _snap(), but never refuse on mismatch or missing date.
+    if ocr_date and vi_date and ocr_date != vi_date:
+        result.notes.append(
+            f"Invoice date on document {_fmt_date(ocr_date)} differs from Tekion "
+            f"Pre Invoice {_fmt_date(vi_date)} — date is not required to pass."
         )
-        result.match = _snap()
-        return result
-    if vi_date is None:
-        result.code = CODE_DATE_MISMATCH
-        result.message = (
-            f"Invoice date on the document is {_fmt_date(ocr_date)}, but Tekion "
-            "has no Invoice Date on the Vendor Invoice. Enter the date in Tekion, "
-            "then re-run checks."
+    elif ocr_date and po_date is not None and po_date != ocr_date:
+        result.notes.append(
+            f"Invoice date on document {_fmt_date(ocr_date)} differs from Tekion "
+            f"PO {po_po} date {_fmt_date(po_date)} — date is not required to pass."
         )
-        result.match = _snap()
-        return result
-    if ocr_date != vi_date:
-        result.code = CODE_DATE_MISMATCH
-        result.message = (
-            f"Invoice date on the document is {_fmt_date(ocr_date)}, but Tekion "
-            f"Pre Invoice Date is {_fmt_date(vi_date)}. They must match. Update "
-            "Invoice Date in Tekion, then re-run."
+    elif not ocr_date:
+        result.notes.append(
+            "Invoice date missing on document — date is not required to pass."
         )
-        result.match = _snap()
-        return result
-    if po_date is not None and po_date != ocr_date:
-        result.code = CODE_DATE_MISMATCH
-        result.message = (
-            f"Invoice date on the document / Pre Invoice is {_fmt_date(ocr_date)}, "
-            f"but the date on Tekion PO {po_po} for this invoice is "
-            f"{_fmt_date(po_date)}. All three must match."
-        )
-        result.match = _snap()
-        return result
 
     # ── Postings / GL ────────────────────────────────────────────────────────
     # Prefer the early preload; retry once if that failed so GL checks still run.

@@ -286,14 +286,16 @@ def test_vendor_punct_space_normalize_matches() -> None:
     assert r.ok, r.message
 
 
-def test_invoice_date_mismatch() -> None:
+def test_invoice_date_mismatch_does_not_block_pass() -> None:
+    """PO verify: date differences are notes only — still pass on the other four."""
     r = verify_vendor_invoice(
         client=_client(_po(), hit=_hit(), postings=_vendor_postings()),
         expected=_input(invoice_date="01/15/2026"),
         dry_run=True,
     )
-    assert not r.ok and r.code == CODE_DATE_MISMATCH
-    assert "date" in r.message.lower()
+    assert r.ok, r.message
+    assert r.code != CODE_DATE_MISMATCH
+    assert any("date" in n.lower() for n in r.notes)
 
 
 def test_missing_gl() -> None:
@@ -744,7 +746,7 @@ def main() -> None:
         test_invoice_number_not_on_pre_invoice_list,
         test_vendor_mismatch,
         test_vendor_punct_space_normalize_matches,
-        test_invoice_date_mismatch,
+        test_invoice_date_mismatch_does_not_block_pass,
         test_missing_gl,
         test_je_unbalanced_fails,
         test_control_must_be_vendor_name,
