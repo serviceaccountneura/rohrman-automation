@@ -9,8 +9,10 @@ step only:
   3. Three-way compare (uploaded invoice == Tekion PO == Pre-invoice VI)
      for: PO #, Vendor, Invoice #, Invoice amount (exact cents), Invoice date.
   4. JE screen (postings): Balance must be $0.00; expense GL Control must
-     equal the PO vendor name — except GL 2460 (Sublet) = RO #. GLs starting
-     with 7 also need a description (control checks behind ENFORCE_JE_CONTROL).
+     equal the PO vendor name — except GL 2460 (Sublet) = RO #. For Sublet,
+     the RO is taken from the Tekion PO (`subletDetails.assetNumber`) first;
+     OCR is only a fallback. GLs starting with 7 also need a description
+     (control checks behind ENFORCE_JE_CONTROL).
   5. On pass (and writes on): attach the PDF and complete the VI / AP posting.
 
 Never creates a PO or a pre-invoice. preInvoice/post is only called with the
@@ -20,7 +22,7 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timezone
 from typing import Any
 
@@ -102,6 +104,8 @@ class ViVerifyResult:
     notes: list[str] = field(default_factory=list)
     # Snapshot for the dashboard three-way match panel.
     match: dict[str, Any] = field(default_factory=dict)
+    # RO used for Sublet 2460 Control (Tekion PO preferred over OCR).
+    resolved_ro: str | None = None
 
     @property
     def gl_lines_for_doc(self) -> list[dict[str, Any]]:
@@ -148,6 +152,29 @@ def _po_num_from_vi_hit(hit: dict[str, Any]) -> str:
         if num:
             return num
     return str(hit.get("poNumber") or hit.get("orderNumber") or "").strip()
+
+
+def _ro_from_tekion_po(po: dict[str, Any] | None) -> str:
+    """Repair Order # Parts already put on a Sublet PO in Tekion.
+
+    Sublet POs carry the RO on each ``subletDetails`` row as ``assetNumber``
+    (the RO number). That is the source of truth for GL 2460 Control — OCR
+    often misses the RO on the PDF.
+    """
+    if not po:
+        return ""
+    for detail in po.get("subletDetails") or []:
+        if not isinstance(detail, dict):
+            continue
+        for key in ("assetNumber", "roNumber", "roNo", "repairOrderNumber"):
+            val = str(detail.get(key) or "").strip()
+            if val and val.lower() not in ("none", "null"):
+                return val
+    for key in ("controlNumber", "assetNumber"):
+        val = str(po.get(key) or "").strip()
+        if val and val.lower() not in ("none", "null"):
+            return val
+    return ""
 
 
 def find_pre_invoice_by_invoice_number(
@@ -550,6 +577,25 @@ def verify_vendor_invoice(
     if lookup_po:
         po = client.find_purchase_order(lookup_po)
 
+    # Sublet RO lives on subletDetails; some list hits omit it — re-fetch by
+    # universalId when we still need an RO for Control.
+    po_looks_sublet = (
+        str(expected.po_type or "").strip().upper() == "SUBLET"
+        or str((po or {}).get("orderType") or "").strip().upper() == "SUBLET"
+        or str((po or {}).get("universalId") or "").upper().startswith("SUBLET%")
+    )
+    if po and po_looks_sublet and not _ro_from_tekion_po(po):
+        uid = str(po.get("universalId") or "").strip()
+        if not uid:
+            for detail in hit.get("poDetails") or []:
+                if isinstance(detail, dict) and detail.get("universalId"):
+                    uid = str(detail["universalId"]).strip()
+                    break
+        if uid:
+            richer = svc.get_po(uid)
+            if richer:
+                po = richer
+
     po_po = str((po or {}).get("orderNumber") or "").strip() if po else ""
     po_vendor = str(
         ((po or {}).get("vendorDetails") or {}).get("vendorName") or ""
@@ -571,6 +617,24 @@ def verify_vendor_invoice(
     result.po_number = po_po or vi_po or ocr_po_number
     result.po_total = po_amount
     result.vendor_name = vi_vendor or po_vendor or None
+
+    # Sublet Control: RO from Tekion PO first (Parts already linked it), OCR
+    # only if the PO has nothing. Mutate the local expected so JE gate + post
+    # both see the same number.
+    po_ro = _ro_from_tekion_po(po)
+    ocr_ro = str(expected.ro_number or "").strip()
+    if po_ro:
+        if ocr_ro and ocr_ro != po_ro:
+            result.notes.append(
+                f"RO from Tekion Sublet PO is {po_ro!r} (OCR had {ocr_ro!r}); using PO."
+            )
+        else:
+            result.notes.append(f"RO {po_ro!r} taken from Tekion Sublet PO.")
+        expected = replace(expected, ro_number=po_ro)
+        result.resolved_ro = po_ro
+    elif ocr_ro:
+        result.notes.append(f"RO {ocr_ro!r} from OCR (Tekion PO had no sublet RO).")
+        result.resolved_ro = ocr_ro
 
     ocr_vendor = str(expected.vendor_name or "").strip()
     invoice_amt = float(expected.invoice_amount)

@@ -79,6 +79,15 @@ def _client(
             else:
                 hits = primary
             return {"data": {"hits": hits, "count": len(hits)}}
+        if "partTrade/u/purchase/search" in path:
+            # get_po(universalId) enrichment — same PO find_purchase_order returns.
+            found = client.find_purchase_order.return_value
+            return {
+                "data": {
+                    "hits": [found] if found else [],
+                    "count": 1 if found else 0,
+                }
+            }
         if "invoicePostings" in path:
             return {"data": postings or []}
         if "paymentInfo" in path:
@@ -409,6 +418,30 @@ def test_sublet_2460_missing_ro_blocks_post_even_when_control_flag_off() -> None
         vi_verify.ENFORCE_JE_CONTROL = prev
 
 
+def test_sublet_ro_from_po_when_ocr_blank() -> None:
+    """Tekion Sublet PO assetNumber supplies RO for 2460 Control when OCR has none."""
+    po = _po()
+    po["orderType"] = "SUBLET"
+    po["universalId"] = "SUBLET%10968"
+    po["subletDetails"] = [{"assetNumber": "308020", "itemType": "job"}]
+    client = _client(
+        po,
+        hit=_hit(poDetails=[{"poNum": "36137", "universalId": "SUBLET%10968"}]),
+        postings=_vendor_postings(ref="", acct="2460"),
+    )
+    r = verify_vendor_invoice(
+        client=client,
+        expected=_input(po_type="SUBLET", ro_number=None),
+        dry_run=False,
+    )
+    assert r.ok and r.completed, r.message
+    expense = _posted_body(client)["postings"][1]
+    assert expense["glAccountId"] == "1707_2460"
+    assert expense["refType"] == "CUSTOM"
+    assert expense["refId"] == expense["refText"] == "308020"
+    assert any("308020" in n for n in r.notes)
+
+
 def test_sublet_2460_tekion_control_counts_as_ro() -> None:
     """If Tekion JE Control already has a value on 2460, missing OCR RO is OK."""
     prev = vi_verify.ENFORCE_JE_CONTROL
@@ -718,6 +751,7 @@ def main() -> None:
         test_je_control_7xxx_needs_description,
         test_sublet_2460_control_is_ro,
         test_sublet_2460_missing_ro_blocks_post_even_when_control_flag_off,
+        test_sublet_ro_from_po_when_ocr_blank,
         test_sublet_2460_tekion_control_counts_as_ro,
         test_tekion_near_duplicate_flags,
         test_tekion_near_duplicate_short_zero_padded_core,

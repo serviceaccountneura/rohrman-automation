@@ -1515,6 +1515,12 @@ def _run_vi_verify(
         _fail(session, doc, EX_TEKION_ERROR, error=str(e))
         return
 
+    # Persist RO from Tekion Sublet PO (or OCR) so the detail page shows it.
+    if result.resolved_ro and str(result.resolved_ro).strip():
+        doc.ro_number = str(result.resolved_ro).strip()
+        session.add(doc)
+        session.commit()
+
     # Always stash match + GL lines so the detail three-way panel has real $.
     if result.gl_lines_for_doc or result.match:
         _record_postings(
