@@ -22,8 +22,9 @@ def _utcnow() -> datetime:
 
 KEY_TEKION_PO_WRITES = "tekion_po_writes"
 KEY_OEM_POST = "oem_post"
+KEY_NOTES_ENABLED = "notes_enabled"
 
-_KNOWN_KEYS = (KEY_TEKION_PO_WRITES, KEY_OEM_POST)
+_KNOWN_KEYS = (KEY_TEKION_PO_WRITES, KEY_OEM_POST, KEY_NOTES_ENABLED)
 
 # key → (value, monotonic_ts)
 _cache: dict[str, tuple[bool, float]] = {}
@@ -36,6 +37,9 @@ def _env_default(key: str) -> bool:
         return bool(settings.tekion_po_writes)
     if key == KEY_OEM_POST:
         return bool(settings.oem_post)
+    if key == KEY_NOTES_ENABLED:
+        # Off until an admin flips Settings — no env seed required.
+        return False
     raise KeyError(f"unknown runtime flag: {key}")
 
 
@@ -109,8 +113,13 @@ def oem_post(session: Session | None = None) -> bool:
     return get_flag(KEY_OEM_POST, session)
 
 
+def notes_enabled(session: Session | None = None) -> bool:
+    return get_flag(KEY_NOTES_ENABLED, session)
+
+
 def all_flags(session: Session | None = None) -> dict[str, bool]:
     return {
         KEY_TEKION_PO_WRITES: tekion_po_writes(session),
         KEY_OEM_POST: oem_post(session),
+        KEY_NOTES_ENABLED: notes_enabled(session),
     }

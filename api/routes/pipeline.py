@@ -32,6 +32,7 @@ from api.deps import CurrentUserDep
 from api.models.db import Document, User
 from api.models.schemas import (
     MessageResponse,
+    NoteUpdateRequest,
     PipelineAcceptedResponse,
     PipelineStatusResponse,
     PoDecisionRequest,
@@ -72,6 +73,7 @@ def tekion_writes() -> dict[str, object]:
         "folders": ["PO_INVOICE", "SUBLET", "MISCELLANEOUS", "STOCK"],
         "postFolders": ["OEM"] if oem_post else [],
         "draftFolders": ["VEHICLE_MANUFACTURING"] + ([] if oem_post else ["OEM"]),
+        "notesEnabled": runtime_flags.notes_enabled(),
     }
 
 
@@ -515,6 +517,40 @@ def rerun_document(
     return _to_status(doc, session=session)
 
 
+@router.patch("/jobs/{document_id}/note", response_model=PipelineStatusResponse)
+def save_note(
+    document_id: UUID,
+    payload: NoteUpdateRequest,
+    session: Annotated[Session, Depends(get_session)],
+) -> PipelineStatusResponse:
+    """Save or clear the clerk note on any document (any folder / status)."""
+    from api.services import runtime_flags
+
+    if not runtime_flags.notes_enabled(session):
+        raise HTTPException(
+            status_code=403,
+            detail="Notes are turned off in Settings.",
+        )
+    doc = session.get(Document, job_queue.resolve_id(session, document_id))
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    text = str(payload.note or "").strip()
+    if len(text) > 4000:
+        raise HTTPException(status_code=400, detail="Note is too long (max 4000).")
+    doc.note = text
+    session.add(doc)
+    session.commit()
+    session.refresh(doc)
+    children: list[UUID] = []
+    if doc.status == job_queue.STATUS_SPLIT:
+        children = list(
+            session.exec(
+                select(Document.id).where(Document.split_from == doc.id)
+            ).all()
+        )
+    return _to_status(doc, children, session=session)
+
+
 @router.get("/jobs/{document_id}", response_model=PipelineStatusResponse)
 def get_job(
     document_id: UUID,
@@ -553,6 +589,12 @@ def _as_json_object(raw: str) -> dict:
     except ValueError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _notes_enabled(session: Session | None) -> bool:
+    from api.services import runtime_flags
+
+    return runtime_flags.notes_enabled(session)
 
 
 def _to_status(
@@ -611,4 +653,6 @@ def _to_status(
         created_at=doc.created_at,
         processed_at=doc.processed_at,
         deleted_at=doc.deleted_at,
+        note=str(doc.note or ""),
+        notes_enabled=_notes_enabled(session),
     )

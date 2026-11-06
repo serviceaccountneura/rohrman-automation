@@ -222,11 +222,11 @@ def confidence_key(s3_key: str) -> str:
 
 
 def viewable_key(s3_key: str) -> str:
-    """The key to show someone, best first: the cleaned-up copy Gemini read,
-    then the upright copy, then the original as uploaded."""
-    for candidate in (enhanced_key(s3_key, False), enhanced_key(s3_key, True), upright_key(s3_key)):
-        if exists(candidate):
-            return candidate
+    """Key for the detail-page preview / download.
+
+    Always the original upload. Enhanced / upright copies stay in S3 for OCR
+    and Tekion flows, but clerks must see the file they uploaded.
+    """
     return s3_key
 
 
