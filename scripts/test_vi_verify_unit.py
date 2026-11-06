@@ -388,6 +388,46 @@ def test_sublet_2460_control_is_ro() -> None:
         vi_verify.ENFORCE_JE_CONTROL = prev
 
 
+def test_sublet_2460_missing_ro_blocks_post_even_when_control_flag_off() -> None:
+    """Sublet + 2460 with no RO anywhere must exception — never attach/post."""
+    prev = vi_verify.ENFORCE_JE_CONTROL
+    vi_verify.ENFORCE_JE_CONTROL = False
+    try:
+        client = _client(_po(), hit=_hit(), postings=_vendor_postings(ref="", acct="2460"))
+        r = verify_vendor_invoice(
+            client=client,
+            expected=_input(po_type="SUBLET", ro_number=None),
+            dry_run=False,
+        )
+        assert not r.ok and not r.completed
+        assert r.code == CODE_JE_CONTROL
+        assert "Repair Order" in r.message or "RO" in r.message
+        paths = [(c.args[0] if c.args else "") for c in client._req_json.call_args_list]
+        assert not any("receivedTransaction" in p for p in paths)
+        assert not any("preInvoice/post" in p for p in paths)
+    finally:
+        vi_verify.ENFORCE_JE_CONTROL = prev
+
+
+def test_sublet_2460_tekion_control_counts_as_ro() -> None:
+    """If Tekion JE Control already has a value on 2460, missing OCR RO is OK."""
+    prev = vi_verify.ENFORCE_JE_CONTROL
+    vi_verify.ENFORCE_JE_CONTROL = False
+    try:
+        r = verify_vendor_invoice(
+            client=_client(
+                _po(),
+                hit=_hit(),
+                postings=_vendor_postings(ref="1575659", acct="2460"),
+            ),
+            expected=_input(po_type="SUBLET", ro_number=None),
+            dry_run=True,
+        )
+        assert r.ok, r.message
+    finally:
+        vi_verify.ENFORCE_JE_CONTROL = prev
+
+
 def test_tekion_near_duplicate_flags() -> None:
     """Pattern match + same amount as the exact VI → DUPLICATE_INVOICE."""
     hit = _hit(invoiceNumber="BLK123", payeeName="AUTO GLASS")
@@ -677,6 +717,8 @@ def main() -> None:
         test_control_must_be_vendor_name,
         test_je_control_7xxx_needs_description,
         test_sublet_2460_control_is_ro,
+        test_sublet_2460_missing_ro_blocks_post_even_when_control_flag_off,
+        test_sublet_2460_tekion_control_counts_as_ro,
         test_tekion_near_duplicate_flags,
         test_tekion_near_duplicate_short_zero_padded_core,
         test_tekion_near_duplicate_requires_po_or_amount,
