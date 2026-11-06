@@ -474,6 +474,8 @@ class PipelineStatusResponse(BaseModel):
     vendor_name: str = Field(default="", alias="vendorName")
     invoice_number: str = Field(default="", alias="invoiceNumber")
     ro_number: str = Field(default="", alias="roNumber")
+    # Parsed from ro_number when a Sublet PO lists several ROs (comma-separated).
+    ro_numbers: list[str] = Field(default_factory=list, alias="roNumbers")
     # Set when the folder was SUBLET / MISCELLANEOUS / STOCK.
     po_number: str = Field(default="", alias="poNumber")
     # Set when the folder was OEM (journal entry).
