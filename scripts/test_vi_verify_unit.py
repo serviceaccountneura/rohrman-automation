@@ -425,7 +425,9 @@ def test_sublet_ro_from_po_when_ocr_blank() -> None:
     po = _po()
     po["orderType"] = "SUBLET"
     po["universalId"] = "SUBLET%10968"
-    po["subletDetails"] = [{"assetNumber": "308020", "itemType": "job"}]
+    po["subletDetails"] = [
+        {"assetNumber": "308020", "itemType": "job", "laborAmount": 53.23}
+    ]
     client = _client(
         po,
         hit=_hit(poDetails=[{"poNum": "36137", "universalId": "SUBLET%10968"}]),
@@ -442,6 +444,172 @@ def test_sublet_ro_from_po_when_ocr_blank() -> None:
     assert expense["refType"] == "CUSTOM"
     assert expense["refId"] == expense["refText"] == "308020"
     assert any("308020" in n for n in r.notes)
+
+
+def test_multi_ro_maps_each_2460_line_by_amount() -> None:
+    """Each Sublet PO RO maps to the matching 2460 JE line — not the first RO on all."""
+    po = _po(
+        total=3075.0,
+        invoice_numbers=[{"invoiceId": "inv-1", "invoiceNumber": "3558"}],
+    )
+    po["orderType"] = "SUBLET"
+    po["universalId"] = "SUBLET%10318"
+    po["subletDetails"] = [
+        {"assetNumber": "1589785", "laborAmount": 1200.0},
+        {"assetNumber": "1589786", "laborAmount": 150.0},
+        {"assetNumber": "1589787", "laborAmount": 600.0},
+        {"assetNumber": "1589788", "laborAmount": 150.0},
+        {"assetNumber": "1589789", "laborAmount": 375.0},
+        {"assetNumber": "1589790", "laborAmount": 600.0},
+    ]
+    hit = _hit(
+        invoiceNumber="3558",
+        invoiceAmount={"amount": 307500},
+        poDetails=[{"poNum": "36137", "universalId": "SUBLET%10318"}],
+        payeeName="SCHAUMBURG KIA",
+    )
+    postings = [
+        {
+            "glAccountId": "1707_2460",
+            "amount": 1200.0,
+            "postingOrder": 1,
+            "refText": "",
+            "lineIdentifier": "a1",
+        },
+        {
+            "glAccountId": "1707_2460",
+            "amount": 150.0,
+            "postingOrder": 2,
+            "refText": "",
+            "lineIdentifier": "a2",
+        },
+        {
+            "glAccountId": "1707_2460",
+            "amount": 600.0,
+            "postingOrder": 3,
+            "refText": "",
+            "lineIdentifier": "a3",
+        },
+        {
+            "glAccountId": "1707_2460",
+            "amount": 150.0,
+            "postingOrder": 4,
+            "refText": "",
+            "lineIdentifier": "a4",
+        },
+        {
+            "glAccountId": "1707_2460",
+            "amount": 375.0,
+            "postingOrder": 5,
+            "refText": "",
+            "lineIdentifier": "a5",
+        },
+        {
+            "glAccountId": "1707_2460",
+            "amount": 600.0,
+            "postingOrder": 6,
+            "refText": "",
+            "lineIdentifier": "a6",
+        },
+        {
+            "glAccountId": "1707_3002",
+            "amount": -3075.0,
+            "postingOrder": 0,
+            "refType": "VENDOR",
+            "refId": "42047",
+            "refText": "1707_160",
+            "lineIdentifier": "ap",
+            "metaData": {"apPostingLine": True},
+        },
+    ]
+    client = _client(po, hit=hit, postings=postings)
+    r = verify_vendor_invoice(
+        client=client,
+        expected=_input(
+            po_type="SUBLET",
+            ro_number=None,
+            invoice_number="3558",
+            invoice_amount=3075.0,
+            vendor_name="SCHAUMBURG KIA",
+        ),
+        dry_run=False,
+    )
+    assert r.ok and r.completed, r.message
+    assert r.resolved_ro and "1589785" in r.resolved_ro and "1589790" in r.resolved_ro
+    body = _posted_body(client)
+    expense = [
+        p
+        for p in body["postings"]
+        if str(p.get("glAccountId") or "").endswith("2460")
+    ]
+    assert [p["refText"] for p in expense] == [
+        "1589785",
+        "1589786",
+        "1589787",
+        "1589788",
+        "1589789",
+        "1589790",
+    ]
+
+
+def test_multi_ro_keeps_tekion_control_already_filled() -> None:
+    """Parts already put the right RO on each 2460 — do not overwrite with first RO."""
+    po = _po(
+        total=1350.0,
+        invoice_numbers=[{"invoiceId": "inv-1", "invoiceNumber": "3558"}],
+    )
+    po["orderType"] = "SUBLET"
+    po["universalId"] = "SUBLET%10318"
+    po["subletDetails"] = [
+        {"assetNumber": "1589785", "laborAmount": 1200.0},
+        {"assetNumber": "1589786", "laborAmount": 150.0},
+    ]
+    hit = _hit(
+        invoiceNumber="3558",
+        invoiceAmount={"amount": 135000},
+        poDetails=[{"poNum": "36137", "universalId": "SUBLET%10318"}],
+    )
+    postings = [
+        {
+            "glAccountId": "1707_2460",
+            "amount": 1200.0,
+            "refText": "1589785",
+            "lineIdentifier": "a1",
+        },
+        {
+            "glAccountId": "1707_2460",
+            "amount": 150.0,
+            "refText": "1589786",
+            "lineIdentifier": "a2",
+        },
+        {
+            "glAccountId": "1707_3002",
+            "amount": -1350.0,
+            "refType": "VENDOR",
+            "refId": "42047",
+            "refText": "1707_160",
+            "lineIdentifier": "ap",
+            "metaData": {"apPostingLine": True},
+        },
+    ]
+    client = _client(po, hit=hit, postings=postings)
+    r = verify_vendor_invoice(
+        client=client,
+        expected=_input(
+            po_type="SUBLET",
+            ro_number=None,
+            invoice_number="3558",
+            invoice_amount=1350.0,
+        ),
+        dry_run=False,
+    )
+    assert r.ok and r.completed, r.message
+    expense = [
+        p
+        for p in _posted_body(client)["postings"]
+        if str(p.get("glAccountId") or "").endswith("2460")
+    ]
+    assert [p["refText"] for p in expense] == ["1589785", "1589786"]
 
 
 def test_sublet_2460_tekion_control_counts_as_ro() -> None:
@@ -754,6 +922,8 @@ def main() -> None:
         test_sublet_2460_control_is_ro,
         test_sublet_2460_missing_ro_blocks_post_even_when_control_flag_off,
         test_sublet_ro_from_po_when_ocr_blank,
+        test_multi_ro_maps_each_2460_line_by_amount,
+        test_multi_ro_keeps_tekion_control_already_filled,
         test_sublet_2460_tekion_control_counts_as_ro,
         test_tekion_near_duplicate_flags,
         test_tekion_near_duplicate_short_zero_padded_core,

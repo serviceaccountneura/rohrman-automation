@@ -106,8 +106,12 @@ class ViVerifyResult:
     notes: list[str] = field(default_factory=list)
     # Snapshot for the dashboard three-way match panel.
     match: dict[str, Any] = field(default_factory=dict)
-    # RO used for Sublet 2460 Control (Tekion PO preferred over OCR).
+    # RO(s) for Sublet 2460 Control (Tekion PO preferred over OCR).
+    # Single RO, or comma-separated when the Sublet PO lists several.
     resolved_ro: str | None = None
+    # Ordered (ro, amount) rows from Tekion Sublet PO — used to map each
+    # 2460 JE line to its own Repair Order Control.
+    po_ro_rows: list[tuple[str, float]] = field(default_factory=list)
 
     @property
     def gl_lines_for_doc(self) -> list[dict[str, Any]]:
@@ -156,27 +160,127 @@ def _po_num_from_vi_hit(hit: dict[str, Any]) -> str:
     return str(hit.get("poNumber") or hit.get("orderNumber") or "").strip()
 
 
-def _ro_from_tekion_po(po: dict[str, Any] | None) -> str:
-    """Repair Order # Parts already put on a Sublet PO in Tekion.
+def _ro_amount_from_sublet_detail(detail: dict[str, Any]) -> float:
+    for key in ("laborAmount", "amount", "partAmount"):
+        raw = detail.get(key)
+        if raw is None or raw == "":
+            continue
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
 
-    Sublet POs carry the RO on each ``subletDetails`` row as ``assetNumber``
-    (the RO number). That is the source of truth for GL 2460 Control — OCR
-    often misses the RO on the PDF.
+
+def _ros_from_tekion_po(po: dict[str, Any] | None) -> list[tuple[str, float]]:
+    """All Repair Orders on a Tekion Sublet PO, in Sublet List order.
+
+    Each ``subletDetails`` row carries ``assetNumber`` (RO #) and an amount.
+    Multi-RO POs (e.g. six cars on one vendor invoice) become six 2460 JE
+    lines — Control must be that row's RO, not the first RO on every line.
     """
     if not po:
-        return ""
+        return []
+    rows: list[tuple[str, float]] = []
     for detail in po.get("subletDetails") or []:
         if not isinstance(detail, dict):
             continue
+        ro = ""
         for key in ("assetNumber", "roNumber", "roNo", "repairOrderNumber"):
             val = str(detail.get(key) or "").strip()
             if val and val.lower() not in ("none", "null"):
-                return val
+                ro = val
+                break
+        if not ro:
+            continue
+        rows.append((ro, _ro_amount_from_sublet_detail(detail)))
+    if rows:
+        return rows
     for key in ("controlNumber", "assetNumber"):
         val = str(po.get(key) or "").strip()
         if val and val.lower() not in ("none", "null"):
-            return val
-    return ""
+            return [(val, float(_money(po.get("totalAmount")) or 0.0))]
+    return []
+
+
+def _ro_from_tekion_po(po: dict[str, Any] | None) -> str:
+    """First RO on the Sublet PO (compat / single-RO path)."""
+    rows = _ros_from_tekion_po(po)
+    return rows[0][0] if rows else ""
+
+
+def _format_ro_list(rows: list[tuple[str, float]]) -> str:
+    """Stable comma-separated RO list for the document / UI (dedupe, keep order)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for ro, _amt in rows:
+        if ro in seen:
+            continue
+        seen.add(ro)
+        out.append(ro)
+    return ", ".join(out)
+
+
+def _apply_sublet_2460_controls(
+    prepared: list[dict[str, Any]],
+    *,
+    po_ro_rows: list[tuple[str, float]],
+    fallback_ro: str,
+) -> list[str]:
+    """Set Control on each GL 2460 expense line to the matching Sublet RO.
+
+    - If Tekion already filled Control (Parts did), leave it alone.
+    - Else match an unused PO ``subletDetails`` row by amount (same order as
+      the Sublet List / JE when amounts align).
+    - Else fall back to the single ``fallback_ro`` when only one RO exists.
+    Returns notes describing what was applied.
+    """
+    notes: list[str] = []
+    unused = list(po_ro_rows)
+    unique_ros = list(dict.fromkeys(ro for ro, _ in po_ro_rows))
+    single_ro = (
+        unique_ros[0]
+        if len(unique_ros) == 1
+        else (fallback_ro.strip() if fallback_ro.strip() and "," not in fallback_ro else "")
+    )
+
+    for line in prepared:
+        if (line.get("metaData") or {}).get("apPostingLine"):
+            continue
+        if _account_number(line) != SUBLET_GL:
+            continue
+        existing = str(line.get("refText") or line.get("refId") or "").strip()
+        if existing:
+            # Keep Tekion's Control, but ensure both refId + refText (A217).
+            set_control(line, existing)
+            notes.append(f"GL {SUBLET_GL} Control already {existing!r} — left as-is.")
+            # Consume a matching unused PO row so later lines don't steal it.
+            for i, (ro, _amt) in enumerate(unused):
+                if ro == existing:
+                    unused.pop(i)
+                    break
+            continue
+
+        line_amt = float(line.get("amount") or 0)
+        chosen = ""
+        for i, (ro, amt) in enumerate(unused):
+            if abs(line_amt - amt) < 0.005:
+                chosen = ro
+                unused.pop(i)
+                break
+        if not chosen and single_ro:
+            chosen = single_ro
+        if chosen:
+            set_control(line, chosen)
+            notes.append(
+                f"GL {SUBLET_GL} ${line_amt:,.2f} Control set to RO {chosen!r}."
+            )
+        else:
+            notes.append(
+                f"GL {SUBLET_GL} ${line_amt:,.2f} has no Control and no matching "
+                "Sublet PO RO amount — left empty."
+            )
+    return notes
 
 
 def find_pre_invoice_by_invoice_number(
@@ -620,20 +724,23 @@ def verify_vendor_invoice(
     result.po_total = po_amount
     result.vendor_name = vi_vendor or po_vendor or None
 
-    # Sublet Control: RO from Tekion PO first (Parts already linked it), OCR
-    # only if the PO has nothing. Mutate the local expected so JE gate + post
-    # both see the same number.
-    po_ro = _ro_from_tekion_po(po)
+    # Sublet Control: ROs from Tekion PO first (Parts already linked them), OCR
+    # only if the PO has nothing. Multi-RO POs keep every assetNumber — each
+    # 2460 JE line is mapped later in _complete_vendor_invoice.
+    po_ro_rows = _ros_from_tekion_po(po)
+    result.po_ro_rows = po_ro_rows
+    po_ro_display = _format_ro_list(po_ro_rows)
     ocr_ro = str(expected.ro_number or "").strip()
-    if po_ro:
-        if ocr_ro and ocr_ro != po_ro:
+    if po_ro_display:
+        if ocr_ro and ocr_ro != po_ro_display and ocr_ro not in po_ro_display:
             result.notes.append(
-                f"RO from Tekion Sublet PO is {po_ro!r} (OCR had {ocr_ro!r}); using PO."
+                f"RO(s) from Tekion Sublet PO: {po_ro_display} "
+                f"(OCR had {ocr_ro!r}); using PO."
             )
         else:
-            result.notes.append(f"RO {po_ro!r} taken from Tekion Sublet PO.")
-        expected = replace(expected, ro_number=po_ro)
-        result.resolved_ro = po_ro
+            result.notes.append(f"RO(s) from Tekion Sublet PO: {po_ro_display}.")
+        expected = replace(expected, ro_number=po_ro_display)
+        result.resolved_ro = po_ro_display
     elif ocr_ro:
         result.notes.append(f"RO {ocr_ro!r} from OCR (Tekion PO had no sublet RO).")
         result.resolved_ro = ocr_ro
@@ -1123,17 +1230,50 @@ def _complete_vendor_invoice(
         po_type=expected.po_type,
         amount_tolerance=0.0,
     )
+    # prepare_postings fills description; 2460 Control is applied below so a
+    # multi-RO Sublet PO does not stamp the first RO onto every JE line.
     prepared = svc.prepare_postings(result.postings, ap_expected)
-    # Ensure expense Control = vendor (or RO for 2460) before complete.
     vendor = result.vendor_name or expected.vendor_name or ""
+    fallback_ro = str(expected.ro_number or result.resolved_ro or "").strip()
+    # One RO only in fallback (comma list is display, not a Control value).
+    if "," in fallback_ro:
+        fallback_ro = fallback_ro.split(",", 1)[0].strip()
+
+    control_notes = _apply_sublet_2460_controls(
+        prepared,
+        po_ro_rows=list(result.po_ro_rows),
+        fallback_ro=fallback_ro,
+    )
+    result.notes.extend(control_notes)
+
     for line in prepared:
         if (line.get("metaData") or {}).get("apPostingLine"):
             continue
         acct = _account_number(line)
-        if acct == SUBLET_GL and expected.ro_number:
-            set_control(line, expected.ro_number)
-        elif vendor:
+        if acct == SUBLET_GL:
+            continue  # already handled (per-line RO)
+        # Non-2460 expense: Control = vendor name (both refId + refText).
+        if vendor:
             set_control(line, vendor)
+
+    # Mirror Controls onto result.postings so the dashboard GL panel matches.
+    by_amt: dict[float, str] = {}
+    for line in prepared:
+        if _account_number(line) != SUBLET_GL:
+            continue
+        if (line.get("metaData") or {}).get("apPostingLine"):
+            continue
+        ctrl = str(line.get("refText") or "").strip()
+        if ctrl:
+            by_amt[round(float(line.get("amount") or 0), 2)] = ctrl
+    for p in result.postings:
+        if _account_number(p) != SUBLET_GL:
+            continue
+        if (p.get("metaData") or {}).get("apPostingLine"):
+            continue
+        ctrl = by_amt.get(round(float(p.get("amount") or 0), 2))
+        if ctrl:
+            set_control(p, ctrl)
 
     accounting_date_ms = result.tekion_invoice_date_ms or int(time.time() * 1000)
     try:

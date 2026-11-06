@@ -126,7 +126,8 @@ class Document(SQLModel, table=True):
     vendor_name: str = Field(default="", max_length=255, index=True)
     invoice_number: str = Field(default="", max_length=100)
     vin: str = Field(default="", max_length=20)
-    ro_number: str = Field(default="", max_length=100)
+    # One RO, or comma-separated list when a Sublet PO spans several ROs.
+    ro_number: str = Field(default="", max_length=500)
     po_number: str = Field(default="", max_length=100)
     # SUBLET, MISCELLANEOUS, STOCK, OEM, VEHICLE_MANUFACTURING. Set from the
     # upload folder, which is authoritative: it selects the pipeline even when

@@ -618,6 +618,11 @@ def _to_status(
         vendor_name=doc.vendor_name,
         invoice_number=doc.invoice_number,
         ro_number=doc.ro_number,
+        ro_numbers=[
+            part.strip()
+            for part in (doc.ro_number or "").split(",")
+            if part.strip()
+        ],
         po_number=doc.po_number,
         transaction_id=doc.transaction_id,
         transaction_number=doc.transaction_number,
