@@ -691,10 +691,17 @@ def resolve_id(session: Session, document_id: Any) -> Any:
 
 
 def queue_depth(session: Session) -> dict[str, int]:
-    """Counts per status — for the queue-stats endpoint."""
+    """Counts per status — for the queue-stats endpoint.
+
+    Soft-deleted rows are kept on record (audit) but must not inflate
+    "In line" / "Being read" — workers already skip them on claim.
+    """
     counts: dict[str, int] = {}
     rows = session.exec(
-        text("SELECT status, COUNT(*) FROM documents GROUP BY status")  # type: ignore[arg-type]
+        text(  # type: ignore[arg-type]
+            "SELECT status, COUNT(*) FROM documents "
+            "WHERE deleted_at IS NULL GROUP BY status"
+        )
     ).all()
     for status, count in rows:
         counts[status] = count

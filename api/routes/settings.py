@@ -1,4 +1,4 @@
-"""Admin Settings — runtime feature flags (TEKION_PO_WRITES / OEM_POST)."""
+"""Admin Settings — runtime feature flags (writes / OEM post / notes)."""
 from __future__ import annotations
 
 from typing import Annotated
@@ -18,6 +18,7 @@ router = APIRouter(prefix="/api/settings", tags=["settings"])
 class RuntimeFlagsResponse(BaseModel):
     tekion_po_writes: bool = Field(alias="tekionPoWrites")
     oem_post: bool = Field(alias="oemPost")
+    notes_enabled: bool = Field(alias="notesEnabled")
 
     model_config = {"populate_by_name": True}
 
@@ -25,6 +26,7 @@ class RuntimeFlagsResponse(BaseModel):
 class RuntimeFlagsUpdate(BaseModel):
     tekion_po_writes: bool | None = Field(default=None, alias="tekionPoWrites")
     oem_post: bool | None = Field(default=None, alias="oemPost")
+    notes_enabled: bool | None = Field(default=None, alias="notesEnabled")
 
     model_config = {"populate_by_name": True}
 
@@ -34,11 +36,12 @@ def get_runtime_flags(
     session: Annotated[Session, Depends(get_session)],
     current_user: CurrentUserDep,
 ) -> RuntimeFlagsResponse:
-    """Current Tekion write / OEM post switches. Admin only."""
+    """Current Tekion write / OEM post / notes switches. Admin only."""
     access.require_admin(current_user)
     return RuntimeFlagsResponse(
         tekionPoWrites=runtime_flags.tekion_po_writes(session),
         oemPost=runtime_flags.oem_post(session),
+        notesEnabled=runtime_flags.notes_enabled(session),
     )
 
 
@@ -48,7 +51,7 @@ def patch_runtime_flags(
     session: Annotated[Session, Depends(get_session)],
     current_user: CurrentUserDep,
 ) -> RuntimeFlagsResponse:
-    """Flip TEKION_PO_WRITES / OEM_POST without editing .env. Admin only."""
+    """Flip runtime flags without editing .env. Admin only."""
     access.require_admin(current_user)
     if body.tekion_po_writes is not None:
         runtime_flags.set_flag(
@@ -64,7 +67,15 @@ def patch_runtime_flags(
             body.oem_post,
             updated_by=current_user.id,
         )
+    if body.notes_enabled is not None:
+        runtime_flags.set_flag(
+            session,
+            runtime_flags.KEY_NOTES_ENABLED,
+            body.notes_enabled,
+            updated_by=current_user.id,
+        )
     return RuntimeFlagsResponse(
         tekionPoWrites=runtime_flags.tekion_po_writes(session),
         oemPost=runtime_flags.oem_post(session),
+        notesEnabled=runtime_flags.notes_enabled(session),
     )

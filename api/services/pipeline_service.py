@@ -307,9 +307,8 @@ def _upright_source(doc: Document, source: str | None, reading: bool) -> tuple[s
     """The file to work from, turned upright; and whether orientation is settled.
 
     A fresh read checks every page (page_orientation.upright_file). When any
-    page was turned, the upright copy is stored beside the original in S3 --
-    the original stays as the record of what was received -- and the preview
-    serves it (see s3_service.viewable_key).
+    page was turned, the upright copy is stored beside the original in S3 for
+    OCR; the original stays the record and the detail-page preview.
 
     A re-run reads nothing, so it needs nothing turned. Tekion is always sent
     the ORIGINAL file, never this one -- see _run. A split-out invoice is cut
@@ -334,18 +333,17 @@ def _upright_source(doc: Document, source: str | None, reading: bool) -> tuple[s
         try:
             s3_service.upload_file(path, upright_s3)
             print(f"[PIPE] {doc.id} stored upright copy at {upright_s3}")
-        except Exception as e:  # noqa: BLE001 - only the preview loses out
+        except Exception as e:  # noqa: BLE001 - OCR can still use the local path
             print(f"[PIPE] {doc.id} could not store the upright copy: {e}")
     return path, True
 
 
 def _store_enhanced_copy(doc: Document, source: str, pages: list) -> None:
-    """Store what Gemini read -- the cleaned-up grayscale pages -- for the preview.
+    """Store what Gemini read -- cleaned-up grayscale pages -- beside the original.
 
-    One page is kept as a PNG, shown pixel for pixel; several as a PDF. Beside
-    the original in S3 as <name>.enhanced.png / .pdf. Only the preview uses it:
-    the original stays the record, and it is the original that goes to Tekion.
-    Best-effort -- a failure costs the preview, nothing else.
+    One page as PNG, several as PDF (<name>.enhanced.png / .pdf). Detail-page
+    preview and Tekion use the original upload. Best-effort -- a failure does
+    not affect the run.
     """
     if not pages or not doc.s3_key or not s3_service.is_configured():
         return
@@ -1516,6 +1514,12 @@ def _run_vi_verify(
         _stash_ocr_legs_for_panel(doc, session, ocr)
         _fail(session, doc, EX_TEKION_ERROR, error=str(e))
         return
+
+    # Persist RO from Tekion Sublet PO (or OCR) so the detail page shows it.
+    if result.resolved_ro and str(result.resolved_ro).strip():
+        doc.ro_number = str(result.resolved_ro).strip()
+        session.add(doc)
+        session.commit()
 
     # Always stash match + GL lines so the detail three-way panel has real $.
     if result.gl_lines_for_doc or result.match:

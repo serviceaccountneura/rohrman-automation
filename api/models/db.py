@@ -244,6 +244,8 @@ class Document(SQLModel, table=True):
     # templates and handwritten annotations, none of which mean anything to a
     # Misc invoice.
     posting_details: str = Field(default="", max_length=8000)
+    # Free-text clerk note on the detail page (any folder). Empty until typed.
+    note: str = Field(default="", max_length=4000)
 
     # ── Review before posting (MISCELLANEOUS) ─────────────────────────────────
     # What the flow decided it WOULD post -- the fields read and the GL lines

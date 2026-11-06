@@ -529,8 +529,18 @@ class PipelineStatusResponse(BaseModel):
     processed_at: datetime | None = Field(default=None, alias="processedAt")
     # Set when the document was deleted. Kept on record, shown greyed out.
     deleted_at: datetime | None = Field(default=None, alias="deletedAt")
+    # Clerk free-text note (any folder). Empty string when none.
+    note: str = ""
+    # Settings toggle — when false the FE hides the Notes section.
+    notes_enabled: bool = Field(default=False, alias="notesEnabled")
 
     model_config = {"populate_by_name": True}
+
+
+class NoteUpdateRequest(BaseModel):
+    """Save / clear the clerk note on a document."""
+
+    note: str = ""
 
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────

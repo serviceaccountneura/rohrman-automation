@@ -34,8 +34,7 @@ def create_upload_url(req: UploadUrlRequest) -> UploadUrlResponse:
 @router.get("/{s3_key:path}")
 def get_download_url(s3_key: str) -> dict[str, str]:
     try:
-        # The upright copy when the scan was turned: a page fed through the
-        # scanner sideways should not be shown sideways. The original is kept.
+        # Preview always uses the original upload (not enhanced / upright).
         url = generate_download_url(viewable_key(s3_key))
         return {"download_url": url}
     except Exception as e:
