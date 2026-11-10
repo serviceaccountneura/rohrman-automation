@@ -45,11 +45,12 @@ _PO_CODES = frozenset(
         "VENDOR_MISMATCH",
         "PO_CLOSED",
         "PO_ALREADY_INVOICED",
-        "MISSING_FIELD",
         "VENDOR_NOT_FOUND",
         "TEKION_REJECTED",
     }
 )
+
+# MISSING_REQUIRED_FIELD / OCR failures stay OTHER (Admin), not Parts PO.
 
 _JE_CODES = frozenset(
     {

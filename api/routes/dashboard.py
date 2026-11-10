@@ -157,12 +157,22 @@ def get_dashboard(
             )
         ).one()
 
+    # Match /exceptions + sidebar: held duplicates sit in status=DUPLICATE, not
+    # EXCEPTION, but clerks still see them under the Exceptions badge.
+    exceptions_open = session.exec(
+        _scope(
+            select(func.count())
+            .select_from(Document)
+            .where(Document.status.in_(["EXCEPTION", "DUPLICATE"]))
+        )
+    ).one()
+
     summary = DashboardSummary(
         total=session.exec(
             _scope(select(func.count()).select_from(Document))
         ).one(),
         processed=_count("PROCESSED"),
-        exceptions=_count("EXCEPTION"),
+        exceptions=exceptions_open,
         auto_resolved=_count("AUTO_RESOLVED"),
     )
 
