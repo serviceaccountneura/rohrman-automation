@@ -708,6 +708,38 @@ def manual_overrides(doc: Document) -> dict[str, Any]:
         return {}
 
 
+def _overlay_manual_on_ocr(ocr: dict[str, Any], corrected: dict[str, Any]) -> None:
+    """Write clerk corrections into the cached OCR dict so helpers and VI resolve see them."""
+    if not corrected:
+        return
+    inv = str(corrected.get("invoice_number") or "").strip()
+    if inv:
+        ocr["invoice_number"] = inv
+    date_s = str(corrected.get("invoice_date") or "").strip()
+    if date_s:
+        ocr["invoice_date"] = date_s
+    vendor = str(corrected.get("vendor_name") or "").strip()
+    if vendor:
+        existing = ocr.get("vendor") if isinstance(ocr.get("vendor"), dict) else {}
+        ocr["vendor"] = {**existing, "name": vendor, "displayName": vendor}
+    po = str(corrected.get("po_number") or "").strip()
+    if po:
+        ocr["po_number"] = po
+        # get_po_number() reads `_po_contract` (underscore), not `po_contract`.
+        contract = (
+            ocr.get("_po_contract")
+            if isinstance(ocr.get("_po_contract"), dict)
+            else {}
+        )
+        ocr["_po_contract"] = {**contract, "po_number": po}
+    amt = str(corrected.get("amount") or "").strip()
+    if amt:
+        cleaned = amt.replace(",", "").replace("$", "").strip()
+        ocr["invoice_total"] = cleaned
+        ocr["totals"] = [{"label": "Total", "value": cleaned}]
+        ocr["total_amount"] = cleaned
+
+
 def _run(doc: Document, session: Session) -> None:
     # A re-run with corrected fields reuses the OCR from the first attempt. The
     # invoice has not changed, and by this point the uploaded temp file has
@@ -778,13 +810,21 @@ def _run(doc: Document, session: Session) -> None:
         _store_confidence(doc, ocr)
 
     # ── 3. Record what OCR found ─────────────────────────────────────────────
+    # Re-run corrections land on the OCR dict first so PO resolve + VI verify
+    # both see the same values (invoice # / vendor / PO # / amount).
+    if overrides:
+        _overlay_manual_on_ocr(ocr, overrides)
     doc.ocr_document_type = ocr_helpers.get_document_type(ocr)
     doc.vendor_name = ocr_helpers.get_vendor_name(ocr) or doc.vendor_name
     doc.invoice_number = ocr_helpers.get_invoice_number(ocr)
     doc.ro_number = ocr_helpers.get_control_number(ocr)
     doc.vin = ocr_helpers.get_vin(ocr)
-    if not doc.dealership_name:
+    if str(overrides.get("dealership_name") or "").strip():
+        doc.dealership_name = str(overrides["dealership_name"]).strip()
+    elif not doc.dealership_name:
         doc.dealership_name = ocr_helpers.get_dealership_name(ocr)
+    if str(overrides.get("po_number") or "").strip():
+        doc.po_number = str(overrides["po_number"]).strip()
     session.add(doc)
     session.commit()
 
@@ -895,7 +935,7 @@ def _record_postings(
     tekion_amount: float | None = None,
     invoice_date: str | None = None,
     tekion_invoice_date: str | None = None,
-    vi_post: dict[str, bool] | None = None,
+    vi_post: dict[str, Any] | None = None,
 ) -> None:
     """Record the accounting lines this document put into Tekion.
 
@@ -1470,6 +1510,18 @@ def _run_vi_verify(
         invoice_number = doc.invoice_number = str(corrected["invoice_number"]).strip()
     if str(corrected.get("invoice_date") or "").strip():
         invoice_date = str(corrected["invoice_date"]).strip()
+    if str(corrected.get("vendor_name") or "").strip():
+        doc.vendor_name = str(corrected["vendor_name"]).strip()
+    if str(corrected.get("po_number") or "").strip():
+        ocr_po_number = str(corrected["po_number"]).strip()
+        doc.po_number = ocr_po_number
+    amt_override = str(corrected.get("amount") or "").strip()
+    if amt_override:
+        try:
+            total = float(amt_override.replace(",", "").replace("$", ""))
+        except ValueError:
+            pass
+    force_vi_headers = bool(corrected.get("force_vi_headers"))
 
     if not invoice_number or total is None:
         _stash_ocr_legs_for_panel(doc, session, ocr)
@@ -1498,6 +1550,7 @@ def _run_vi_verify(
         invoice_file_path=source_path,
         invoice_file_name=doc.file_name or None,
         skip_near_duplicate_check=skip_near_duplicate_check,
+        force_vi_headers=force_vi_headers,
     )
 
     po_writes = runtime_flags.tekion_po_writes(session)
@@ -1537,6 +1590,12 @@ def _run_vi_verify(
                 "writes": po_writes,
                 "attached": result.attached,
                 "posted": result.completed,
+                "forceHeaders": force_vi_headers,
+                "forceBy": str(corrected.get("force_by") or "") or None,
+                "forceNotes": [
+                    n for n in (result.notes or []) if str(n).startswith("Force push:")
+                ]
+                or None,
             },
         )
 

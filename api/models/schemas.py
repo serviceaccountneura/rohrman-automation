@@ -446,6 +446,10 @@ class RerunRequest(BaseModel):
     dealership_name: str = Field(default="", alias="dealershipName")
     manufacturer: str = ""
     dealer_cost_total: str = Field(default="", alias="dealerCostTotal")
+    vendor_name: str = Field(default="", alias="vendorName")
+    po_number: str = Field(default="", alias="poNumber")
+    # Invoice total for VI three-way match (same cents as Pre Invoice / PO).
+    amount: str = ""
     # {"2245": "904.00"} -- the GL account a clerk wrote, and the amount it
     # points at. Merged into what OCR read rather than replacing it.
     gl_annotations: dict[str, str] = Field(default_factory=dict, alias="glAnnotations")
