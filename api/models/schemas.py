@@ -6,8 +6,6 @@ from enum import Enum
 from typing import Annotated, Any, Literal, Union
 from uuid import UUID
 
-from typing import Any
-
 from pydantic import BaseModel, Field, EmailStr
 
 
@@ -643,7 +641,8 @@ class DocumentItem(BaseModel):
     processed_at: datetime | None
     # Vendor Invoice flow only: {writes, attached, posted}, so the table can
     # tell a verified invoice from a posted one. None for every other flow.
-    vi_post: dict[str, bool] | None = None
+    # writes/attached/posted bools, plus optional forceHeaders / forceBy / forceNotes
+    vi_post: dict[str, Any] | None = None
 
 
 class DocumentListResponse(BaseModel):
