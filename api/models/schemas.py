@@ -6,8 +6,6 @@ from enum import Enum
 from typing import Annotated, Any, Literal, Union
 from uuid import UUID
 
-from typing import Any
-
 from pydantic import BaseModel, Field, EmailStr
 
 
@@ -446,6 +444,10 @@ class RerunRequest(BaseModel):
     dealership_name: str = Field(default="", alias="dealershipName")
     manufacturer: str = ""
     dealer_cost_total: str = Field(default="", alias="dealerCostTotal")
+    vendor_name: str = Field(default="", alias="vendorName")
+    po_number: str = Field(default="", alias="poNumber")
+    # Invoice total for VI three-way match (same cents as Pre Invoice / PO).
+    amount: str = ""
     # {"2245": "904.00"} -- the GL account a clerk wrote, and the amount it
     # points at. Merged into what OCR read rather than replacing it.
     gl_annotations: dict[str, str] = Field(default_factory=dict, alias="glAnnotations")
@@ -639,7 +641,8 @@ class DocumentItem(BaseModel):
     processed_at: datetime | None
     # Vendor Invoice flow only: {writes, attached, posted}, so the table can
     # tell a verified invoice from a posted one. None for every other flow.
-    vi_post: dict[str, bool] | None = None
+    # writes/attached/posted bools, plus optional forceHeaders / forceBy / forceNotes
+    vi_post: dict[str, Any] | None = None
 
 
 class DocumentListResponse(BaseModel):

@@ -508,11 +508,108 @@ def rerun_document(
     # The marker makes the worker reuse the first reading even when nothing
     # was corrected; see _run. Ignored by everything that applies corrections.
     fields["rerun"] = True
+    # A normal re-run must not keep a prior Force push flag.
+    fields.pop("force_vi_headers", None)
+    fields.pop("force_by", None)
+    fields.pop("force_at", None)
     doc.manual_fields = json.dumps(fields)[:4000]
     job_queue.requeue_for_rerun(session, doc)
     print(
         f"[PIPE] {doc.id} re-run requested "
         + (f"with {fields}" if supplied else "as-is (no new corrections)")
+    )
+    return _to_status(doc, session=session)
+
+
+# Header mismatches a clerk may Force-push past once a Tekion VI+PO exist.
+_FORCEABLE_VI_CODES = frozenset(
+    {
+        "VENDOR_MISMATCH",
+        "AMOUNT_MISMATCH",
+        "INVOICE_NUMBER_MISMATCH",
+        "INVOICE_DATE_MISMATCH",
+    }
+)
+_PO_FORCE_FOLDERS = frozenset(
+    {"PO_INVOICE", "SUBLET", "MISCELLANEOUS", "STOCK"}
+)
+
+
+@router.post("/jobs/{document_id}/force-post", response_model=PipelineStatusResponse)
+def force_post_document(
+    document_id: UUID,
+    session: Annotated[Session, Depends(get_session)],
+    current_user: CurrentUserDep,
+) -> PipelineStatusResponse:
+    """Skip OCR↔Tekion header mismatches and push when a VI already exists.
+
+    Does not invent a Tekion Vendor Invoice. Missing-on-Tekion / no GL /
+    unbalanced JE still cannot be forced.
+    """
+    from datetime import datetime, timezone
+
+    doc = session.get(Document, job_queue.resolve_id(session, document_id))
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if doc.status != job_queue.STATUS_EXCEPTION:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Document is {doc.status}; only a failed document can be force-pushed",
+        )
+    folder = (doc.po_type or "").upper()
+    if folder not in _PO_FORCE_FOLDERS:
+        raise HTTPException(
+            status_code=409,
+            detail="Force push is only available for PO / Sublet / Misc / Stock invoices.",
+        )
+    code = (doc.exception_type or "").upper()
+    if code not in _FORCEABLE_VI_CODES:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot force push for {code or 'this exception'}. "
+                "Tekion must already have the Vendor Invoice / PO, and only "
+                "vendor, amount, or invoice-number mismatches can be bypassed."
+            ),
+        )
+    # Evidence a VI was found: PO # on the row, or a three-way preInvoice leg.
+    has_vi = bool(str(doc.po_number or "").strip())
+    if not has_vi:
+        try:
+            details = json.loads(doc.posting_details or "{}") or {}
+            match = details.get("viMatch") or {}
+            if isinstance(match, dict):
+                for key in ("poNumber", "invoiceNumber", "vendor", "amount"):
+                    leg = match.get(key) or {}
+                    if isinstance(leg, dict) and leg.get("preInvoice") not in (
+                        None,
+                        "",
+                    ):
+                        has_vi = True
+                        break
+        except ValueError:
+            has_vi = False
+    if not has_vi:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Cannot force push: no Tekion Vendor Invoice / PO was found for "
+                "this invoice. Create and pre-invoice it in Tekion first."
+            ),
+        )
+
+    fields = pipeline_service.manual_overrides(doc)
+    fields["rerun"] = True
+    fields["force_vi_headers"] = True
+    fields["force_by"] = getattr(current_user, "email", None) or str(
+        getattr(current_user, "id", "") or "unknown"
+    )
+    fields["force_at"] = datetime.now(timezone.utc).isoformat()
+    doc.manual_fields = json.dumps(fields)[:4000]
+    job_queue.requeue_for_rerun(session, doc)
+    print(
+        f"[PIPE] {doc.id} FORCE push requested by {fields['force_by']} "
+        f"(was {code})"
     )
     return _to_status(doc, session=session)
 

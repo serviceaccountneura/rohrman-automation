@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func
@@ -259,7 +259,7 @@ def filter_options(
     }
 
 
-def _vi_post(posting_details: str) -> dict[str, bool] | None:
+def _vi_post(posting_details: str) -> dict[str, Any] | None:
     """What the Vendor Invoice flow did in Tekion, from posting_details."""
     try:
         vi_post = json.loads(posting_details or "{}").get("viPost")

@@ -80,6 +80,10 @@ class ViVerifyInput:
     invoice_file_name: str | None = None
     # One-shot waive after dashboard "Ignore" on a Tekion near-duplicate hold.
     skip_near_duplicate_check: bool = False
+    # Clerk Force push: VI+PO must still exist in Tekion, but OCR↔Tekion
+    # vendor / invoice # / amount header mismatches are skipped so attach+post
+    # can proceed. Tekion's own VI↔PO link and GL/balance checks still apply.
+    force_vi_headers: bool = False
 
 
 @dataclass
@@ -845,25 +849,42 @@ def verify_vendor_invoice(
         result.match = _snap()
         return result
     if ocr_vendor and not _names_match(ocr_vendor, vi_vendor):
-        result.code = CODE_VENDOR_MISMATCH
-        result.message = (
-            f"Vendor on the invoice is {ocr_vendor!r}, but Tekion PO / Pre Invoice "
-            f"has {vi_vendor!r}. All three must match. Correct the vendor (or the "
-            "PO) in Tekion, then re-run checks."
-        )
-        result.match = _snap()
-        return result
+        if expected.force_vi_headers:
+            result.notes.append(
+                f"Force push: skipped vendor mismatch (invoice {ocr_vendor!r} vs "
+                f"Tekion {vi_vendor!r}); using Tekion vendor."
+            )
+            result.match = _snap()
+        else:
+            result.code = CODE_VENDOR_MISMATCH
+            result.message = (
+                f"Vendor on the invoice is {ocr_vendor!r}, but Tekion PO / Pre Invoice "
+                f"has {vi_vendor!r}. All three must match. Correct the vendor (or the "
+                "PO) in Tekion, then re-run checks."
+            )
+            result.match = _snap()
+            return result
 
     # ── 3. Full Invoice Number (invoice ↔ PO ↔ Pre-invoice) ──────────────────
     if not _invoice_numbers_equal(vi_invoice_number, invoice_number):
-        result.code = CODE_INVOICE_NUMBER_MISMATCH
-        result.message = (
-            f"Invoice number on the document is {invoice_number!r}, but Tekion "
-            f"Pre Invoice has {vi_invoice_number!r}. They must match completely "
-            "(including any prefix or suffix)."
-        )
-        result.match = _snap()
-        return result
+        if expected.force_vi_headers:
+            result.notes.append(
+                f"Force push: skipped invoice # mismatch (document "
+                f"{invoice_number!r} vs Pre Invoice {vi_invoice_number!r}); "
+                "using Tekion Pre Invoice number."
+            )
+            invoice_number = vi_invoice_number
+            result.invoice_number = vi_invoice_number
+            result.match = _snap()
+        else:
+            result.code = CODE_INVOICE_NUMBER_MISMATCH
+            result.message = (
+                f"Invoice number on the document is {invoice_number!r}, but Tekion "
+                f"Pre Invoice has {vi_invoice_number!r}. They must match completely "
+                "(including any prefix or suffix)."
+            )
+            result.match = _snap()
+            return result
     if not po_invoice_list:
         result.code = CODE_INVOICE_NUMBER_MISMATCH
         result.message = (
@@ -873,15 +894,22 @@ def verify_vendor_invoice(
         result.match = _snap()
         return result
     if not any(_invoice_numbers_equal(n, invoice_number) for n in po_invoice_list):
-        listed = ", ".join(repr(n) for n in po_invoice_list)
-        result.code = CODE_INVOICE_NUMBER_MISMATCH
-        result.message = (
-            f"Invoice number {invoice_number!r} is not on Tekion PO {po_po} "
-            f"(PO has: {listed}). The PO, Pre Invoice, and document must carry "
-            "the same full invoice number."
-        )
-        result.match = _snap()
-        return result
+        if expected.force_vi_headers:
+            result.notes.append(
+                f"Force push: invoice {invoice_number!r} not listed on Tekion PO "
+                f"{po_po}; continuing with Pre Invoice link."
+            )
+            result.match = _snap()
+        else:
+            listed = ", ".join(repr(n) for n in po_invoice_list)
+            result.code = CODE_INVOICE_NUMBER_MISMATCH
+            result.message = (
+                f"Invoice number {invoice_number!r} is not on Tekion PO {po_po} "
+                f"(PO has: {listed}). The PO, Pre Invoice, and document must carry "
+                "the same full invoice number."
+            )
+            result.match = _snap()
+            return result
 
     # ── Near-duplicates on Tekion's Pre Invoice list (Daisy check) ─────────
     # Exact invoice # already matched above. Also scan for pattern variants
@@ -927,24 +955,41 @@ def verify_vendor_invoice(
         result.match = _snap()
         return result
     if not _money_eq(invoice_amt, vi_amount):
-        result.code = CODE_AMOUNT_MISMATCH
-        result.message = (
-            f"Invoice amount on the document is ${invoice_amt:,.2f}, but Tekion "
-            f"Pre Invoice Amount is ${float(vi_amount):,.2f}. Uploaded invoice, "
-            "PO total, and Pre Invoice amount must match to the cent."
-        )
-        result.match = _snap()
-        return result
+        if expected.force_vi_headers:
+            result.notes.append(
+                f"Force push: skipped amount mismatch (document "
+                f"${invoice_amt:,.2f} vs Pre Invoice ${float(vi_amount):,.2f}); "
+                "using Tekion Pre Invoice amount."
+            )
+            invoice_amt = float(vi_amount)
+            result.match = _snap()
+        else:
+            result.code = CODE_AMOUNT_MISMATCH
+            result.message = (
+                f"Invoice amount on the document is ${invoice_amt:,.2f}, but Tekion "
+                f"Pre Invoice Amount is ${float(vi_amount):,.2f}. Uploaded invoice, "
+                "PO total, and Pre Invoice amount must match to the cent."
+            )
+            result.match = _snap()
+            return result
     if not _money_eq(invoice_amt, po_amount) or not _money_eq(vi_amount, po_amount):
-        result.code = CODE_AMOUNT_MISMATCH
-        result.message = (
-            f"Amounts do not match across all three: document ${invoice_amt:,.2f}, "
-            f"Tekion PO total ${float(po_amount):,.2f}, Pre Invoice "
-            f"${float(vi_amount):,.2f}. Correct the amount in Tekion (or the PO), "
-            "then re-run checks."
-        )
-        result.match = _snap()
-        return result
+        if expected.force_vi_headers:
+            result.notes.append(
+                f"Force push: skipped three-way amount mismatch (document "
+                f"${float(expected.invoice_amount):,.2f}, PO "
+                f"${float(po_amount):,.2f}, Pre Invoice ${float(vi_amount):,.2f})."
+            )
+            result.match = _snap()
+        else:
+            result.code = CODE_AMOUNT_MISMATCH
+            result.message = (
+                f"Amounts do not match across all three: document ${invoice_amt:,.2f}, "
+                f"Tekion PO total ${float(po_amount):,.2f}, Pre Invoice "
+                f"${float(vi_amount):,.2f}. Correct the amount in Tekion (or the PO), "
+                "then re-run checks."
+            )
+            result.match = _snap()
+            return result
 
     # ── 5. Invoice Date — informational only (not a pass/fail gate) ──────────
     # Parts routinely create / pre-invoice the PO days or weeks after the
