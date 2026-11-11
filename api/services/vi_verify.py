@@ -1378,10 +1378,12 @@ def _complete_vendor_invoice(
             set_control(p, ctrl)
 
     accounting_date_ms = result.tekion_invoice_date_ms or int(time.time() * 1000)
+    inv_id = result.invoice_id or ""
+    inv_no = result.invoice_number or _norm_invoice(expected.invoice_number)
     try:
         svc.post_transaction(
-            result.invoice_id or "",
-            result.invoice_number or _norm_invoice(expected.invoice_number),
+            inv_id,
+            inv_no,
             prepared,
             accounting_date_ms=accounting_date_ms,
         )
@@ -1392,11 +1394,49 @@ def _complete_vendor_invoice(
                 "already posted for this vendor. Void the duplicate Vendor Invoice "
                 "in Tekion; nothing was posted."
             ) from exc
-        raise RuntimeError(
-            "Verification passed and the invoice file was "
-            f"{'uploaded' if result.media_id else 'not uploaded'}, but completing the "
-            f"Vendor Invoice in Tekion failed: {exc}"
-        ) from exc
+        from api.services.closed_month import (
+            first_of_current_month_ms,
+            is_closed_month_error,
+        )
+
+        if not is_closed_month_error(exc):
+            raise RuntimeError(
+                "Verification passed and the invoice file was "
+                f"{'uploaded' if result.media_id else 'not uploaded'}, but completing the "
+                f"Vendor Invoice in Tekion failed: {exc}"
+            ) from exc
+
+        # Closed month (A132): retry once with 1st of the current open month.
+        tz_name = "America/Chicago"
+        get_tz = getattr(client, "get_dealer_timezone", None)
+        if callable(get_tz):
+            try:
+                tz_name = str(get_tz() or tz_name)
+            except Exception:  # noqa: BLE001
+                pass
+        bumped_ms = first_of_current_month_ms(tz_name=tz_name)
+        print(
+            f"[VI] Closed month on post ({exc}); bumping scheduledTime "
+            f"{accounting_date_ms} -> {bumped_ms} and retrying once"
+        )
+        try:
+            svc.post_transaction(
+                inv_id,
+                inv_no,
+                prepared,
+                accounting_date_ms=bumped_ms,
+            )
+        except Exception as retry_exc:  # noqa: BLE001
+            raise RuntimeError(
+                "Verification passed and the invoice file was "
+                f"{'uploaded' if result.media_id else 'not uploaded'}, but completing the "
+                f"Vendor Invoice in Tekion failed after closed-month retry: {retry_exc}"
+            ) from retry_exc
+        result.tekion_invoice_date_ms = bumped_ms
+        result.notes.append(
+            "Tekion closed month on first post; completed with accounting date "
+            "set to the 1st of the current month."
+        )
 
     result.completed = True
     result.notes.append("Completed Vendor Invoice (attach + post transaction).")

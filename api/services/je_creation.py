@@ -867,11 +867,51 @@ def create_journal_entry(
             )
             result.notes.append(f"Attached invoice mediaId={media_id}")
 
-        txn = (
-            svc.submit(result.payload, result.dealer_id)
-            if post
-            else svc.save_draft(result.payload, result.dealer_id)
-        )
+        try:
+            txn = (
+                svc.submit(result.payload, result.dealer_id)
+                if post
+                else svc.save_draft(result.payload, result.dealer_id)
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Closed month (A132): bump Accounting Date to the 1st of the
+            # current open month and retry the post once (client: Kia Nov 2026).
+            from api.services.closed_month import (
+                first_of_current_month_date_str,
+                is_closed_month_error,
+            )
+
+            if not (post and is_closed_month_error(exc)):
+                raise
+            bumped = first_of_current_month_date_str(tz_name=dealer_tz)
+            old_date = expected.invoice_date
+            print(
+                f"[JE] Closed month on post ({exc}); bumping accounting date "
+                f"{old_date!r} -> {bumped!r} and retrying once"
+            )
+            accounting_date = _parse_date(bumped, tz_name=dealer_tz)
+            result.accounting_date_ms = int(accounting_date.timestamp() * 1000)
+            result.control_number = _control_number(accounting_date)
+            result.postings = svc.build_postings(
+                expected, resolved, result.control_number, result.dealer_id
+            )
+            result.credit_total, result.debit_total, result.balance = svc.check_balance(
+                result.postings
+            )
+            result.payload = svc.build_payload(
+                expected,
+                result.postings,
+                result.accounting_date_ms,
+                result.dealer_id,
+                result.debit_total,
+                attachments=attachments,
+            )
+            result.notes.append(
+                f"Tekion closed month for {old_date}; posted with accounting "
+                f"date {bumped} (1st of current month)."
+            )
+            txn = svc.submit(result.payload, result.dealer_id)
+
         result.saved = True
         result.posted = post
         result.transaction_id = str(txn.get("id") or "")
