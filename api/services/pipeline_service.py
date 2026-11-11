@@ -1551,6 +1551,8 @@ def _run_vi_verify(
         invoice_file_name=doc.file_name or None,
         skip_near_duplicate_check=skip_near_duplicate_check,
         force_vi_headers=force_vi_headers,
+        # OCR totals are absolute; credit VIs in Tekion are negative.
+        is_credit=ocr_helpers.is_credit_invoice(ocr),
     )
 
     po_writes = runtime_flags.tekion_po_writes(session)

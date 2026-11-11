@@ -84,6 +84,10 @@ class ViVerifyInput:
     # vendor / invoice # / amount header mismatches are skipped so attach+post
     # can proceed. Tekion's own VI↔PO link and GL/balance checks still apply.
     force_vi_headers: bool = False
+    # OCR / folder says this is a vendor credit (credit memo). Tekion stores the
+    # Pre Invoice amount as negative while OCR totals stay positive — magnitude
+    # match is enough; we never rebuild JE lines on the PO path.
+    is_credit: bool = False
 
 
 @dataclass
@@ -460,6 +464,46 @@ def _money_eq(a: float | None, b: float | None) -> bool:
     if a is None or b is None:
         return False
     return round(float(a), 2) == round(float(b), 2)
+
+
+def _money_eq_mag(a: float | None, b: float | None) -> bool:
+    """Same cents ignoring sign (credit VI −$22 vs OCR/PO +$22)."""
+    if a is None or b is None:
+        return False
+    return round(abs(float(a)), 2) == round(abs(float(b)), 2)
+
+
+def _credit_amount_case(
+    *,
+    expected: "ViVerifyInput",
+    vi_amount: float | None,
+    po: dict[str, Any] | None,
+) -> bool:
+    """Whether amount checks should compare magnitude only.
+
+    Credit Pre Invoices in Tekion carry a negative Invoice Amount; PO totals and
+    OCR ``get_total_amount`` stay positive. Signs already live on Tekion's JE
+    lines — VI verify only needs the dollars to agree.
+    """
+    if expected.is_credit:
+        return True
+    if vi_amount is not None and float(vi_amount) < 0:
+        return True
+    order = str((po or {}).get("orderType") or "").strip().upper()
+    if "CREDIT" in order:
+        return True
+    return False
+
+
+def _amounts_agree(
+    a: float | None,
+    b: float | None,
+    *,
+    credit: bool,
+) -> bool:
+    if _money_eq(a, b):
+        return True
+    return bool(credit and _money_eq_mag(a, b))
 
 
 def _po_nums_equal(a: str | None, b: str | None) -> bool:
@@ -938,6 +982,11 @@ def verify_vendor_invoice(
             return result
 
     # ── 4. Invoice Amount exact cents (invoice ↔ PO ↔ Pre-invoice) ───────────
+    # Credit memos: Tekion VI amount is negative; OCR/PO stay positive. Compare
+    # magnitude only — JE debit/credit direction already comes from Tekion.
+    credit_amt = _credit_amount_case(
+        expected=expected, vi_amount=vi_amount, po=po
+    )
     if vi_amount is None:
         result.code = CODE_AMOUNT_MISMATCH
         result.message = (
@@ -954,7 +1003,7 @@ def verify_vendor_invoice(
         )
         result.match = _snap()
         return result
-    if not _money_eq(invoice_amt, vi_amount):
+    if not _amounts_agree(invoice_amt, vi_amount, credit=credit_amt):
         if expected.force_vi_headers:
             result.notes.append(
                 f"Force push: skipped amount mismatch (document "
@@ -972,7 +1021,15 @@ def verify_vendor_invoice(
             )
             result.match = _snap()
             return result
-    if not _money_eq(invoice_amt, po_amount) or not _money_eq(vi_amount, po_amount):
+    elif credit_amt and not _money_eq(invoice_amt, vi_amount):
+        result.notes.append(
+            f"Credit amount: document ${invoice_amt:,.2f} matches Pre Invoice "
+            f"${float(vi_amount):,.2f} by magnitude (sign differs on credit VIs)."
+        )
+    if not (
+        _amounts_agree(invoice_amt, po_amount, credit=credit_amt)
+        and _amounts_agree(vi_amount, po_amount, credit=credit_amt)
+    ):
         if expected.force_vi_headers:
             result.notes.append(
                 f"Force push: skipped three-way amount mismatch (document "
@@ -1321,10 +1378,12 @@ def _complete_vendor_invoice(
             set_control(p, ctrl)
 
     accounting_date_ms = result.tekion_invoice_date_ms or int(time.time() * 1000)
+    inv_id = result.invoice_id or ""
+    inv_no = result.invoice_number or _norm_invoice(expected.invoice_number)
     try:
         svc.post_transaction(
-            result.invoice_id or "",
-            result.invoice_number or _norm_invoice(expected.invoice_number),
+            inv_id,
+            inv_no,
             prepared,
             accounting_date_ms=accounting_date_ms,
         )
@@ -1335,11 +1394,49 @@ def _complete_vendor_invoice(
                 "already posted for this vendor. Void the duplicate Vendor Invoice "
                 "in Tekion; nothing was posted."
             ) from exc
-        raise RuntimeError(
-            "Verification passed and the invoice file was "
-            f"{'uploaded' if result.media_id else 'not uploaded'}, but completing the "
-            f"Vendor Invoice in Tekion failed: {exc}"
-        ) from exc
+        from api.services.closed_month import (
+            first_of_current_month_ms,
+            is_closed_month_error,
+        )
+
+        if not is_closed_month_error(exc):
+            raise RuntimeError(
+                "Verification passed and the invoice file was "
+                f"{'uploaded' if result.media_id else 'not uploaded'}, but completing the "
+                f"Vendor Invoice in Tekion failed: {exc}"
+            ) from exc
+
+        # Closed month (A132): retry once with 1st of the current open month.
+        tz_name = "America/Chicago"
+        get_tz = getattr(client, "get_dealer_timezone", None)
+        if callable(get_tz):
+            try:
+                tz_name = str(get_tz() or tz_name)
+            except Exception:  # noqa: BLE001
+                pass
+        bumped_ms = first_of_current_month_ms(tz_name=tz_name)
+        print(
+            f"[VI] Closed month on post ({exc}); bumping scheduledTime "
+            f"{accounting_date_ms} -> {bumped_ms} and retrying once"
+        )
+        try:
+            svc.post_transaction(
+                inv_id,
+                inv_no,
+                prepared,
+                accounting_date_ms=bumped_ms,
+            )
+        except Exception as retry_exc:  # noqa: BLE001
+            raise RuntimeError(
+                "Verification passed and the invoice file was "
+                f"{'uploaded' if result.media_id else 'not uploaded'}, but completing the "
+                f"Vendor Invoice in Tekion failed after closed-month retry: {retry_exc}"
+            ) from retry_exc
+        result.tekion_invoice_date_ms = bumped_ms
+        result.notes.append(
+            "Tekion closed month on first post; completed with accounting date "
+            "set to the 1st of the current month."
+        )
 
     result.completed = True
     result.notes.append("Completed Vendor Invoice (attach + post transaction).")
