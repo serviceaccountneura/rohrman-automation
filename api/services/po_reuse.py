@@ -253,6 +253,11 @@ def pipeline_folder_for(found: FoundPo) -> str | None:
 
     ``NON_OEM_SPECIAL_ORDER`` / ``VENDOR_SPECIAL_ORDER`` are PO-side (VI
     verify), same path as Misc — not OEM journal entry.
+
+    ``MISCELLANEOUS_CREDIT_PO`` is the same VI-verify path: Tekion already
+    holds the credit PO + pre-invoice with flipped JE signs (A/P debit,
+    inventory credit). We only need to accept the type so clerks can upload
+    Advance Auto–style credit memos through the PO Invoice inbox.
     """
     raw = (found.order_type or "").strip().upper()
     if not raw and found.universal_id:
@@ -260,6 +265,7 @@ def pipeline_folder_for(found: FoundPo) -> str | None:
     if raw in {
         "MISCELLANEOUS",
         "MISC",
+        "MISCELLANEOUS_CREDIT_PO",
         "NON_OEM_SPECIAL_ORDER",
         "VENDOR_SPECIAL_ORDER",
         "SPECIAL_ORDER",
