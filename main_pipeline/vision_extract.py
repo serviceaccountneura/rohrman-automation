@@ -74,7 +74,9 @@ TABLES (most important — reproduce them faithfully):
   number, plus any short letter code printed with it in that field -- beside it on the same line
   ("6101029 RI") or directly beneath it ("331937" with "HOM" under it is "331937 HOM"). Join the
   parts with a single space, number first. Do not add text from outside the field. Report it the
-  same way every time, code included.
+  same way every time, code included. Never truncate a long digit string: copy every digit from
+  that field exactly (e.g. Invoice/Trans "4347631342322" must stay "4347631342322", not
+  "434763134").
 
 THE INVOICE NUMBER AND THE INVOICE TOTAL -- decide these two yourself, from the whole page, and
   put them in the top-level fields. Everything else stays a faithful transcription; these two are
