@@ -4,6 +4,8 @@ Invoice automation for Rohrman Automotive Group. An AP clerk uploads an invoice
 into a folder; the system reads it with OCR and creates the matching record in
 Tekion — a purchase order and pre-invoice, or a journal entry.
 
+Maintainer check: aabideen.
+
 Nineteen dealerships, one Tekion login.
 
 | | |
